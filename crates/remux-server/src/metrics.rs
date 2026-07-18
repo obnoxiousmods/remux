@@ -402,7 +402,7 @@ pub async fn track(
                     let mut user_name: Option<String> = None;
                     if let Some(token) = auth_token.as_deref() {
                         if let Ok(Some(row)) = sqlx::query_as::<_, (String, String, String, String, String, String)>(
-                            "SELECT d.id, COALESCE(NULLIF(d.custom_name, ''), d.name), d.app_name, d.app_version, u.id, u.username \
+                            "SELECT d.id, COALESCE(NULLIF(d.custom_name, ''), d.name), d.app_name, d.app_version, lower(hex(u.id)), u.username \
                              FROM devices d JOIN users u ON u.id = d.user_id WHERE d.access_token = ? LIMIT 1"
                         ).bind(token).fetch_optional(&db).await {
                             context.device_id = Some(row.0);
@@ -417,7 +417,7 @@ pub async fn track(
                         .as_deref()
                     {
                         if let Ok(Some(row)) = sqlx::query_as::<_, (String, String, String, String, String)>(
-                            "SELECT COALESCE(NULLIF(d.custom_name, ''), d.name), d.app_name, d.app_version, u.id, u.username \
+                            "SELECT COALESCE(NULLIF(d.custom_name, ''), d.name), d.app_name, d.app_version, lower(hex(u.id)), u.username \
                              FROM devices d JOIN users u ON u.id = d.user_id WHERE d.id = ? ORDER BY d.last_activity_at DESC LIMIT 1"
                         ).bind(device_id).fetch_optional(&db).await {
                             context.device_name = Some(row.0);
@@ -427,9 +427,12 @@ pub async fn track(
                             user_name = Some(row.4);
                         }
                     }
-                    let item_name = match item_id.as_deref() {
+                    let item_name = match item_id
+                        .as_deref()
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    {
                         Some(id) => sqlx::query_scalar::<_, String>(
-                            "SELECT name FROM media WHERE id = ? LIMIT 1",
+                            "SELECT title FROM media WHERE id = ? LIMIT 1",
                         )
                         .bind(id)
                         .fetch_optional(&db)
