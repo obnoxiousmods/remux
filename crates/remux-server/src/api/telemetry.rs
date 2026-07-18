@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[serde(rename_all = "camelCase")]
 pub struct ExploreQuery {
     pub hours: Option<i64>,
+    pub offset_hours: Option<i64>,
     pub bucket_minutes: Option<i64>,
     pub group_by: Option<String>,
     pub route: Option<String>,
@@ -137,6 +138,7 @@ pub struct FilterOptions {
 #[serde(rename_all = "camelCase")]
 pub struct ExploreResponse {
     pub hours: i64,
+    pub offset_hours: i64,
     pub bucket_minutes: i64,
     pub group_by: String,
     pub resolution: String,
@@ -292,6 +294,57 @@ impl Acc {
 }
 
 fn label(row: &RequestRow, dimension: &str) -> String {
+    let known = |value: Option<&str>| {
+        value
+            .filter(|value| {
+                !value
+                    .trim()
+                    .is_empty()
+            })
+            .unwrap_or("Unknown")
+            .to_string()
+    };
+    match dimension {
+        "deviceClient" => {
+            return format!(
+                "{} · {} {}",
+                known(
+                    row.device_name
+                        .as_deref()
+                ),
+                known(
+                    row.client_name
+                        .as_deref()
+                ),
+                row.client_version
+                    .as_deref()
+                    .unwrap_or_default()
+            )
+            .trim()
+            .to_string();
+        }
+        "routeClient" => {
+            return format!(
+                "{} · {}",
+                row.route_template,
+                known(
+                    row.client_name
+                        .as_deref()
+                )
+            );
+        }
+        "routeDevice" => {
+            return format!(
+                "{} · {}",
+                row.route_template,
+                known(
+                    row.device_name
+                        .as_deref()
+                )
+            );
+        }
+        _ => {}
+    }
     let value = match dimension {
         "device" => row
             .device_name
@@ -346,11 +399,16 @@ async fn rows(
     state: &AppState,
     query: &ExploreQuery,
     hours: i64,
+    offset_hours: i64,
 ) -> Result<Vec<RequestRow>> {
     let mut sql = QueryBuilder::<Sqlite>::new(
         "SELECT id, created_at, method, route_template, status, latency_ms, sample_reason, device_name, client_name, client_version, user_name, item_name, error_category FROM telemetry_request_events WHERE created_at >= ",
     );
-    sql.push_bind((Utc::now() - chrono::Duration::hours(hours)).to_rfc3339());
+    let range_end = Utc::now() - chrono::Duration::hours(offset_hours);
+    let range_start = range_end - chrono::Duration::hours(hours);
+    sql.push_bind(range_start.to_rfc3339())
+        .push(" AND created_at < ")
+        .push_bind(range_end.to_rfc3339());
     filter(&mut sql, "route_template", &query.route);
     filter(&mut sql, "device_name", &query.device);
     filter(&mut sql, "client_name", &query.client);
@@ -390,7 +448,117 @@ async fn rows(
         .await?)
 }
 
+async fn recent_rows(
+    state: &AppState,
+    query: &ExploreQuery,
+    hours: i64,
+) -> Result<Vec<RequestRow>> {
+    let mut sql = QueryBuilder::<Sqlite>::new(
+        "SELECT id, created_at, method, route_template, status, latency_ms, sample_reason, device_name, client_name, client_version, user_name, item_name, error_category FROM telemetry_request_events WHERE created_at >= ",
+    );
+    sql.push_bind(
+        (Utc::now() - chrono::Duration::hours(hours.min(24 * 14))).to_rfc3339(),
+    );
+    filter(&mut sql, "route_template", &query.route);
+    filter(&mut sql, "device_name", &query.device);
+    filter(&mut sql, "client_name", &query.client);
+    filter(&mut sql, "user_name", &query.user);
+    filter(&mut sql, "item_name", &query.content);
+    filter(&mut sql, "method", &query.method);
+    filter(&mut sql, "sample_reason", &query.sample_reason);
+    match query
+        .status_class
+        .as_deref()
+    {
+        Some("2xx") => sql.push(" AND status BETWEEN 200 AND 299"),
+        Some("3xx") => sql.push(" AND status BETWEEN 300 AND 399"),
+        Some("4xx") => sql.push(" AND status BETWEEN 400 AND 499"),
+        Some("5xx") => sql.push(" AND status BETWEEN 500 AND 599"),
+        Some("errors") => sql.push(" AND status >= 400"),
+        _ => &mut sql,
+    };
+    sql.push(" ORDER BY created_at DESC LIMIT 100");
+    Ok(sql
+        .build_query_as::<RequestRow>()
+        .fetch_all(
+            &state
+                .ctx
+                .db,
+        )
+        .await?)
+}
+
+fn request_event(row: &RequestRow) -> RequestEvent {
+    RequestEvent {
+        id: row.id,
+        created_at: row
+            .created_at
+            .clone(),
+        method: row
+            .method
+            .clone(),
+        route: row
+            .route_template
+            .clone(),
+        status: row.status,
+        latency_ms: row.latency_ms,
+        sample_reason: row
+            .sample_reason
+            .clone(),
+        device: row
+            .device_name
+            .clone()
+            .unwrap_or_else(|| "Unknown".into()),
+        client: row
+            .client_name
+            .clone()
+            .unwrap_or_else(|| "Unknown".into()),
+        client_version: row
+            .client_version
+            .clone()
+            .unwrap_or_default(),
+        user: row
+            .user_name
+            .clone()
+            .unwrap_or_else(|| "Unknown".into()),
+        content: row
+            .item_name
+            .clone()
+            .unwrap_or_default(),
+        error_category: row
+            .error_category
+            .clone()
+            .unwrap_or_default(),
+    }
+}
+
 fn rollup_label(row: &RollupRow, dimension: &str) -> String {
+    let known = |value: &str| {
+        if value
+            .trim()
+            .is_empty()
+        {
+            "Unknown".to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    match dimension {
+        "deviceClient" => {
+            return format!(
+                "{} · {}",
+                known(&row.device_name),
+                known(&row.client_name)
+            );
+        }
+        "routeClient" => {
+            return format!("{} · {}", row.route_template, known(&row.client_name));
+        }
+        "routeDevice" => {
+            return format!("{} · {}", row.route_template, known(&row.device_name));
+        }
+        _ => {}
+    }
     let value = match dimension {
         "device" => row
             .device_name
@@ -429,11 +597,16 @@ async fn rollup_rows(
     state: &AppState,
     query: &ExploreQuery,
     hours: i64,
+    offset_hours: i64,
 ) -> Result<Vec<RollupRow>> {
     let mut sql = QueryBuilder::<Sqlite>::new(
         "SELECT bucket_start, route_template, method, device_name, client_name, user_name, item_name, status_class, sample_reason, request_count, error_count, total_latency_ms, max_latency_ms, latency_lt_100, latency_lt_500, latency_lt_1000, latency_lt_2500, latency_lt_5000, latency_lt_10000, latency_ge_10000 FROM telemetry_hourly_rollups WHERE bucket_start >= ",
     );
-    sql.push_bind((Utc::now() - chrono::Duration::hours(hours)).to_rfc3339());
+    let range_end = Utc::now() - chrono::Duration::hours(offset_hours);
+    let range_start = range_end - chrono::Duration::hours(hours);
+    sql.push_bind(range_start.to_rfc3339())
+        .push(" AND bucket_start < ")
+        .push_bind(range_end.to_rfc3339());
     filter(&mut sql, "route_template", &query.route);
     filter(&mut sql, "device_name", &query.device);
     filter(&mut sql, "client_name", &query.client);
@@ -469,45 +642,63 @@ fn sort_breakdown(rows: &mut Vec<BreakdownRow>, query: &ExploreQuery) {
         .sort_by
         .as_deref()
         .unwrap_or("p95");
-    rows.sort_by(|a, b| {
-        let value = |row: &BreakdownRow| match sort {
-            "count" => {
-                row.stats
-                    .count as f64
-            }
-            "errors" => {
-                row.stats
-                    .error_count as f64
-            }
-            "errorRate" => {
-                row.stats
-                    .error_rate
-            }
-            "mean" => {
-                row.stats
-                    .mean_latency_ms
-            }
-            "p50" => {
-                row.stats
-                    .p50_latency_ms
-            }
-            "max" => {
-                row.stats
-                    .max_latency_ms
-            }
-            _ => {
-                row.stats
-                    .p95_latency_ms
-            }
-        };
-        value(b).total_cmp(&value(a))
-    });
-    if query
-        .sort_dir
-        .as_deref()
-        == Some("asc")
-    {
-        rows.reverse();
+    if sort == "label" {
+        rows.sort_by(|a, b| {
+            a.label
+                .to_lowercase()
+                .cmp(
+                    &b.label
+                        .to_lowercase(),
+                )
+        });
+        if query
+            .sort_dir
+            .as_deref()
+            != Some("asc")
+        {
+            rows.reverse();
+        }
+    } else {
+        rows.sort_by(|a, b| {
+            let value = |row: &BreakdownRow| match sort {
+                "count" => {
+                    row.stats
+                        .count as f64
+                }
+                "errors" => {
+                    row.stats
+                        .error_count as f64
+                }
+                "errorRate" => {
+                    row.stats
+                        .error_rate
+                }
+                "mean" => {
+                    row.stats
+                        .mean_latency_ms
+                }
+                "p50" => {
+                    row.stats
+                        .p50_latency_ms
+                }
+                "max" => {
+                    row.stats
+                        .max_latency_ms
+                }
+                _ => {
+                    row.stats
+                        .p95_latency_ms
+                }
+            };
+            value(b).total_cmp(&value(a))
+        });
+        if query
+            .sort_dir
+            .as_deref()
+            == Some("asc")
+        {
+            rows.reverse();
+        }
     }
     rows.truncate(
         query
@@ -521,10 +712,11 @@ async fn explore_rollups(
     state: &AppState,
     query: &ExploreQuery,
     hours: i64,
+    offset_hours: i64,
     bucket_minutes: i64,
     group_by: String,
 ) -> Result<ExploreResponse> {
-    let mut rows = rollup_rows(state, query, hours).await?;
+    let mut rows = rollup_rows(state, query, hours, offset_hours).await?;
     let truncated = rows.len() > 500_000;
     rows.truncate(500_000);
     let mut summary = RollupAcc::default();
@@ -623,8 +815,18 @@ async fn explore_rollups(
             })
         })
         .collect();
+    let recent = if offset_hours == 0 {
+        recent_rows(state, query, hours)
+            .await?
+            .iter()
+            .map(request_event)
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(ExploreResponse {
         hours,
+        offset_hours,
         bucket_minutes: bucket_minutes.max(60),
         group_by,
         resolution: "hourly-rollup".into(),
@@ -633,7 +835,7 @@ async fn explore_rollups(
         summary: summary.finish(),
         series,
         breakdown,
-        recent: Vec::new(),
+        recent,
         filters,
     })
 }
@@ -648,6 +850,10 @@ pub async fn explore(
         .hours
         .unwrap_or(24)
         .clamp(1, 24 * 180);
+    let offset_hours = query
+        .offset_hours
+        .unwrap_or(0)
+        .clamp(0, 24 * 180);
     let bucket_minutes = query
         .bucket_minutes
         .unwrap_or(if hours <= 6 {
@@ -663,19 +869,28 @@ pub async fn explore(
         .as_deref()
     {
         Some(
-            "device" | "client" | "user" | "content" | "method" | "status" | "none",
+            "device" | "client" | "user" | "content" | "method" | "status" | "none"
+            | "deviceClient" | "routeClient" | "routeDevice",
         ) => query
             .group_by
             .clone()
             .unwrap(),
         _ => "route".to_string(),
     };
-    if hours > 48 {
+    if hours + offset_hours > 48 {
         return Ok(Json(
-            explore_rollups(&state, &query, hours, bucket_minutes, group_by).await?,
+            explore_rollups(
+                &state,
+                &query,
+                hours,
+                offset_hours,
+                bucket_minutes,
+                group_by,
+            )
+            .await?,
         ));
     }
-    let mut rows = rows(&state, &query, hours).await?;
+    let mut rows = rows(&state, &query, hours, offset_hours).await?;
     let truncated = rows.len() > 500_000;
     rows.truncate(500_000);
     let mut summary = Acc::default();
@@ -768,47 +983,7 @@ pub async fn explore(
     let recent = rows
         .iter()
         .take(100)
-        .map(|r| RequestEvent {
-            id: r.id,
-            created_at: r
-                .created_at
-                .clone(),
-            method: r
-                .method
-                .clone(),
-            route: r
-                .route_template
-                .clone(),
-            status: r.status,
-            latency_ms: r.latency_ms,
-            sample_reason: r
-                .sample_reason
-                .clone(),
-            device: r
-                .device_name
-                .clone()
-                .unwrap_or_else(|| "Unknown".into()),
-            client: r
-                .client_name
-                .clone()
-                .unwrap_or_else(|| "Unknown".into()),
-            client_version: r
-                .client_version
-                .clone()
-                .unwrap_or_default(),
-            user: r
-                .user_name
-                .clone()
-                .unwrap_or_else(|| "Unknown".into()),
-            content: r
-                .item_name
-                .clone()
-                .unwrap_or_default(),
-            error_category: r
-                .error_category
-                .clone()
-                .unwrap_or_default(),
-        })
+        .map(request_event)
         .collect();
     let filters = FilterOptions {
         routes: routes
@@ -835,6 +1010,7 @@ pub async fn explore(
     };
     Ok(Json(ExploreResponse {
         hours,
+        offset_hours,
         bucket_minutes,
         group_by,
         resolution: "raw".into(),
@@ -878,5 +1054,46 @@ mod tests {
         assert_eq!(stats.p95_latency_ms, 1_000.0);
         assert_eq!(stats.p99_latency_ms, 10_000.0);
         assert_eq!(stats.error_rate, 2.0);
+    }
+
+    #[test]
+    fn composite_dimensions_and_label_sort_are_stable() {
+        let row = RequestRow {
+            id: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            method: "GET".into(),
+            route_template: "/items/{id}".into(),
+            status: 200,
+            latency_ms: 10.0,
+            sample_reason: "sample".into(),
+            device_name: Some("Living Room".into()),
+            client_name: Some("Jellyflix".into()),
+            client_version: Some("2.3.1".into()),
+            user_name: Some("viewer".into()),
+            item_name: Some("Episode".into()),
+            error_category: None,
+        };
+        assert_eq!(label(&row, "deviceClient"), "Living Room · Jellyflix 2.3.1");
+        assert_eq!(label(&row, "routeClient"), "/items/{id} · Jellyflix");
+
+        let mut rows = vec![
+            BreakdownRow {
+                label: "Zulu".into(),
+                stats: Stats::default(),
+            },
+            BreakdownRow {
+                label: "alpha".into(),
+                stats: Stats::default(),
+            },
+        ];
+        sort_breakdown(
+            &mut rows,
+            &ExploreQuery {
+                sort_by: Some("label".into()),
+                sort_dir: Some("asc".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(rows[0].label, "alpha");
     }
 }

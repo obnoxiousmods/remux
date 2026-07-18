@@ -5046,6 +5046,7 @@ pub struct TelemetryFilterOptions {
 #[serde(rename_all = "camelCase", default)]
 pub struct TelemetryExploreResponse {
     pub hours: i64,
+    pub offset_hours: i64,
     pub bucket_minutes: i64,
     pub group_by: String,
     pub resolution: String,
@@ -5061,6 +5062,7 @@ pub struct TelemetryExploreResponse {
 #[derive(Debug, Clone, Default)]
 pub struct GetTelemetryExplore {
     pub hours: i64,
+    pub offset_hours: i64,
     pub bucket_minutes: i64,
     pub group_by: String,
     pub route: String,
@@ -5073,6 +5075,7 @@ pub struct GetTelemetryExplore {
     pub sample_reason: String,
     pub sort_by: String,
     pub sort_dir: String,
+    pub limit: usize,
 }
 
 impl Endpoint for GetTelemetryExplore {
@@ -5082,6 +5085,11 @@ impl Endpoint for GetTelemetryExplore {
             (
                 "hours",
                 self.hours
+                    .to_string(),
+            ),
+            (
+                "offsetHours",
+                self.offset_hours
                     .to_string(),
             ),
             (
@@ -5144,6 +5152,11 @@ impl Endpoint for GetTelemetryExplore {
                 self.sort_dir
                     .clone(),
             ),
+            (
+                "limit",
+                self.limit
+                    .to_string(),
+            ),
         ];
         let query = pairs
             .into_iter()
@@ -5192,6 +5205,16 @@ mod telemetry_contract_tests {
             12.5
         );
         assert_eq!(explore.captured_rows, 1);
+
+        let request = GetTelemetryExplore {
+            hours: 24,
+            offset_hours: 24,
+            limit: 200,
+            ..Default::default()
+        };
+        let path = request.path();
+        assert!(path.contains("offsetHours=24"));
+        assert!(path.contains("limit=200"));
     }
 }
 
