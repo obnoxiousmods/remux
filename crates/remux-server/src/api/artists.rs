@@ -6,6 +6,7 @@ use axum::{
 use axum_anyhow::ApiResult as Result;
 use axum_extra::extract::Query as ExtraQuery;
 use remux_macros::get;
+use uuid::Uuid;
 
 use crate::{AppState, OptionExt, api, api::items::get_items, db, db::auth};
 

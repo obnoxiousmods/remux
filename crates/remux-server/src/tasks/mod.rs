@@ -28,6 +28,10 @@ mod jellyfin_import;
 mod purge_iptv;
 mod purge_media;
 mod purge_metrics;
+mod purge_movies;
+mod purge_music;
+mod purge_shared;
+mod purge_shows;
 mod refresh_all_meta;
 mod refresh_iptv;
 mod refresh_library;
@@ -45,6 +49,9 @@ use jellyfin_import::JellyfinImportTask;
 use purge_iptv::PurgeIptvTask;
 use purge_media::PurgeMediaTask;
 use purge_metrics::PurgeMetricsTask;
+use purge_movies::PurgeMoviesTask;
+use purge_music::PurgeMusicTask;
+use purge_shows::PurgeShowsTask;
 use refresh_all_meta::RefreshAllMetaTask;
 use refresh_iptv::RefreshIptvTask;
 use refresh_library::RefreshLibraryTask;
@@ -131,6 +138,7 @@ pub enum TaskCategory {
     LiveTv,
     Users,
     Maintenance,
+    Purge,
 }
 
 impl TaskCategory {
@@ -140,6 +148,7 @@ impl TaskCategory {
             Self::LiveTv => 1,
             Self::Users => 2,
             Self::Maintenance => 3,
+            Self::Purge => 4,
         }
     }
 }
@@ -401,6 +410,15 @@ impl TaskService {
             .await?;
         service
             .register_task(Arc::new(PurgeIptvTask))
+            .await?;
+        service
+            .register_task(Arc::new(PurgeMoviesTask))
+            .await?;
+        service
+            .register_task(Arc::new(PurgeShowsTask))
+            .await?;
+        service
+            .register_task(Arc::new(PurgeMusicTask))
             .await?;
         service
             .register_task(Arc::new(JellyfinImportTask))

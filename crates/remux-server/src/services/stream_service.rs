@@ -1,8 +1,12 @@
 use crate::{
     AppContext, api, db,
     playback::probe::{probe_stream, resolve_stream_root},
+    stream::StreamDescriptor,
 };
-use remux_sdks::remux::StreamFilter;
+use remux_sdks::{
+    remux::{MediaStreamType, StreamFilter, VideoRangeType},
+    remuxdb,
+};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -431,6 +435,15 @@ impl StreamService {
             .ctx
             .config
             .port;
+        let item = db::Media::get_by_id(
+            &self
+                .ctx
+                .db,
+            &self.item_id,
+        )
+        .await
+        .ok()
+        .flatten();
 
         let mut results = Vec::with_capacity(
             sel.candidates
@@ -449,6 +462,11 @@ impl StreamService {
                         .server_input(stream.id, port)
                 });
             let skip_probe = sel.probe_only_first && idx > 0;
+            let was_cached = stream
+                .probe_data
+                .as_ref()
+                .and_then(|pd| pd.video_stream())
+                .is_some();
             let timeout_secs = if stream
                 .stream_info
                 .as_ref()
@@ -475,10 +493,25 @@ impl StreamService {
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-            let cid = self.source_id_for(&effective_stream);
+            // Use the StreamGroup UUID when this candidate is a group representative
+            // (group_id is set by filter_sources). This ensures the client sends back
+            // the stable group UUID, not a stream UUID that can change after a refresh.
+            let (cid, name) = if let Some(gid) = stream.group_id {
+                (
+                    gid,
+                    stream
+                        .title
+                        .clone(),
+                )
+            } else {
+                (
+                    self.source_id_for(&effective_stream),
+                    self.source_name_for(&effective_stream),
+                )
+            };
             source.id = cid;
             source.e_tag = cid;
-            source.name = Some(self.source_name_for(&effective_stream));
+            source.name = Some(name);
             source.has_segments = true;
             source.path = Some(format!("/remux/{}", effective_stream.id));
             source.is_remote = false;
@@ -490,6 +523,33 @@ impl StreamService {
                     .as_ref()
                     .and_then(|si| serde_json::to_value(si).ok()),
             });
+
+            let remuxdb_enabled = probe_cfg
+                .remuxdb_enabled
+                .unwrap_or(true);
+            if was_cached {
+                debug!(id = %effective_stream.id, "remuxdb: skipping (probe cache hit)");
+            } else if !remuxdb_enabled {
+                debug!(id = %effective_stream.id, "remuxdb: skipping (disabled)");
+            } else if let Some(url) = self
+                .ctx
+                .config
+                .remuxdb_url
+                .clone()
+            {
+                match media_info_from_probe(&source, &effective_stream, item.as_ref()) {
+                    Some(mi) => {
+                        debug!(id = %effective_stream.id, url, "remuxdb: submitting mediainfo");
+                        let token = probe_cfg
+                            .remuxdb_token
+                            .clone();
+                        tokio::spawn(mi.submit(url, token));
+                    }
+                    None => {
+                        debug!(id = %effective_stream.id, "remuxdb: skipping (no stream_info or missing required fields)");
+                    }
+                }
+            }
 
             results.push(ProbeResult {
                 source,
@@ -536,4 +596,308 @@ pub(crate) struct StreamSelection {
     pub probe_only_first: bool,
     /// True when the client named a specific stream — keep its UUID, don't override to item_id.
     pub specific_requested: bool,
+}
+
+fn media_info_from_probe(
+    probe: &api::MediaSourceInfo,
+    stream: &db::Media,
+    item: Option<&db::Media>,
+) -> Option<remuxdb::MediaInfo> {
+    let (info_hash, file_idx, filename) = match stream
+        .stream_info
+        .as_ref()
+    {
+        Some(si) => {
+            let (hash, idx) = match &si.descriptor {
+                StreamDescriptor::Torrent {
+                    info_hash,
+                    file_idx,
+                    ..
+                } => (Some(info_hash.clone()), file_idx.map(|i| i as i32)),
+                _ => (None, None),
+            };
+            (
+                hash,
+                idx,
+                si.filename
+                    .clone()
+                    .unwrap_or_else(|| {
+                        stream
+                            .title
+                            .clone()
+                    }),
+            )
+        }
+        None => (
+            None,
+            None,
+            stream
+                .title
+                .clone(),
+        ),
+    };
+
+    let (kind, external_ids, season, episode) = if let Some(item) = item {
+        let kind = match item.kind {
+            db::MediaKind::Episode => "episode",
+            _ => "movie",
+        }
+        .to_string();
+        let imdb_id = item
+            .external_ids
+            .imdb
+            .as_ref()
+            .or(item
+                .external_ids
+                .series_imdb
+                .as_ref())
+            .map(|v| v.to_string());
+        let ids = (imdb_id.is_some()
+            || item
+                .external_ids
+                .tmdb
+                .is_some()
+            || item
+                .external_ids
+                .tvdb
+                .is_some()
+            || item
+                .external_ids
+                .kitsu
+                .is_some())
+        .then(|| remuxdb::ExternalIds {
+            imdb_id,
+            tmdb_id: item
+                .external_ids
+                .tmdb,
+            tvdb_id: item
+                .external_ids
+                .tvdb,
+            kitsu_id: item
+                .external_ids
+                .kitsu,
+        });
+        let season = if item.kind == db::MediaKind::Episode {
+            item.parent_idx
+                .map(|v| v as i32)
+        } else {
+            None
+        };
+        let episode = if item.kind == db::MediaKind::Episode {
+            item.idx
+                .map(|v| v as i32)
+        } else {
+            None
+        };
+        (kind, ids, season, episode)
+    } else {
+        ("movie".to_string(), None, None, None)
+    };
+
+    let tracks = probe
+        .media_streams
+        .iter()
+        .filter_map(|ms| match ms.type_? {
+            MediaStreamType::Video => {
+                Some(remuxdb::TrackPayload::Video(remuxdb::VideoTrackPayload {
+                    idx: ms.index as i32,
+                    codec: ms
+                        .codec
+                        .clone()
+                        .unwrap_or_default(),
+                    width: ms
+                        .width
+                        .unwrap_or(0) as i32,
+                    height: ms
+                        .height
+                        .unwrap_or(0) as i32,
+                    fps: ms
+                        .real_frame_rate
+                        .map(|f| f as f64),
+                    avg_fps: ms
+                        .average_frame_rate
+                        .map(|f| f as f64),
+                    bit_rate: ms.bit_rate,
+                    bit_depth: ms
+                        .bit_depth
+                        .map(|d| d as i32),
+                    profile: ms
+                        .profile
+                        .clone(),
+                    codec_tag: ms
+                        .codec_tag
+                        .clone(),
+                    comment: ms
+                        .comment
+                        .clone(),
+                    title: ms
+                        .title
+                        .clone(),
+                    language: ms
+                        .language
+                        .clone(),
+                    color_primaries: ms
+                        .color_primaries
+                        .clone(),
+                    color_range: ms
+                        .color_range
+                        .clone(),
+                    color_space: ms
+                        .color_space
+                        .clone(),
+                    color_transfer: ms
+                        .color_transfer
+                        .clone(),
+                    aspect_ratio: ms
+                        .aspect_ratio
+                        .clone(),
+                    rotation: ms
+                        .rotation
+                        .map(|r| r as i32),
+                    is_default: ms
+                        .is_default
+                        .unwrap_or(false),
+                    is_forced: ms.is_forced,
+                    is_external: ms.is_external,
+                    is_hearing_impaired: ms.is_hearing_impaired,
+                    is_interlaced: ms.is_interlaced,
+                    hdr10_plus_present: matches!(
+                        ms.video_range_type,
+                        Some(VideoRangeType::Hdr10Plus)
+                    ),
+                    dv_profile: ms
+                        .dv_profile
+                        .map(|v| v as i32),
+                    dv_level: ms
+                        .dv_level
+                        .map(|v| v as i32),
+                    dv_version_major: ms
+                        .dv_version_major
+                        .map(|v| v as i32),
+                    dv_version_minor: ms
+                        .dv_version_minor
+                        .map(|v| v as i32),
+                    dv_bl_signal_compat_id: ms
+                        .dv_bl_signal_compatibility_id
+                        .map(|v| v as i32),
+                    dv_rpu_present: ms
+                        .rpu_present_flag
+                        .map_or(false, |v| v != 0),
+                    dv_bl_present: ms
+                        .bl_present_flag
+                        .map_or(false, |v| v != 0),
+                    dv_el_present: ms
+                        .el_present_flag
+                        .map_or(false, |v| v != 0),
+                    is_anamorphic: ms
+                        .is_anamorphic
+                        .unwrap_or(false),
+                    level: ms
+                        .level
+                        .map(|v| v as i32),
+                    ref_frames: ms
+                        .ref_frames
+                        .map(|v| v as i32),
+                }))
+            }
+            MediaStreamType::Audio => {
+                Some(remuxdb::TrackPayload::Audio(remuxdb::AudioTrackPayload {
+                    idx: ms.index as i32,
+                    codec: ms
+                        .codec
+                        .clone()
+                        .unwrap_or_default(),
+                    channels: ms
+                        .channels
+                        .unwrap_or(0) as i32,
+                    sample_rate: ms
+                        .sample_rate
+                        .unwrap_or(0) as i32,
+                    bit_rate: ms.bit_rate,
+                    bit_depth: ms
+                        .bit_depth
+                        .map(|d| d as i32),
+                    channel_layout: ms
+                        .channel_layout
+                        .clone(),
+                    profile: ms
+                        .profile
+                        .clone(),
+                    codec_tag: ms
+                        .codec_tag
+                        .clone(),
+                    comment: ms
+                        .comment
+                        .clone(),
+                    title: ms
+                        .title
+                        .clone(),
+                    language: ms
+                        .language
+                        .clone(),
+                    is_default: ms
+                        .is_default
+                        .unwrap_or(false),
+                    is_forced: ms.is_forced,
+                    is_external: ms.is_external,
+                    is_hearing_impaired: ms.is_hearing_impaired,
+                }))
+            }
+            MediaStreamType::Subtitle => Some(remuxdb::TrackPayload::Subtitle(
+                remuxdb::SubtitleTrackPayload {
+                    idx: ms.index as i32,
+                    codec: ms
+                        .codec
+                        .clone(),
+                    title: ms
+                        .title
+                        .clone(),
+                    language: ms
+                        .language
+                        .clone(),
+                    comment: ms
+                        .comment
+                        .clone(),
+                    is_default: ms
+                        .is_default
+                        .unwrap_or(false),
+                    is_forced: ms.is_forced,
+                    is_external: ms.is_external,
+                    is_hearing_impaired: ms.is_hearing_impaired,
+                },
+            )),
+            _ => None,
+        })
+        .collect();
+
+    Some(remuxdb::MediaInfo {
+        client_id: crate::common::server_id(),
+        kind,
+        filename,
+        torrent_info_hash: info_hash,
+        torrent_file_idx: file_idx,
+        container: probe
+            .container
+            .clone()
+            .unwrap_or_default(),
+        size: probe
+            .size
+            .or_else(|| {
+                stream
+                    .stream_info
+                    .as_ref()
+                    .and_then(|si| si.size)
+            })
+            .filter(|&s| s > 0)?,
+        duration: crate::common::ticks_to_seconds(
+            probe
+                .run_time_ticks
+                .unwrap_or(0),
+        ),
+        bitrate: probe.bitrate,
+        season,
+        episode,
+        external_ids,
+        tracks,
+    })
 }

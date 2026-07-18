@@ -643,6 +643,7 @@ pub fn CollectionForm(
                         SelectOption::new("mixed", "Mixed (Movies & Shows)"),
                         SelectOption::new("music", "Music"),
                         SelectOption::new("collections", "Collections"),
+                        SelectOption::new("playlists", "Playlists"),
                     ],
                     on_change: move |v: String| col_type.set(v),
                 }

@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use gloo_storage::{LocalStorage, Storage};
 use remux_sdks::{
     remux::{
         AuthenticateUserByName, CountryInfo, GetCountries, GetStartupConfiguration,
@@ -36,6 +37,18 @@ fn App() -> Element {
     // Initialise theming: applies the persisted mode to <html>, provides the
     // ThemePrefs context, and drives the live accent/scale <style> below.
     let theme = use_theme();
+
+    use_effect(move || {
+        let initial_theme =
+            LocalStorage::get::<String>("theme").unwrap_or_else(|_| "auto".to_string());
+        if let Some(window) = web_sys::window() {
+            if let Some(document) = window.document() {
+                if let Some(html) = document.document_element() {
+                    let _ = html.set_attribute("data-theme", &initial_theme);
+                }
+            }
+        }
+    });
 
     use_effect(move || {
         spawn(async move {

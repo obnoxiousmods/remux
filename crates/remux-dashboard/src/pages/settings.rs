@@ -7,10 +7,10 @@ use crate::{
 };
 use dioxus::prelude::*;
 use remux_sdks::remux::{
-    CountryInfo, EmbeddedSubtitleHandling, EncodingOptions, GetCountries,
-    GetEncodingConfiguration, GetIntroConfiguration, GetSystemConfiguration,
-    HardwareAccelerationType, IntroOptions, IntroOrder, IntroTriggers,
-    ServerConfiguration, StartTask, UpdateEncodingConfiguration,
+    CountryInfo, CultureDto, EmbeddedSubtitleHandling, EncodingOptions, GetCountries,
+    GetCultures, GetEncodingConfiguration, GetIntroConfiguration,
+    GetSystemConfiguration, HardwareAccelerationType, IntroOptions, IntroOrder,
+    IntroTriggers, ServerConfiguration, StartTask, UpdateEncodingConfiguration,
     UpdateIntroConfiguration, UpdateSystemConfiguration,
 };
 
@@ -19,7 +19,9 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
     let mut base_cfg: Signal<Option<ServerConfiguration>> = use_signal(|| None);
     let mut server_name = use_signal(String::new);
     let mut metadata_country = use_signal(|| "US".to_string());
+    let mut metadata_language = use_signal(|| "en".to_string());
     let mut countries: Signal<Vec<CountryInfo>> = use_signal(Vec::new);
+    let mut cultures: Signal<Vec<CultureDto>> = use_signal(Vec::new);
     let mut catalog_max_items = use_signal(|| 100_i64);
     let mut meta_concurrency = use_signal(|| 12_i64);
     let mut filter_digital_release = use_signal(|| true);
@@ -54,6 +56,11 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                         cfg.metadata_country_code
                             .clone()
                             .unwrap_or_else(|| "US".to_string()),
+                    );
+                    metadata_language.set(
+                        cfg.preferred_metadata_language
+                            .clone()
+                            .unwrap_or_else(|| "en".to_string()),
                     );
                     catalog_max_items.set(
                         cfg.catalog_max_items
@@ -95,6 +102,12 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
             {
                 countries.set(list);
             }
+            if let Ok(list) = client
+                .execute(GetCultures)
+                .await
+            {
+                cultures.set(list);
+            }
             loading.set(false);
         });
     });
@@ -108,6 +121,9 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
             .peek()
             .clone();
         let country = metadata_country
+            .peek()
+            .clone();
+        let language = metadata_language
             .peek()
             .clone();
         let max = *catalog_max_items.peek();
@@ -130,6 +146,7 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
             .unwrap_or_default();
         cfg.server_name = Some(name);
         cfg.metadata_country_code = Some(country);
+        cfg.preferred_metadata_language = Some(language);
         cfg.quick_connect_available = Some(qc_enabled);
         cfg.catalog_max_items = Some(max);
         cfg.meta_concurrency = concurrency;
@@ -204,6 +221,23 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                                     format!("{} ({})", country.name, country.two_letter_iso_region_name),
                                 )).collect(),
                                 on_change: move |v: String| metadata_country.set(v),
+                            }
+                        }
+
+                        div { class: "field",
+                            label { class: "field-label", r#for: "s-language", "Metadata Language" }
+                            select {
+                                id: "s-language",
+                                class: "select-input",
+                                value: "{metadata_language}",
+                                onchange: move |e| metadata_language.set(e.value()),
+                                for culture in cultures.read().iter() {
+                                    option {
+                                        value: "{culture.two_letter_iso_language_name}",
+                                        selected: metadata_language.read().as_str() == culture.two_letter_iso_language_name,
+                                        "{culture.display_name} ({culture.two_letter_iso_language_name})"
+                                    }
+                                }
                             }
                         }
 
@@ -1627,6 +1661,135 @@ pub fn IntroSettingsCard(app_state: AppState) -> Element {
                     }
 
                     FormActions {
+                        button {
+                            r#type: "submit",
+                            class: "btn btn-primary",
+                            disabled: *saving.read(),
+                            if *saving.read() { "Saving…" } else { "Save Settings" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn RemuxdbSettingsCard(app_state: AppState) -> Element {
+    let mut base_cfg: Signal<Option<ServerConfiguration>> = use_signal(|| None);
+    let mut enabled = use_signal(|| true);
+    let mut token = use_signal(String::new);
+    let mut loading = use_signal(|| true);
+    let mut saving = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+    let mut saved = use_signal(|| false);
+
+    let app_state_load = app_state.clone();
+    use_effect(move || {
+        let client = app_state_load
+            .client
+            .clone();
+        spawn(async move {
+            match client
+                .execute(GetSystemConfiguration)
+                .await
+            {
+                Ok(cfg) => {
+                    enabled.set(
+                        cfg.remuxdb_enabled
+                            .unwrap_or(true),
+                    );
+                    token.set(
+                        cfg.remuxdb_token
+                            .clone()
+                            .unwrap_or_default(),
+                    );
+                    base_cfg.set(Some(cfg));
+                }
+                Err(e) => error.set(Some(format!("Failed to load: {e}"))),
+            }
+            loading.set(false);
+        });
+    });
+
+    let on_submit = move |e: Event<FormData>| {
+        e.prevent_default();
+        let client = app_state
+            .client
+            .clone();
+        let Some(cfg) = base_cfg
+            .peek()
+            .clone()
+        else {
+            return;
+        };
+        let token_val = token
+            .peek()
+            .clone();
+        let updated = ServerConfiguration {
+            remuxdb_enabled: Some(*enabled.peek()),
+            remuxdb_token: if token_val.is_empty() {
+                None
+            } else {
+                Some(token_val)
+            },
+            ..cfg
+        };
+        saving.set(true);
+        error.set(None);
+        saved.set(false);
+        spawn(async move {
+            match client
+                .execute(UpdateSystemConfiguration { config: updated })
+                .await
+            {
+                Ok(_) => saved.set(true),
+                Err(e) => error.set(Some(e.user_message())),
+            }
+            saving.set(false);
+        });
+    };
+
+    rsx! {
+        Card { title: "Remuxdb",
+            if *loading.read() {
+                LoadingText {}
+            } else {
+                form { onsubmit: on_submit, style: "display:flex;flex-direction:column;gap:14px",
+                    div { class: "field",
+                        label { class: "field-label",
+                            input {
+                                r#type: "checkbox",
+                                checked: *enabled.read(),
+                                oninput: move |e| enabled.set(e.checked()),
+                            }
+                            " Enable Remuxdb"
+                        }
+                        p { class: "field-hint", "Submit probe data to remuxdb after each live probe." }
+                    }
+
+                    if *enabled.read() {
+                        div { class: "field",
+                            label { class: "field-label", r#for: "remuxdb-token", "User Token" }
+                            input {
+                                id: "remuxdb-token",
+                                r#type: "password",
+                                class: "field-input",
+                                placeholder: "••••••••••••••••",
+                                value: "{token}",
+                                oninput: move |e| token.set(e.value()),
+                            }
+                            p { class: "field-hint", "Optional bearer token for your remuxdb account." }
+                        }
+                    }
+
+                    if let Some(err) = error.read().as_ref() {
+                        ErrorAlert { message: err.clone() }
+                    }
+                    if *saved.read() {
+                        SuccessAlert { message: "Settings saved.".to_string() }
+                    }
+                    div { class: "form-actions",
                         button {
                             r#type: "submit",
                             class: "btn btn-primary",

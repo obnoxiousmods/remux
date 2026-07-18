@@ -1556,30 +1556,39 @@ pub async fn item(
     let show_ungrouped = server_config
         .stream_groups_show_ungrouped
         .unwrap_or(true);
-    let mut media = match MediaResolveService::resolve_item(id, &state.ctx).await? {
-        Some(m) => db::Media::get_by_filter(
-            &state
-                .ctx
-                .db,
-            &db::MediaFilter {
-                id: Some(vec![m.id]),
-                include_user_state: true,
-                include_child_count: true,
-                user_id: Some(
-                    session
-                        .user
-                        .id,
-                ),
-                ..Default::default()
-            },
-        )
-        .await?
-        .records
-        .into_iter()
-        .next()
-        .unwrap_or(m),
+    let resolved_id = match MediaResolveService::resolve_item(id, &state.ctx).await? {
+        // Stream-group UUIDs are client-facing source IDs, not independently
+        // browsable items. Resolve them back to their movie/episode parent.
+        Some(media) if media.kind == db::MediaKind::StreamGroup => {
+            match media.parent_id {
+                Some(parent_id) => parent_id,
+                None => return Ok(None),
+            }
+        }
+        Some(media) => media.id,
         None => return Ok(None),
     };
+    let mut media = db::Media::get_by_filter(
+        &state
+            .ctx
+            .db,
+        &db::MediaFilter {
+            id: Some(vec![resolved_id]),
+            include_user_state: true,
+            include_child_count: true,
+            user_id: Some(
+                session
+                    .user
+                    .id,
+            ),
+            ..Default::default()
+        },
+    )
+    .await?
+    .records
+    .into_iter()
+    .next()
+    .context_not_found("item not found")?;
 
     let needs_streams = want_streams
         && matches!(
@@ -3649,6 +3658,133 @@ mod tests {
                 > 0,
             "unfiltered query on series collection must return series"
         );
+    }
+
+    #[tokio::test]
+    async fn collections_parent_hides_empty_smart_collection() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        insert_smart_collection_with_filter(
+            db,
+            "Top Provider Movies",
+            db::CollectionMediaKind::Movie,
+            Some(tag_filter("provider:NonExistent")),
+        )
+        .await;
+
+        let body: serde_json::Value = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("parentId", COLLECTIONS_PARENT_ID)])
+            .await
+            .json();
+
+        let empty = vec![];
+        let names: Vec<&str> = body["Items"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|item| item["Name"].as_str())
+            .collect();
+        assert!(!names.contains(&"Top Provider Movies"));
+    }
+
+    #[tokio::test]
+    async fn collections_parent_shows_non_empty_smart_collection() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let movie =
+            insert_media(db, "Tagged Movie", db::MediaKind::Movie, "tt9991234").await;
+        sqlx::query("INSERT OR IGNORE INTO media_tags (media_id, tag) VALUES (?, ?)")
+            .bind(movie.id)
+            .bind("provider:TestNet")
+            .execute(db)
+            .await
+            .unwrap();
+        insert_smart_collection_with_filter(
+            db,
+            "TestNet Movies",
+            db::CollectionMediaKind::Movie,
+            Some(tag_filter("provider:TestNet")),
+        )
+        .await;
+
+        let body: serde_json::Value = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("parentId", COLLECTIONS_PARENT_ID)])
+            .await
+            .json();
+
+        let empty = vec![];
+        let names: Vec<&str> = body["Items"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|item| item["Name"].as_str())
+            .collect();
+        assert!(names.contains(&"TestNet Movies"));
+    }
+
+    #[tokio::test]
+    async fn userviews_hides_empty_smart_collection() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let now = Utc::now().naive_utc();
+        let mut collection = db::Media {
+            title: "Empty Provider Shows".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Smart),
+            collection_media_kind: Some(db::CollectionMediaKind::Series),
+            collection_smart_filter: Some(tag_filter("provider:NobodyHasThis")),
+            promoted: true,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        collection
+            .save(db)
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = server
+            .get(&format!("/userviews?userId={user_id}"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+
+        let empty = vec![];
+        let names: Vec<&str> = body["Items"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|item| item["Name"].as_str())
+            .collect();
+        assert!(!names.contains(&"Empty Provider Shows"));
     }
 
     #[tokio::test]

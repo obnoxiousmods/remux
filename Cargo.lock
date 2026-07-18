@@ -6319,6 +6319,7 @@ dependencies = [
  "gloo-net",
  "gloo-storage",
  "gloo-timers",
+ "js-sys",
  "remux-sdks",
  "serde",
  "serde_json",

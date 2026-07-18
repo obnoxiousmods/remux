@@ -142,6 +142,7 @@ pub fn DashboardLayout() -> Element {
         Route::SettingsBrandingRoute => "Branding",
         Route::SettingsAppearanceRoute => "Appearance",
         Route::SettingsIntroRoute => "Intro",
+        Route::SettingsRemuxdbRoute => "Remuxdb",
         Route::AccessUsersRoute => "Users",
         Route::AccessApiKeysRoute => "API Keys",
         Route::AccessDevicesRoute => "Devices",
@@ -168,7 +169,10 @@ pub fn DashboardLayout() -> Element {
         | Route::SettingsJellyfinSyncRoute
         | Route::SettingsBrandingRoute
         | Route::SettingsAppearanceRoute
-        | Route::SettingsIntroRoute => Some(("Settings", Route::SettingsGeneralRoute)),
+        | Route::SettingsIntroRoute
+        | Route::SettingsRemuxdbRoute => {
+            Some(("Settings", Route::SettingsGeneralRoute))
+        }
         Route::AccessUsersRoute
         | Route::AccessApiKeysRoute
         | Route::AccessDevicesRoute => Some(("Access", Route::AccessUsersRoute)),
@@ -270,6 +274,7 @@ pub fn DashboardLayout() -> Element {
                             | Route::SettingsBrandingRoute
                             | Route::SettingsAppearanceRoute
                             | Route::SettingsIntroRoute
+                            | Route::SettingsRemuxdbRoute
                         ),
                         NavSubItem {
                             label: "General",
@@ -313,6 +318,12 @@ pub fn DashboardLayout() -> Element {
                             active: route == Route::SettingsAppearanceRoute,
                             on_click: move |_| { navigator().push(Route::SettingsAppearanceRoute); sidebar_open.set(false); },
                         }
+                        NavSubItem {
+                            label: "Remuxdb",
+                            icon: "database",
+                            active: route == Route::SettingsRemuxdbRoute,
+                            on_click: move |_| { navigator().push(Route::SettingsRemuxdbRoute); sidebar_open.set(false); },
+                        }
                     }
 
                     SidebarGroup {
@@ -342,7 +353,7 @@ pub fn DashboardLayout() -> Element {
                     SidebarGroup {
                         label: "System",
                         icon: "system",
-                        active: matches!(route, Route::SystemLogsRoute | Route::SystemActivityRoute),
+                        active: matches!(route, Route::SystemLogsRoute | Route::SystemActivityRoute | Route::SystemTelemetryRoute | Route::SessionsRoute),
                         NavSubItem {
                             label: "Activity",
                             icon: "activity",

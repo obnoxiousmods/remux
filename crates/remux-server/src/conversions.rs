@@ -256,12 +256,14 @@ impl From<db::Media> for api::MediaSourceInfo {
         // download dialog — whereas a null/absent array is handled safely. When a
         // track has not been probed yet, synthesize a minimal audio stream from
         // the container so the array always carries at least one element.
-        let media_streams = if media_streams.is_empty() {
+        let media_streams = if is_track && media_streams.is_empty() {
             vec![api::MediaStream {
                 type_: Some(api::MediaStreamType::Audio),
                 index: 0,
                 codec: Some(container.clone()),
+                channels: Some(2),
                 is_default: Some(true),
+                display_title: Some("Audio".to_string()),
                 ..Default::default()
             }]
         } else {

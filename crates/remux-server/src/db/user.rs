@@ -325,11 +325,24 @@ impl User {
     }
 
     pub async fn delete(db: &SqlitePool, id: &Uuid) -> Result<bool> {
+        sqlx::query("DELETE FROM devices WHERE user_id = ?1")
+            .bind(id)
+            .execute(db)
+            .await?;
+        // user_media_state is intentionally not cleaned up — see schema comment
         let result = sqlx::query("DELETE FROM users WHERE id = ?1")
             .bind(id)
             .execute(db)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    pub fn can_remote_control_others(&self) -> bool {
+        self.is_admin
+            || self
+                .policy
+                .as_deref()
+                .map_or(false, |p| p.enable_remote_control_of_other_users)
     }
 
     pub async fn get_media_state(

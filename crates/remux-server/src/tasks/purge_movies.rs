@@ -5,21 +5,21 @@ use std::sync::Arc;
 use super::{ProgressReporter, Task, TaskCategory, TaskService};
 use crate::AppContext;
 
-pub struct PurgeIptvTask;
+pub struct PurgeMoviesTask;
 
 #[async_trait]
-impl Task for PurgeIptvTask {
+impl Task for PurgeMoviesTask {
     fn key(&self) -> &str {
-        "PurgeIptv"
+        "PurgeMovies"
     }
     fn name(&self) -> &str {
-        "Purge IPTV"
+        "Purge Movies"
     }
     fn description(&self) -> &str {
-        "Wipes all IPTV channels and programs from the database."
+        "Wipes all movies from the database."
     }
     fn short_description(&self) -> &str {
-        "Removes all TV channels and programs (no physical files are deleted)."
+        "Removes all movie items (no physical files are deleted)."
     }
     fn category(&self) -> TaskCategory {
         TaskCategory::Purge
@@ -34,6 +34,6 @@ impl Task for PurgeIptvTask {
         _tasks: Arc<TaskService>,
         _progress: ProgressReporter,
     ) -> Result<()> {
-        super::purge_shared::purge_by_kinds(&ctx, &["tv_channel", "tv_program"]).await
+        super::purge_shared::purge_by_kinds(&ctx, &["movie"]).await
     }
 }

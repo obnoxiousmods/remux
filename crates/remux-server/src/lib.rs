@@ -272,6 +272,7 @@ pub async fn init_app(
         )),
         web_paths,
         addons,
+        started_at: Utc::now(),
     };
 
     // Sync intro items at startup (best-effort; errors are logged not fatal).
@@ -378,6 +379,8 @@ pub struct AppContext {
     /// Present in filesystem builds; `None` in desktop (assets are embedded).
     pub web_paths: Option<FilesystemPaths>,
     pub addons: addons::AddonService,
+    /// When this server process started.
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl AppContext {
@@ -505,6 +508,10 @@ pub struct Config {
     pub telemetry_sample_rate: f64,
     #[serde(default = "default_telemetry_slow_request_ms")]
     pub telemetry_slow_request_ms: u64,
+    /// Base URL for RemuxDB. When set, probe results are submitted after each
+    /// live probe. Set to null to disable submission.
+    #[serde(default = "default_remuxdb_url")]
+    pub remuxdb_url: Option<String>,
     /// Size of the SQLite connection pool. WAL mode permits unlimited
     /// concurrent readers, so this bounds how many requests can touch the
     /// database at once; too small a value simply queues readers behind each
@@ -537,6 +544,10 @@ fn default_telemetry_sample_rate() -> f64 {
 }
 fn default_telemetry_slow_request_ms() -> u64 {
     1_000
+}
+
+fn default_remuxdb_url() -> Option<String> {
+    Some("https://remuxdb.1632022.xyz".to_string())
 }
 
 fn default_addon_http_timeout_secs() -> u64 {
@@ -645,6 +656,7 @@ impl Default for Config {
             telemetry_enabled: default_telemetry_enabled(),
             telemetry_sample_rate: default_telemetry_sample_rate(),
             telemetry_slow_request_ms: default_telemetry_slow_request_ms(),
+            remuxdb_url: default_remuxdb_url(),
             db_max_connections: default_db_max_connections(),
         }
         .resolve()
