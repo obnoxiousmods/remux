@@ -7,7 +7,8 @@ use gloo_timers::future::TimeoutFuture;
 use remux_sdks::remux::{
     DeleteTelemetryView, GetTelemetryExplore, GetTelemetryViews, SaveTelemetryView,
     TelemetryBreakdownRow, TelemetryExploreResponse, TelemetryFilterOptions,
-    TelemetryRequestEvent, TelemetrySavedView, TelemetrySeriesPoint, TelemetryStats,
+    TelemetryPlaybackReadiness, TelemetryRequestEvent, TelemetrySavedView,
+    TelemetrySeriesPoint, TelemetryStats,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -900,6 +901,55 @@ fn StatusDonut(rows: Vec<TelemetryBreakdownRow>) -> Element {
 }
 
 #[component]
+fn PlaybackReadinessPanel(
+    readiness: TelemetryPlaybackReadiness,
+    previous: Option<TelemetryPlaybackReadiness>,
+) -> Element {
+    let previous: HashMap<String, TelemetryStats> = previous
+        .map(|value| {
+            value
+                .breakdown
+                .into_iter()
+                .map(|row| (row.label, row.stats))
+                .collect()
+        })
+        .unwrap_or_default();
+    rsx! {
+        div { class:"telemetry-readiness",
+            div { class:"telemetry-readiness-copy",
+                p { "Measured inside Remux from playback-info, HLS manifest and direct-stream responses. These are server readiness/TTFB timings; browser first-frame reports are not included." }
+                span { "Device, client, user, content, endpoint and status filters apply where available." }
+            }
+            if readiness.breakdown.is_empty() {
+                EmptyState { message:"No server playback-readiness requests match this view." }
+            } else {
+                div { class:"telemetry-readiness-grid",
+                    for row in &readiness.breakdown {
+                        {let old=previous.get(&row.label);rsx!{
+                            div { class:"telemetry-readiness-stage",
+                                div { class:"telemetry-readiness-stage-head",
+                                    strong { "{row.label}" }
+                                    span { "{format_count(row.stats.count)} requests" }
+                                }
+                                dl {
+                                    div { dt { "p50" } dd { {metric_value(row.stats.p50_latency_ms,"p50")} } }
+                                    div { dt { "p95" } dd { {metric_value(row.stats.p95_latency_ms,"p95")} } }
+                                    div { dt { "Max" } dd { {metric_value(row.stats.max_latency_ms,"max")} } }
+                                    div { dt { "Errors" } dd { class:if row.stats.error_count>0{"telemetry-status-error"}else{""},"{format_count(row.stats.error_count)}" } }
+                                }
+                                if let Some(delta)=delta_text(row.stats.p95_latency_ms,old.map(|stats|stats.p95_latency_ms)) {
+                                    small { class:"telemetry-delta", "p95 {delta} vs previous period" }
+                                }
+                            }
+                        }}
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 pub fn TelemetryPage(app_state: AppState) -> Element {
     let mut draft = use_signal(QueryConfig::default);
     let mut applied = use_signal(QueryConfig::default);
@@ -1203,6 +1253,13 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
                     }
                     Card { title:"HTTP status distribution",
                         StatusDonut { rows:status_data.read().as_ref().map(|value|value.breakdown.clone()).unwrap_or_default() }
+                    }
+                }
+
+                Card { title:"Server playback readiness",action:rsx!{span{class:"telemetry-server-badge","SERVER COLLECTED"}},
+                    PlaybackReadinessPanel {
+                        readiness:result.playback_readiness.clone(),
+                        previous:comparison.as_ref().map(|value|value.playback_readiness.clone())
                     }
                 }
 

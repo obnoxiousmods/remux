@@ -520,7 +520,7 @@ pub async fn track(
                         .bind(context.device_name)
                         .bind(context.client_name)
                         .bind(context.client_version)
-                        .bind(format!(r#"{{"route":{},"status":{status},"source":"server"}}"#, serde_json::to_string(&template).unwrap_or_else(|_| "\"unknown\"".into())))
+                        .bind(format!(r#"{{"route":{},"method":{},"status":{status},"source":"server"}}"#, serde_json::to_string(&template).unwrap_or_else(|_| "\"unknown\"".into()), serde_json::to_string(method).unwrap_or_else(|_| "\"unknown\"".into())))
                         .execute(&db)
                         .await;
                     }
@@ -686,7 +686,14 @@ fn server_playback_event(
         // high-frequency transfer traffic, not a playback startup milestone.
         None
     } else if method == "GET"
-        && (route.contains("/audio/") || route.contains("/videos/"))
+        && (matches!(
+            route.as_str(),
+            "/audio/{id}/stream"
+                | "/audio/{id}/stream.{container}"
+                | "/audio/{id}/universal"
+                | "/videos/{id}/stream"
+                | "/videos/{id}/stream.{container}"
+        ))
     {
         Some(if status < 400 {
             "server-stream-ready"
@@ -896,6 +903,14 @@ mod tests {
         assert_eq!(
             server_playback_event("GET", "/videos/{id}/{segment_file}", 200),
             None
+        );
+        assert_eq!(
+            server_playback_event("GET", "/audio/{item_id}/lyrics", 200),
+            None
+        );
+        assert_eq!(
+            server_playback_event("GET", "/audio/{id}/stream", 200),
+            Some("server-stream-ready")
         );
         assert_eq!(
             server_playback_event("POST", "/sessions/playing/progress", 204),

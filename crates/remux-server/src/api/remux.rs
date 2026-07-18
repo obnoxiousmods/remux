@@ -643,6 +643,10 @@ pub async fn telemetry_playback_event(
         || event_name.is_empty()
         || playback_key.len() > 160
         || event_name.len() > 120
+        // `server-*` is a reserved namespace written only by the global
+        // request middleware. This keeps admin playback-readiness analytics
+        // authoritative even when an authenticated client is hostile or buggy.
+        || event_name.starts_with("server-")
     {
         return Ok(StatusCode::BAD_REQUEST);
     }
@@ -1008,6 +1012,26 @@ mod tests {
                 .unwrap()
                 >= 2
         );
+    }
+
+    #[tokio::test]
+    async fn client_cannot_spoof_server_playback_milestones() {
+        let (server, _guard, _tmp) = boot(false).await;
+        let token = admin_token(&server).await;
+        let resp = server
+            .post("/remux/telemetry/playback")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth_header_with_token(&token)).unwrap(),
+            )
+            .json(&json!({
+                "playbackKey": "spoof-attempt",
+                "event": "server-stream-ready",
+                "elapsedMs": 1
+            }))
+            .expect_failure()
+            .await;
+        resp.assert_status_bad_request();
     }
 
     /// When `metrics_enabled` is false the endpoint is invisible (404), so it

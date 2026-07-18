@@ -74,6 +74,13 @@ struct RollupRow {
     latency_ge_10000: i64,
 }
 
+#[derive(Debug, Clone, FromRow)]
+struct PlaybackRow {
+    event: String,
+    elapsed_ms: f64,
+    status: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Stats {
@@ -102,6 +109,15 @@ pub struct BreakdownRow {
     pub label: String,
     #[serde(flatten)]
     pub stats: Stats,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackReadiness {
+    /// Server-observed playback-path requests only. Browser-submitted player
+    /// diagnostics are deliberately excluded from this dataset.
+    pub summary: Stats,
+    pub breakdown: Vec<BreakdownRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +165,7 @@ pub struct ExploreResponse {
     pub breakdown: Vec<BreakdownRow>,
     pub recent: Vec<RequestEvent>,
     pub filters: FilterOptions,
+    pub playback_readiness: PlaybackReadiness,
 }
 
 #[derive(Default, Clone)]
@@ -393,6 +410,96 @@ fn filter(
             .push(" = ")
             .push_bind(value.to_string());
     }
+}
+
+fn playback_label(event: &str) -> String {
+    match event {
+        "server-playback-info-ready" | "server-playback-info-error" => {
+            "Playback info".to_string()
+        }
+        "server-manifest-ready" | "server-manifest-error" => "HLS manifest".to_string(),
+        "server-stream-ready" | "server-stream-error" => "Direct stream".to_string(),
+        other => other
+            .trim_start_matches("server-")
+            .replace('-', " "),
+    }
+}
+
+async fn playback_readiness(
+    state: &AppState,
+    query: &ExploreQuery,
+    hours: i64,
+    offset_hours: i64,
+) -> Result<PlaybackReadiness> {
+    let mut sql = QueryBuilder::<Sqlite>::new(
+        "SELECT p.event, COALESCE(p.elapsed_ms, 0) AS elapsed_ms, \
+         CASE WHEN p.event LIKE '%-error' OR p.error_category IS NOT NULL THEN 500 ELSE 200 END AS status \
+         FROM telemetry_playback_events p \
+         LEFT JOIN users u ON replace(lower(p.user_id), '-', '') = lower(hex(u.id)) \
+         WHERE p.event IN ('server-playback-info-ready', 'server-playback-info-error', \
+         'server-manifest-ready', 'server-manifest-error', 'server-stream-ready', 'server-stream-error') \
+         AND p.details_json LIKE '%\"source\":\"server\"%' AND p.created_at >= ",
+    );
+    let range_end = Utc::now() - chrono::Duration::hours(offset_hours);
+    let range_start = range_end - chrono::Duration::hours(hours);
+    sql.push_bind(range_start.to_rfc3339())
+        .push(" AND p.created_at < ")
+        .push_bind(range_end.to_rfc3339());
+    filter(&mut sql, "p.device_name", &query.device);
+    filter(&mut sql, "p.client_name", &query.client);
+    filter(&mut sql, "u.username", &query.user);
+    filter(&mut sql, "p.item_name", &query.content);
+    if let Some(route) = query
+        .route
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        sql.push(" AND json_extract(p.details_json, '$.route') = ")
+            .push_bind(route.to_string());
+    }
+    if let Some(status_class) = query
+        .status_class
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if status_class == "errors" {
+            sql.push(" AND (p.event LIKE '%-error' OR p.error_category IS NOT NULL)");
+        } else if let Some(prefix) = status_class.strip_suffix("xx") {
+            if let Ok(hundred) = prefix.parse::<i64>() {
+                sql.push(" AND CAST(json_extract(p.details_json, '$.status') AS INTEGER) >= ")
+                    .push_bind(hundred * 100)
+                    .push(" AND CAST(json_extract(p.details_json, '$.status') AS INTEGER) < ")
+                    .push_bind((hundred + 1) * 100);
+            }
+        }
+    }
+    let rows = sql
+        .build_query_as::<PlaybackRow>()
+        .fetch_all(
+            &state
+                .ctx
+                .db,
+        )
+        .await?;
+    let mut summary = Acc::default();
+    let mut breakdown: BTreeMap<String, Acc> = BTreeMap::new();
+    for row in rows {
+        summary.add(row.elapsed_ms, row.status);
+        breakdown
+            .entry(playback_label(&row.event))
+            .or_default()
+            .add(row.elapsed_ms, row.status);
+    }
+    Ok(PlaybackReadiness {
+        summary: summary.finish(),
+        breakdown: breakdown
+            .into_iter()
+            .map(|(label, acc)| BreakdownRow {
+                label,
+                stats: acc.finish(),
+            })
+            .collect(),
+    })
 }
 
 async fn rows(
@@ -716,6 +823,8 @@ async fn explore_rollups(
     bucket_minutes: i64,
     group_by: String,
 ) -> Result<ExploreResponse> {
+    let playback_readiness =
+        playback_readiness(state, query, hours, offset_hours).await?;
     let mut rows = rollup_rows(state, query, hours, offset_hours).await?;
     let truncated = rows.len() > 500_000;
     rows.truncate(500_000);
@@ -837,6 +946,7 @@ async fn explore_rollups(
         breakdown,
         recent,
         filters,
+        playback_readiness,
     })
 }
 
@@ -891,6 +1001,8 @@ pub async fn explore(
         ));
     }
     let mut rows = rows(&state, &query, hours, offset_hours).await?;
+    let playback_readiness =
+        playback_readiness(&state, &query, hours, offset_hours).await?;
     let truncated = rows.len() > 500_000;
     rows.truncate(500_000);
     let mut summary = Acc::default();
@@ -1021,6 +1133,7 @@ pub async fn explore(
         breakdown,
         recent,
         filters,
+        playback_readiness,
     }))
 }
 

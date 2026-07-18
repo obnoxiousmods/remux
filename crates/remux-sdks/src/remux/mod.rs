@@ -5014,6 +5014,13 @@ pub struct TelemetryBreakdownRow {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
+pub struct TelemetryPlaybackReadiness {
+    pub summary: TelemetryStats,
+    pub breakdown: Vec<TelemetryBreakdownRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct TelemetryRequestEvent {
     pub id: i64,
     pub created_at: String,
@@ -5057,6 +5064,7 @@ pub struct TelemetryExploreResponse {
     pub breakdown: Vec<TelemetryBreakdownRow>,
     pub recent: Vec<TelemetryRequestEvent>,
     pub filters: TelemetryFilterOptions,
+    pub playback_readiness: TelemetryPlaybackReadiness,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5195,7 +5203,11 @@ mod telemetry_contract_tests {
                 "hours": 24, "bucketMinutes": 30, "groupBy": "route",
                 "resolution": "raw", "capturedRows": 1, "truncated": false,
                 "summary": { "count": 1, "meanLatencyMs": 12.5 },
-                "series": [], "breakdown": [], "recent": [], "filters": {}
+                "series": [], "breakdown": [], "recent": [], "filters": {},
+                "playbackReadiness": {
+                    "summary": { "count": 2, "p95LatencyMs": 42.0 },
+                    "breakdown": [{ "label": "Direct stream", "count": 2, "p95LatencyMs": 42.0 }]
+                }
             }))
             .unwrap();
         assert_eq!(
@@ -5205,6 +5217,13 @@ mod telemetry_contract_tests {
             12.5
         );
         assert_eq!(explore.captured_rows, 1);
+        assert_eq!(
+            explore
+                .playback_readiness
+                .summary
+                .count,
+            2
+        );
 
         let request = GetTelemetryExplore {
             hours: 24,
