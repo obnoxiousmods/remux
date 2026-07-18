@@ -121,8 +121,33 @@ Be honest about what has actually been exercised:
 | `bench` (full flow) | ✅ run end-to-end; a no-op change correctly produced a noise-level delta table and restored the working file |
 | server build + boot + corpus replay | ✅ run end-to-end: 36/36 corpus requests returned <400 against a freshly-booted binary |
 | `normalize` volatile-field stripping | ✅ unit-tested |
-| `verify` (the two-build diff as a whole) | ⚠️ **not yet run end-to-end** — every component above is proven, but the full baseline-vs-treatment double-build diff has not been executed once. Expect to shake out rough edges the first time. |
+| `verify` (the two-build diff as a whole) | ⚠️ **runs end-to-end, but its result is not yet trustworthy — see below** |
 | `gate` | ⚠️ depends on `verify`; the external parity/playback hooks only report availability |
+
+### `verify`'s known false-positive problem
+
+It has now been executed end-to-end (exit 0; the working tree is correctly
+restored afterwards, confirmed). It was pointed at a change that is *known* to be
+result-identical — the `/livetv/info` `limit(1)` fix — so it should have reported
+a clean PASS. Instead it reported diffs on **unrelated** endpoints (`/years`).
+
+That is a flaw in the harness, not in the change:
+
+* each arm boots on a **fresh temporary database**, and
+* the server runs **startup tasks** that populate the library,
+* so the two arms observe *different data* depending on how far those tasks got
+  before the corpus was replayed.
+
+`/years` was independently checked against production and is perfectly
+deterministic (three consecutive calls, 107 items, identical order), which rules
+out unstable ordering as the cause.
+
+**Do not trust a `verify` diff until this is fixed.** The fix is to remove the
+data non-determinism, by either seeding both arms from one fixed, pre-built
+database snapshot instead of an empty one, or adding a config switch that
+suppresses startup tasks for the duration of the capture. Until then, prove
+response equivalence the way the wins in `PERFORMANCE-AUDIT.md` were proven:
+capture the specific endpoint's body from both builds and compare directly.
 
 ## What each gate proves
 
