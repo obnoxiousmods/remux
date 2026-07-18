@@ -185,8 +185,14 @@
   .mt-1 {
     margin-top: calc(var(--spacing) * 1);
   }
+  .\!hidden {
+    display: none !important;
+  }
   .block {
     display: block;
+  }
+  .contents {
+    display: contents;
   }
   .flex {
     display: flex;
