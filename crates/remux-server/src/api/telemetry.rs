@@ -1252,4 +1252,85 @@ mod tests {
         );
         assert_eq!(rows[0].label, "alpha");
     }
+
+    /// The status donut used to be fed by a second, identically-filtered
+    /// `explore` request. It is now grouped in the same pass, so this pins the
+    /// grouping and the stable label ordering that replaced it.
+    #[test]
+    fn status_breakdown_groups_by_class_in_stable_order() {
+        let row = |status: i64, latency: f64| RequestRow {
+            id: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            method: "GET".into(),
+            route_template: "/items/{id}".into(),
+            status,
+            latency_ms: latency,
+            sample_reason: "sample".into(),
+            device_name: None,
+            client_name: None,
+            client_version: None,
+            user_name: None,
+            item_name: None,
+            error_category: None,
+        };
+        let rows = vec![
+            row(200, 10.0),
+            row(204, 20.0),
+            row(500, 30.0),
+            row(404, 40.0),
+            row(301, 50.0),
+        ];
+
+        let mut acc: BTreeMap<String, Acc> = BTreeMap::new();
+        for row in &rows {
+            acc.entry(label(row, "status"))
+                .or_default()
+                .add(row.latency_ms, row.status);
+        }
+        let breakdown = finish_status_breakdown(acc);
+
+        let labels: Vec<_> = breakdown
+            .iter()
+            .map(|row| {
+                row.label
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(labels, ["2xx", "3xx", "4xx", "5xx"]);
+
+        // 200 and 204 collapse into one class; 4xx/5xx count as errors.
+        assert_eq!(
+            breakdown[0]
+                .stats
+                .count,
+            2
+        );
+        assert_eq!(
+            breakdown[0]
+                .stats
+                .error_count,
+            0
+        );
+        assert_eq!(
+            breakdown[2]
+                .stats
+                .error_count,
+            1
+        );
+        assert_eq!(
+            breakdown[3]
+                .stats
+                .error_count,
+            1
+        );
+        assert_eq!(
+            breakdown
+                .iter()
+                .map(|row| row
+                    .stats
+                    .count)
+                .sum::<i64>(),
+            rows.len() as i64
+        );
+    }
 }
