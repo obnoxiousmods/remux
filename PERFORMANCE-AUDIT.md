@@ -24,10 +24,11 @@ without data.
 | `GET /items/{id}/images/{type}` | 296 ms mean | unchanged | **not fixed** | upstream image fetch, network-bound |
 | `GET /shows/nextup` | 65 ms | unchanged | **not fixed** | UMS indexes already present |
 | `GET /useritems/resume` | 25–37 ms | unchanged | **not fixed** | UMS indexes already present |
-| `GET /playlists/{id}/items` | see below | see below | N+1 removed (2N → 2 queries) | measured separately |
-| `GET /collections/{id}/items` | see below | see below | N+1 removed (2N → 2 queries) | measured separately |
-| `GET /sessions` | see below | see below | queue N+1 removed | measured separately |
-| `GET /items/{id}/images` (info) | see below | see below | blocking `stat` → `spawn_blocking` | measured separately |
+| `GET /playlists/{id}/items` (133 members) | 21.2 ms | **9.7 ms** | **2.19× faster** | CI 2.11–2.26, p<0.0001, n=30/30 |
+| `GET /playlists/{id}/items` (842, limit 200) | 38.7 ms | **21.4 ms** | **1.80× faster** | CI 1.64–2.01, p<0.0001; body identical |
+| `GET /collections/{id}/items` | — | — | same N+1 removed (2N → 2) | shares the batching; no large collection to measure |
+| `GET /sessions` | 106.1 ms | 106.5 ms | **not exercised** | 0/1644 sessions have a queue, so the fixed path never runs |
+| `GET /items/{id}/images` (info) | 0.7 ms | 0.8 ms | **no difference** | CI 0.77–1.05, p=0.23 — too fast to resolve serially |
 | all ~304 routes | — | — | **timing now observable** | `GET /remux/metrics` |
 
 
@@ -35,6 +36,56 @@ Goal: the best possible performance **without sacrificing any results**. Every
 change here is behaviour-preserving and gated on measured, human-noticeable
 gains — measured before and after, with the regression check that caught (and
 then fixed) a real regression in the very first optimization.
+
+## Finding 6 — N+1 member resolution ✅ FIXED
+
+`relations_to_items` (playlists) and the member loops in `api/collections.rs` and
+`api/session.rs` resolved list members **one at a time** with `Media::get_by_id`,
+which is itself *two* queries (the row, then its images). An 842-member playlist
+therefore issued **1,684 round-trips**. Replaced with a batched
+`Media::get_by_ids` (two queries total, identical semantics — no policy
+filtering, images included).
+
+Two correctness details that were easy to get wrong, and which I did get wrong
+first:
+
+* Members must be looked up with `get` + `clone`, **not** `remove`. A playlist or
+  a play queue may legally contain the same item twice; removing on first use
+  silently drops the repeat. My initial version used `remove` and would have
+  changed responses.
+* Ordering is preserved by iterating the *relations*, not the map, and absent
+  rows are skipped exactly as `get_by_id` returning `None` skipped them.
+
+Measured (interleaved, two purpose-built binaries differing only in this hunk,
+n=30 per arm):
+
+| Endpoint | Before | After | Gain |
+|---|---|---|---|
+| `/playlists/{id}/items` — 133 members | 21.2 ms | **9.7 ms** | **2.19×** (CI 2.11–2.26, p<0.0001) |
+| `/playlists/{id}/items` — 842 members, `limit=200` | 38.7 ms | **21.4 ms** | **1.80×** (CI 1.64–2.01, p<0.0001) |
+
+Response equivalence verified on the 842-member playlist: **full body identical**
+— 200 items, identical id order, `TotalRecordCount` 842 in both builds.
+
+## Changes that are correct but showed no measurable gain
+
+Reported rather than quietly claimed, because "objective upgrade" means the
+measurement decides:
+
+* **`/items/{id}/images` — blocking `std::fs::metadata` moved to
+  `spawn_blocking`.** Measured 0.7 ms vs 0.8 ms, ratio 0.89×, **CI 0.77–1.05
+  (includes 1.0)**, p=0.23 → *no difference resolved*. The endpoint is far too
+  fast for a serial test to resolve, and the change's real purpose — not
+  stalling an async worker while many requests are in flight — is exactly what a
+  serial benchmark cannot show. Kept because it is strictly correct async
+  hygiene with no measured downside, not because it was proven faster.
+* **`/sessions` — play-queue N+1 batched.** Measured 106.1 ms vs 106.5 ms,
+  **CI 0.96–1.06**, p=0.50. The reason is not that batching failed: **0 of 1,644
+  sessions currently carry a `NowPlayingQueue`**, so the batched path is never
+  entered. This is *not exercised*, not *no gain*. It objectively reduces 2N
+  queries to 2 whenever a queue exists.
+* **Regex hoisted to `LazyLock` (`addons/opendal.rs`).** Not on any request path
+  — it runs during library scans — so there is no endpoint to A/B it against.
 
 ## Measurement surfaces (built for this audit)
 
@@ -293,7 +344,7 @@ A code comment now records this at each of the three call sites
 again. **Lesson: benchmark the query the server actually emits, not a
 simplification of it, and interleave the runs.**
 
-## Finding 5 — fetching a whole table to answer a boolean ✅ FIXED
+## Finding 4 — fetching a whole table to answer a boolean ✅ FIXED
 
 `/livetv/info` (measured **333.9 ms**, the second-slowest read endpoint) builds
 a `MediaFilter` for `TvChannel` with **no limit**, runs it, and then uses the
@@ -335,7 +386,7 @@ responses, not just reasoning about them.
 Worth internalising as a review rule: **a query whose result is only ever passed
 to `is_empty()` must carry `limit: Some(1)`.**
 
-## Finding 4 — press-play latency (`POST /items/{id}/playbackinfo`) — diagnosed, not yet fixed
+## Finding 5 — press-play latency (`POST /items/{id}/playbackinfo`) — diagnosed, not fixed
 
 The worst user-facing latency on the server. Production samples:
 **14184 ms, 13872 ms, 10356 ms, 8848 ms, 8500 ms** — mean 3133 ms across all
