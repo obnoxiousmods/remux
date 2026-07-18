@@ -6,7 +6,7 @@ use axum::{
 };
 use http::StatusCode;
 use remux_macros::{get, post, query, route};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 use tracing::info;
@@ -703,6 +703,105 @@ pub struct LogFileQuery {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogTailQuery {
+    pub name: String,
+    pub lines: Option<usize>,
+    pub search: Option<String>,
+    pub level: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogTailResponse {
+    pub name: String,
+    pub lines: Vec<String>,
+    pub file_size: u64,
+    pub scanned_bytes: usize,
+    pub truncated: bool,
+}
+
+fn valid_log_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+}
+
+/// Read only the tail of a potentially multi-gigabyte log. The old dashboard
+/// downloaded the complete file (56MB on the live host) before rendering it.
+#[get("/system/logs/tail")]
+pub async fn system_log_tail(
+    State(state): State<AppState>,
+    _session: auth::AdminSession,
+    Query(q): Query<LogTailQuery>,
+) -> Result<impl IntoResponse> {
+    if !valid_log_name(&q.name) {
+        return Ok((StatusCode::BAD_REQUEST, "invalid log name").into_response());
+    }
+    let dir = state
+        .ctx
+        .config
+        .log_dir
+        .as_deref()
+        .context_not_found("logging directory not configured")?;
+    let path = std::path::Path::new(dir).join(&q.name);
+    let name = q
+        .name
+        .clone();
+    let wanted = q
+        .lines
+        .unwrap_or(500)
+        .clamp(50, 5_000);
+    let search = q
+        .search
+        .unwrap_or_default()
+        .to_lowercase();
+    let level = q
+        .level
+        .unwrap_or_default()
+        .to_lowercase();
+    let result =
+        tokio::task::spawn_blocking(move || -> std::io::Result<LogTailResponse> {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&path)?;
+            let file_size = file
+                .metadata()?
+                .len();
+            let scan = file_size.min(8 * 1024 * 1024) as usize;
+            file.seek(SeekFrom::End(-(scan as i64)))?;
+            let mut bytes = vec![0; scan];
+            file.read_exact(&mut bytes)?;
+            let text = String::from_utf8_lossy(&bytes);
+            let mut lines: Vec<String> = text
+                .lines()
+                .rev()
+                .filter(|line| {
+                    let lower = line.to_lowercase();
+                    (search.is_empty() || lower.contains(&search))
+                        && (level.is_empty()
+                            || level == "all"
+                            || lower.contains(&level))
+                })
+                .take(wanted)
+                .map(str::to_string)
+                .collect();
+            lines.reverse();
+            Ok(LogTailResponse {
+                name,
+                lines,
+                file_size,
+                scanned_bytes: scan,
+                truncated: file_size > scan as u64,
+            })
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(anyhow::Error::from)?;
+    Ok(Json(result).into_response())
+}
+
 /// `GET /System/Logs/Log?name=` — download a single log file as plain text.
 ///
 /// The `name` is hardened against path traversal: it must be a bare filename
@@ -713,15 +812,7 @@ pub async fn system_log_file(
     _session: auth::AdminSession,
     Query(q): Query<LogFileQuery>,
 ) -> Result<Response> {
-    if q.name
-        .is_empty()
-        || q.name
-            .contains('/')
-        || q.name
-            .contains('\\')
-        || q.name
-            .contains("..")
-    {
+    if !valid_log_name(&q.name) {
         return Ok((StatusCode::BAD_REQUEST, "invalid log name").into_response());
     }
 
@@ -1339,6 +1430,43 @@ mod test {
         dl.assert_status_ok();
         assert_eq!(dl.text(), "hello log\n");
 
+        // The explorer reads a bounded tail and applies filtering server-side.
+        std::fs::write(
+            log_dir
+                .path()
+                .join("remux.log"),
+            b"old info\nrecent warning\nrecent error\n",
+        )
+        .unwrap();
+        let tail = server
+            .get("/system/logs/tail")
+            .add_query_param("name", "remux.log")
+            .add_query_param("lines", "2")
+            .add_query_param("search", "recent")
+            .add_header(AUTHORIZATION, header())
+            .await;
+        tail.assert_status_ok();
+        let tail_body: serde_json::Value = tail.json();
+        assert_eq!(
+            tail_body["lines"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            tail_body["lines"][0]
+                .as_str()
+                .unwrap()
+                .contains("warning")
+        );
+        assert!(
+            tail_body["scannedBytes"]
+                .as_u64()
+                .unwrap()
+                <= 8 * 1024 * 1024
+        );
+
         // Path traversal is rejected before touching the filesystem.
         let bad = server
             .get("/system/logs/log")
@@ -1347,6 +1475,14 @@ mod test {
             .expect_failure()
             .await;
         assert_eq!(bad.status_code(), StatusCode::BAD_REQUEST);
+
+        let bad_tail = server
+            .get("/system/logs/tail")
+            .add_query_param("name", "../remux-test.sqlite")
+            .add_header(AUTHORIZATION, header())
+            .expect_failure()
+            .await;
+        assert_eq!(bad_tail.status_code(), StatusCode::BAD_REQUEST);
 
         // Admin-gated.
         let unauth = server

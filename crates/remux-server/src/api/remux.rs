@@ -833,6 +833,23 @@ pub async fn save_telemetry_view(
     Ok(Json(serde_json::json!({"id": id})).into_response())
 }
 
+#[delete("/remux/telemetry/views/{id}")]
+pub async fn delete_telemetry_view(
+    State(state): State<AppState>,
+    _admin: auth::AdminSession,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse> {
+    sqlx::query("DELETE FROM telemetry_saved_views WHERE id = ?")
+        .bind(id)
+        .execute(
+            &state
+                .ctx
+                .db,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[get("/remux/streams/{id}")]
 pub async fn remux_streams(
     State(state): State<AppState>,

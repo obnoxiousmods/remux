@@ -336,6 +336,16 @@ pub async fn track(
         .path()
         .to_string();
     let client_context = client_context(req.headers());
+    let auth_token = auth_token(
+        req.headers(),
+        req.uri()
+            .query(),
+    );
+    let playback_key = query_value(
+        req.uri()
+            .query(),
+        &["PlaySessionId", "playSessionId", "playbackKey"],
+    );
     let template = matched.map(|m| {
         m.as_str()
             .to_string()
@@ -384,25 +394,133 @@ pub async fn track(
                     "sample"
                 };
                 let item_id = item_id_from_path(&request_path);
+                let server_playback_event =
+                    server_playback_event(method, &template, status);
                 tokio::spawn(async move {
+                    let mut context = client_context;
+                    let mut user_id: Option<String> = None;
+                    let mut user_name: Option<String> = None;
+                    if let Some(token) = auth_token.as_deref() {
+                        if let Ok(Some(row)) = sqlx::query_as::<_, (String, String, String, String, String, String)>(
+                            "SELECT d.id, COALESCE(NULLIF(d.custom_name, ''), d.name), d.app_name, d.app_version, u.id, u.username \
+                             FROM devices d JOIN users u ON u.id = d.user_id WHERE d.access_token = ? LIMIT 1"
+                        ).bind(token).fetch_optional(&db).await {
+                            context.device_id = Some(row.0);
+                            context.device_name = Some(row.1);
+                            context.client_name = Some(row.2);
+                            context.client_version = Some(row.3);
+                            user_id = Some(row.4);
+                            user_name = Some(row.5);
+                        }
+                    } else if let Some(device_id) = context
+                        .device_id
+                        .as_deref()
+                    {
+                        if let Ok(Some(row)) = sqlx::query_as::<_, (String, String, String, String, String)>(
+                            "SELECT COALESCE(NULLIF(d.custom_name, ''), d.name), d.app_name, d.app_version, u.id, u.username \
+                             FROM devices d JOIN users u ON u.id = d.user_id WHERE d.id = ? ORDER BY d.last_activity_at DESC LIMIT 1"
+                        ).bind(device_id).fetch_optional(&db).await {
+                            context.device_name = Some(row.0);
+                            context.client_name = Some(row.1);
+                            context.client_version = Some(row.2);
+                            user_id = Some(row.3);
+                            user_name = Some(row.4);
+                        }
+                    }
+                    let item_name = match item_id.as_deref() {
+                        Some(id) => sqlx::query_scalar::<_, String>(
+                            "SELECT name FROM media WHERE id = ? LIMIT 1",
+                        )
+                        .bind(id)
+                        .fetch_optional(&db)
+                        .await
+                        .ok()
+                        .flatten(),
+                        None => None,
+                    };
+                    let playback_key = playback_key.or_else(|| {
+                        server_playback_event.map(|_| {
+                            let minute = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                                / 60;
+                            format!(
+                                "server:{}:{}:{minute}",
+                                context
+                                    .device_id
+                                    .as_deref()
+                                    .unwrap_or("unknown"),
+                                item_id
+                                    .as_deref()
+                                    .unwrap_or("unknown")
+                            )
+                        })
+                    });
                     let _ = sqlx::query(
                         "INSERT INTO telemetry_request_events \
-                         (method, route_template, status, latency_ms, sample_reason, device_id, device_name, client_name, client_version, item_id, error_category) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                         (method, route_template, status, latency_ms, sample_reason, device_id, device_name, client_name, client_version, user_id, user_name, item_id, item_name, playback_key, error_category) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     )
                     .bind(method)
-                    .bind(template)
+                    .bind(&template)
                     .bind(status as i64)
                     .bind(latency_ms)
                     .bind(reason)
-                    .bind(client_context.device_id)
-                    .bind(client_context.device_name)
-                    .bind(client_context.client_name)
-                    .bind(client_context.client_version)
-                    .bind(item_id)
+                    .bind(&context.device_id)
+                    .bind(&context.device_name)
+                    .bind(&context.client_name)
+                    .bind(&context.client_version)
+                    .bind(&user_id)
+                    .bind(&user_name)
+                    .bind(&item_id)
+                    .bind(&item_name)
+                    .bind(&playback_key)
                     .bind(if failed { Some(format!("http-{status}")) } else { None })
                     .execute(&db)
                     .await;
+                    let status_class = format!("{}xx", status / 100);
+                    let _ = sqlx::query(
+                        "INSERT INTO telemetry_hourly_rollups \
+                         (bucket_start, route_template, method, device_name, client_name, user_name, item_name, status_class, sample_reason, request_count, error_count, total_latency_ms, max_latency_ms, latency_lt_100, latency_lt_500, latency_lt_1000, latency_lt_2500, latency_lt_5000, latency_lt_10000, latency_ge_10000) \
+                         VALUES (strftime('%Y-%m-%dT%H:00:00Z','now'), ?, ?, COALESCE(?,''), COALESCE(?,''), COALESCE(?,''), COALESCE(?,''), ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(bucket_start, route_template, method, device_name, client_name, user_name, item_name, status_class, sample_reason) DO UPDATE SET \
+                         request_count=request_count+1, error_count=error_count+excluded.error_count, \
+                         total_latency_ms=total_latency_ms+excluded.total_latency_ms, max_latency_ms=MAX(max_latency_ms, excluded.max_latency_ms), \
+                         latency_lt_100=latency_lt_100+excluded.latency_lt_100, latency_lt_500=latency_lt_500+excluded.latency_lt_500, \
+                         latency_lt_1000=latency_lt_1000+excluded.latency_lt_1000, latency_lt_2500=latency_lt_2500+excluded.latency_lt_2500, \
+                         latency_lt_5000=latency_lt_5000+excluded.latency_lt_5000, latency_lt_10000=latency_lt_10000+excluded.latency_lt_10000, \
+                         latency_ge_10000=latency_ge_10000+excluded.latency_ge_10000"
+                    ).bind(&template).bind(method).bind(&context.device_name).bind(&context.client_name)
+                     .bind(&user_name).bind(&item_name).bind(status_class).bind(reason)
+                     .bind(if failed { 1_i64 } else { 0_i64 }).bind(latency_ms).bind(latency_ms)
+                     .bind(i64::from(latency_ms < 100.0)).bind(i64::from((100.0..500.0).contains(&latency_ms)))
+                     .bind(i64::from((500.0..1000.0).contains(&latency_ms))).bind(i64::from((1000.0..2500.0).contains(&latency_ms)))
+                     .bind(i64::from((2500.0..5000.0).contains(&latency_ms))).bind(i64::from((5000.0..10000.0).contains(&latency_ms)))
+                     .bind(i64::from(latency_ms >= 10000.0)).execute(&db).await;
+                    if let (Some(event), Some(key)) =
+                        (server_playback_event, playback_key)
+                    {
+                        let _ = sqlx::query(
+                            "INSERT INTO telemetry_playback_events \
+                             (playback_key, event, elapsed_ms, item_id, item_name, error_category, user_id, device_id, device_name, client_name, client_version, details_json) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                        )
+                        .bind(key)
+                        .bind(event)
+                        .bind(latency_ms)
+                        .bind(item_id)
+                        .bind(item_name)
+                        .bind(if failed { Some(format!("http-{status}")) } else { None })
+                        .bind(user_id)
+                        .bind(context.device_id)
+                        .bind(context.device_name)
+                        .bind(context.client_name)
+                        .bind(context.client_version)
+                        .bind(format!(r#"{{"route":{},"status":{status},"source":"server"}}"#, serde_json::to_string(&template).unwrap_or_else(|_| "\"unknown\"".into())))
+                        .execute(&db)
+                        .await;
+                    }
                 });
             }
             schedule_telemetry_retention(
@@ -432,8 +550,9 @@ fn schedule_telemetry_retention(db: &sqlx::SqlitePool) {
     }
     let db = db.clone();
     tokio::spawn(async move {
-        let _ = sqlx::query("DELETE FROM telemetry_request_events WHERE created_at < datetime('now', '-30 days')").execute(&db).await;
-        let _ = sqlx::query("DELETE FROM telemetry_playback_events WHERE created_at < datetime('now', '-30 days')").execute(&db).await;
+        let _ = sqlx::query("DELETE FROM telemetry_request_events WHERE created_at < datetime('now', '-14 days')").execute(&db).await;
+        let _ = sqlx::query("DELETE FROM telemetry_playback_events WHERE created_at < datetime('now', '-14 days')").execute(&db).await;
+        let _ = sqlx::query("DELETE FROM telemetry_hourly_rollups WHERE bucket_start < datetime('now', '-180 days')").execute(&db).await;
     });
 }
 
@@ -476,6 +595,106 @@ fn client_context(headers: &axum::http::HeaderMap) -> ClientContext {
         device_name: value_for("Device"),
         client_name: value_for("Client"),
         client_version: value_for("Version"),
+    }
+}
+
+fn auth_token(headers: &axum::http::HeaderMap, query: Option<&str>) -> Option<String> {
+    headers
+        .get("X-Emby-Token")
+        .or_else(|| headers.get("X-MediaBrowser-Token"))
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .or_else(|| headers.get("X-Emby-Authorization"))
+                .and_then(|value| {
+                    value
+                        .to_str()
+                        .ok()
+                })
+                .and_then(|raw| {
+                    raw.split(',')
+                        .find_map(|part| {
+                            let (key, value) = part
+                                .trim()
+                                .split_once('=')?;
+                            key.trim()
+                                .eq_ignore_ascii_case("Token")
+                                .then(|| {
+                                    value
+                                        .trim()
+                                        .trim_matches('"')
+                                        .to_string()
+                                })
+                        })
+                })
+        })
+        .or_else(|| {
+            query.and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|pair| {
+                        let (key, value) = pair.split_once('=')?;
+                        (key.eq_ignore_ascii_case("api_key")
+                            || key.eq_ignore_ascii_case("apikey")
+                            || key.eq_ignore_ascii_case("token"))
+                        .then(|| value.to_string())
+                    })
+            })
+        })
+}
+
+fn query_value(query: Option<&str>, names: &[&str]) -> Option<String> {
+    query.and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
+            names
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+                .then(|| value.into_owned())
+        })
+    })
+}
+
+fn server_playback_event(
+    method: &str,
+    template: &str,
+    status: u16,
+) -> Option<&'static str> {
+    let route = template.to_ascii_lowercase();
+    if route.contains("playbackinfo") {
+        Some(if status < 400 {
+            "server-playback-info-ready"
+        } else {
+            "server-playback-info-error"
+        })
+    } else if route.contains(".m3u8") || route.contains("/hls/") {
+        Some(if status < 400 {
+            "server-manifest-ready"
+        } else {
+            "server-manifest-error"
+        })
+    } else if method == "GET"
+        && (route.contains("/audio/") || route.contains("/videos/"))
+    {
+        Some(if status < 400 {
+            "server-stream-ready"
+        } else {
+            "server-stream-error"
+        })
+    } else if method == "POST" && route.contains("/sessions/playing/stopped") {
+        Some("server-playback-stopped")
+    } else if method == "POST"
+        && route.contains("/sessions/playing")
+        && !route.contains("/progress")
+    {
+        Some("server-playback-started")
+    } else {
+        None
     }
 }
 
@@ -648,6 +867,29 @@ mod tests {
             let err = (upper - us) as f64 / us as f64;
             assert!(err < 0.15, "bucket too coarse for {us}: {upper} ({err:.3})");
         }
+    }
+
+    #[test]
+    fn playback_query_and_server_event_classification() {
+        assert_eq!(
+            query_value(
+                Some("api_key=secret&PlaySessionId=play%20one"),
+                &["playSessionId"]
+            ),
+            Some("play one".into())
+        );
+        assert_eq!(
+            server_playback_event("GET", "/items/{id}/playbackinfo", 200),
+            Some("server-playback-info-ready")
+        );
+        assert_eq!(
+            server_playback_event("GET", "/videos/{id}/master.m3u8", 500),
+            Some("server-manifest-error")
+        );
+        assert_eq!(
+            server_playback_event("POST", "/sessions/playing/progress", 204),
+            None
+        );
     }
 
     #[test]

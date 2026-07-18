@@ -533,7 +533,7 @@ fn default_telemetry_enabled() -> bool {
     true
 }
 fn default_telemetry_sample_rate() -> f64 {
-    0.05
+    1.0
 }
 fn default_telemetry_slow_request_ms() -> u64 {
     1_000

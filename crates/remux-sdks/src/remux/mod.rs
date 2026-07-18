@@ -1096,6 +1096,16 @@ pub struct LogFile {
     pub date_modified: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LogTailResponse {
+    pub name: String,
+    pub lines: Vec<String>,
+    pub file_size: u64,
+    pub scanned_bytes: usize,
+    pub truncated: bool,
+}
+
 #[dto]
 pub struct LibraryOptions {
     pub enable_photos: Option<bool>,
@@ -4972,6 +4982,260 @@ pub struct TelemetryRankingRow {
     pub max_latency_ms: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TelemetryStats {
+    pub count: i64,
+    pub error_count: i64,
+    pub error_rate: f64,
+    pub mean_latency_ms: f64,
+    pub p50_latency_ms: f64,
+    pub p95_latency_ms: f64,
+    pub p99_latency_ms: f64,
+    pub max_latency_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TelemetrySeriesPoint {
+    pub bucket_start: String,
+    pub label: String,
+    #[serde(flatten)]
+    pub stats: TelemetryStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TelemetryBreakdownRow {
+    pub label: String,
+    #[serde(flatten)]
+    pub stats: TelemetryStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TelemetryRequestEvent {
+    pub id: i64,
+    pub created_at: String,
+    pub method: String,
+    pub route: String,
+    pub status: i64,
+    pub latency_ms: f64,
+    pub sample_reason: String,
+    pub device: String,
+    pub client: String,
+    pub client_version: String,
+    pub user: String,
+    pub content: String,
+    pub error_category: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TelemetryFilterOptions {
+    pub routes: Vec<String>,
+    pub devices: Vec<String>,
+    pub clients: Vec<String>,
+    pub users: Vec<String>,
+    pub contents: Vec<String>,
+    pub methods: Vec<String>,
+    pub sample_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TelemetryExploreResponse {
+    pub hours: i64,
+    pub bucket_minutes: i64,
+    pub group_by: String,
+    pub resolution: String,
+    pub captured_rows: usize,
+    pub truncated: bool,
+    pub summary: TelemetryStats,
+    pub series: Vec<TelemetrySeriesPoint>,
+    pub breakdown: Vec<TelemetryBreakdownRow>,
+    pub recent: Vec<TelemetryRequestEvent>,
+    pub filters: TelemetryFilterOptions,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GetTelemetryExplore {
+    pub hours: i64,
+    pub bucket_minutes: i64,
+    pub group_by: String,
+    pub route: String,
+    pub device: String,
+    pub client: String,
+    pub user: String,
+    pub content: String,
+    pub method: String,
+    pub status_class: String,
+    pub sample_reason: String,
+    pub sort_by: String,
+    pub sort_dir: String,
+}
+
+impl Endpoint for GetTelemetryExplore {
+    type Output = TelemetryExploreResponse;
+    fn path(&self) -> String {
+        let pairs = [
+            (
+                "hours",
+                self.hours
+                    .to_string(),
+            ),
+            (
+                "bucketMinutes",
+                self.bucket_minutes
+                    .to_string(),
+            ),
+            (
+                "groupBy",
+                self.group_by
+                    .clone(),
+            ),
+            (
+                "route",
+                self.route
+                    .clone(),
+            ),
+            (
+                "device",
+                self.device
+                    .clone(),
+            ),
+            (
+                "client",
+                self.client
+                    .clone(),
+            ),
+            (
+                "user",
+                self.user
+                    .clone(),
+            ),
+            (
+                "content",
+                self.content
+                    .clone(),
+            ),
+            (
+                "method",
+                self.method
+                    .clone(),
+            ),
+            (
+                "statusClass",
+                self.status_class
+                    .clone(),
+            ),
+            (
+                "sampleReason",
+                self.sample_reason
+                    .clone(),
+            ),
+            (
+                "sortBy",
+                self.sort_by
+                    .clone(),
+            ),
+            (
+                "sortDir",
+                self.sort_dir
+                    .clone(),
+            ),
+        ];
+        let query = pairs
+            .into_iter()
+            .map(|(key, value)| format!("{}={}", key, urlencoding::encode(&value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("/remux/telemetry/explore?{query}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TelemetrySavedView {
+    pub id: String,
+    pub name: String,
+    pub config_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[cfg(test)]
+mod telemetry_contract_tests {
+    use super::*;
+
+    #[test]
+    fn admin_observability_contracts_deserialize_camel_case() {
+        let tail: LogTailResponse = serde_json::from_value(serde_json::json!({
+            "name": "remux.log", "lines": ["ok"], "fileSize": 10,
+            "scannedBytes": 10, "truncated": false
+        }))
+        .unwrap();
+        assert_eq!(tail.scanned_bytes, 10);
+
+        let explore: TelemetryExploreResponse =
+            serde_json::from_value(serde_json::json!({
+                "hours": 24, "bucketMinutes": 30, "groupBy": "route",
+                "resolution": "raw", "capturedRows": 1, "truncated": false,
+                "summary": { "count": 1, "meanLatencyMs": 12.5 },
+                "series": [], "breakdown": [], "recent": [], "filters": {}
+            }))
+            .unwrap();
+        assert_eq!(
+            explore
+                .summary
+                .mean_latency_ms,
+            12.5
+        );
+        assert_eq!(explore.captured_rows, 1);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GetTelemetryViews;
+impl Endpoint for GetTelemetryViews {
+    type Output = Vec<TelemetrySavedView>;
+    fn path(&self) -> String {
+        "/remux/telemetry/views".into()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SaveTelemetryView {
+    pub name: String,
+    pub config: serde_json::Value,
+}
+impl Endpoint for SaveTelemetryView {
+    type Output = serde_json::Value;
+    fn path(&self) -> String {
+        "/remux/telemetry/views".into()
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::json!({"name": self.name, "config": self.config}))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteTelemetryView {
+    pub id: String,
+}
+impl Endpoint for DeleteTelemetryView {
+    type Output = ();
+    fn path(&self) -> String {
+        format!("/remux/telemetry/views/{}", urlencoding::encode(&self.id))
+    }
+    fn method(&self) -> Method {
+        Method::DELETE
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GetTelemetryRankings {
     pub dimension: String,
@@ -5447,6 +5711,27 @@ impl Endpoint for GetLogFiles {
     type Output = Vec<LogFile>;
     fn path(&self) -> String {
         "/system/logs".into()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GetLogTail {
+    pub name: String,
+    pub lines: usize,
+    pub search: String,
+    pub level: String,
+}
+
+impl Endpoint for GetLogTail {
+    type Output = LogTailResponse;
+    fn path(&self) -> String {
+        format!(
+            "/system/logs/tail?name={}&lines={}&search={}&level={}",
+            urlencoding::encode(&self.name),
+            self.lines,
+            urlencoding::encode(&self.search),
+            urlencoding::encode(&self.level)
+        )
     }
 }
 
