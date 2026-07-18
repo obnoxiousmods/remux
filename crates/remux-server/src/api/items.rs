@@ -522,6 +522,19 @@ pub async fn get_items(
                             .sort_order
                             .clone()
                             .unwrap_or_default(),
+                        exclude_childless: !q
+                            .include_childless
+                            .unwrap_or(false),
+                        policy_filter: session
+                            .user
+                            .policy
+                            .as_ref()
+                            .and_then(|policy| {
+                                policy
+                                    .filter_rules
+                                    .as_ref()
+                            })
+                            .cloned(),
                         ..Default::default()
                     },
                 )
@@ -3145,6 +3158,9 @@ pub async fn media_segments(
 mod tests {
     use chrono::Utc;
     use http::header::HeaderValue;
+    use remux_sdks::remux::{
+        CollectionFilter, FilterGroup, FilterMatchMode, FilterRule, SetOp,
+    };
     use uuid::Uuid;
 
     use crate::{
@@ -3152,6 +3168,60 @@ mod tests {
         db::{ExternalIds, MediaIdRaw, NonEmptyString},
         integration_test::{auth_header_with_token, authenticated_server},
     };
+
+    const COLLECTIONS_PARENT_ID: &str = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+
+    async fn get_user_id(server: &axum_test::TestServer, auth: &str) -> String {
+        let response: serde_json::Value = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(auth).unwrap(),
+            )
+            .await
+            .json();
+        response["Id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn tag_filter(tag: &str) -> CollectionFilter {
+        CollectionFilter {
+            match_mode: FilterMatchMode::All,
+            groups: vec![FilterGroup {
+                match_mode: FilterMatchMode::All,
+                rules: vec![FilterRule::Tag {
+                    op: SetOp::In,
+                    values: vec![tag.to_string()],
+                }],
+            }],
+        }
+    }
+
+    async fn insert_smart_collection_with_filter(
+        db: &sqlx::SqlitePool,
+        title: &str,
+        media_kind: db::CollectionMediaKind,
+        filter: Option<CollectionFilter>,
+    ) -> db::Media {
+        let now = Utc::now().naive_utc();
+        let mut collection = db::Media {
+            title: title.to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Smart),
+            collection_media_kind: Some(media_kind),
+            collection_smart_filter: filter,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        collection
+            .save(db)
+            .await
+            .unwrap();
+        collection
+    }
 
     fn make_content_ids(kind: db::MediaKind, imdb: &str) -> (Uuid, ExternalIds) {
         let ext = ExternalIds {
