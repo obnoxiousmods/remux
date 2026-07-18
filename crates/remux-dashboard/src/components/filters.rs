@@ -578,7 +578,13 @@ pub fn ChipInput(
                                 let key = e.key().to_string();
                                 let text = input_text.read().replace(',', "");
                                 let text = text.trim().to_string();
-                                if (key == "Enter" || key == ",") && !text.is_empty() {
+                                if key == "Escape" {
+                                    // Stopped from bubbling so it dismisses the
+                                    // suggestion list without also closing an
+                                    // enclosing modal.
+                                    e.stop_propagation();
+                                    show_dropdown.set(false);
+                                } else if (key == "Enter" || key == ",") && !text.is_empty() {
                                     e.prevent_default();
                                     let mut v = vals_kd.clone();
                                     if !v.contains(&text) { v.push(text); }

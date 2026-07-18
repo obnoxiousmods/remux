@@ -163,6 +163,9 @@ pub struct ExploreResponse {
     pub summary: Stats,
     pub series: Vec<SeriesPoint>,
     pub breakdown: Vec<BreakdownRow>,
+    /// Same rows grouped by status class, so the client renders the status
+    /// donut without issuing a second identical query.
+    pub status_breakdown: Vec<BreakdownRow>,
     pub recent: Vec<RequestEvent>,
     pub filters: FilterOptions,
     pub playback_readiness: PlaybackReadiness,
@@ -744,6 +747,28 @@ async fn rollup_rows(
         .await?)
 }
 
+/// Status-class rows are a fixed, small set rendered as a donut, so they are
+/// returned in stable label order rather than the caller's breakdown sort.
+fn finish_status_breakdown(acc: BTreeMap<String, Acc>) -> Vec<BreakdownRow> {
+    acc.into_iter()
+        .map(|(label, acc)| BreakdownRow {
+            label,
+            stats: acc.finish(),
+        })
+        .collect()
+}
+
+fn finish_rollup_status_breakdown(
+    acc: BTreeMap<String, RollupAcc>,
+) -> Vec<BreakdownRow> {
+    acc.into_iter()
+        .map(|(label, acc)| BreakdownRow {
+            label,
+            stats: acc.finish(),
+        })
+        .collect()
+}
+
 fn sort_breakdown(rows: &mut Vec<BreakdownRow>, query: &ExploreQuery) {
     let sort = query
         .sort_by
@@ -830,6 +855,9 @@ async fn explore_rollups(
     rows.truncate(500_000);
     let mut summary = RollupAcc::default();
     let mut breakdown: HashMap<String, RollupAcc> = HashMap::new();
+    // See the raw path: grouped in the same pass so the status donut does not
+    // need a second, identically-filtered request.
+    let mut status_breakdown: BTreeMap<String, RollupAcc> = BTreeMap::new();
     let mut series: BTreeMap<(i64, String), RollupAcc> = BTreeMap::new();
     let mut filters = FilterOptions::default();
     for row in &rows {
@@ -837,6 +865,10 @@ async fn explore_rollups(
         let label = rollup_label(row, &group_by);
         breakdown
             .entry(label.clone())
+            .or_default()
+            .add(row);
+        status_breakdown
+            .entry(rollup_label(row, "status"))
             .or_default()
             .add(row);
         if let Ok(time) = DateTime::parse_from_rfc3339(&row.bucket_start) {
@@ -914,6 +946,7 @@ async fn explore_rollups(
         })
         .collect();
     sort_breakdown(&mut breakdown, query);
+    let status_breakdown = finish_rollup_status_breakdown(status_breakdown);
     let series = series
         .into_iter()
         .filter_map(|((bucket, label), acc)| {
@@ -944,6 +977,7 @@ async fn explore_rollups(
         summary: summary.finish(),
         series,
         breakdown,
+        status_breakdown,
         recent,
         filters,
         playback_readiness,
@@ -1007,6 +1041,9 @@ pub async fn explore(
     rows.truncate(500_000);
     let mut summary = Acc::default();
     let mut breakdown: HashMap<String, Acc> = HashMap::new();
+    // Grouped alongside the caller's dimension so the status donut does not
+    // need a second, identically-filtered request.
+    let mut status_breakdown: BTreeMap<String, Acc> = BTreeMap::new();
     let mut series: BTreeMap<(i64, String), Acc> = BTreeMap::new();
     let mut routes = BTreeSet::new();
     let mut devices = BTreeSet::new();
@@ -1020,6 +1057,10 @@ pub async fn explore(
         let group = label(row, &group_by);
         breakdown
             .entry(group.clone())
+            .or_default()
+            .add(row.latency_ms, row.status);
+        status_breakdown
+            .entry(label(row, "status"))
             .or_default()
             .add(row.latency_ms, row.status);
         if let Ok(time) = DateTime::parse_from_rfc3339(&row.created_at) {
@@ -1082,6 +1123,7 @@ pub async fn explore(
         })
         .collect();
     sort_breakdown(&mut breakdown, &query);
+    let status_breakdown = finish_status_breakdown(status_breakdown);
     let series = series
         .into_iter()
         .filter_map(|((bucket, label), acc)| {
@@ -1131,6 +1173,7 @@ pub async fn explore(
         summary: summary.finish(),
         series,
         breakdown,
+        status_breakdown,
         recent,
         filters,
         playback_readiness,

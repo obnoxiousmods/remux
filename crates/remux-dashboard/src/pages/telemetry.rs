@@ -17,6 +17,16 @@ const SERIES_COLORS: [&str; 10] = [
     "#8b5cf6", "#06b6d4", "#22c55e", "#f59e0b", "#ef4444", "#ec4899", "#3b82f6",
     "#84cc16", "#f97316", "#14b8a6",
 ];
+/// How many breakdown rows the server returns. It sorts, then truncates to this
+/// many, so when a grouping has more distinct values than this the returned set
+/// depends on the sort and a re-query is unavoidable.
+const BREAKDOWN_LIMIT: usize = 200;
+
+/// Ceiling on a single explore round trip. Without it a stalled fetch never
+/// resolves, leaving `loading`/`refreshing` stuck on and the page wedged until
+/// a manual reload.
+const REQUEST_TIMEOUT_MS: u32 = 30_000;
+
 const TABLE_COLUMNS: [(&str, &str); 8] = [
     ("count", "Requests"),
     ("errors", "Errors"),
@@ -500,7 +510,7 @@ fn request(
         sort_dir: query
             .sort_dir
             .clone(),
-        limit: 200,
+        limit: BREAKDOWN_LIMIT,
     }
 }
 
@@ -569,6 +579,56 @@ fn csv_url(value: &str) -> String {
     format!("data:text/csv;charset=utf-8,{}", urlencoding::encode(value))
 }
 
+/// Applies a breakdown column sort.
+///
+/// Reordering is local, so it costs no round trip. The exception is a truncated
+/// breakdown: the server sorts before it truncates, so the rows we hold are the
+/// top N under the *previous* ordering and the correct set must be refetched.
+#[allow(clippy::too_many_arguments)]
+fn sort_breakdown_by(
+    key: &str,
+    default_ascending: bool,
+    truncated: bool,
+    mut table_sort_by: Signal<String>,
+    mut table_sort_asc: Signal<bool>,
+    mut draft: Signal<QueryConfig>,
+    mut applied: Signal<QueryConfig>,
+) {
+    let ascending = if *table_sort_by.peek() == key {
+        !*table_sort_asc.peek()
+    } else {
+        default_ascending
+    };
+    table_sort_by.set(key.to_string());
+    table_sort_asc.set(ascending);
+
+    if truncated {
+        let mut next = applied
+            .peek()
+            .clone();
+        next.sort_by = key.to_string();
+        next.sort_dir = if ascending {
+            "asc".into()
+        } else {
+            "desc".into()
+        };
+        draft.set(next.clone());
+        applied.set(next);
+    }
+}
+
+/// Resolves to `None` if `future` has not completed within `ms`.
+async fn with_timeout<T>(
+    future: impl std::future::Future<Output = T>,
+    ms: u32,
+) -> Option<T> {
+    futures::pin_mut!(future);
+    match futures::future::select(future, TimeoutFuture::new(ms)).await {
+        futures::future::Either::Left((value, _)) => Some(value),
+        futures::future::Either::Right(_) => None,
+    }
+}
+
 fn filtered_breakdown(
     rows: &[TelemetryBreakdownRow],
     search: &str,
@@ -586,6 +646,37 @@ fn filtered_breakdown(
         })
         .cloned()
         .collect()
+}
+
+/// Reorders an already-fetched breakdown in place of a round trip.
+///
+/// Sorting used to write `applied`, which re-ran the whole server-side
+/// aggregation just to reorder at most a couple hundred rows we already hold.
+fn sorted_breakdown(
+    rows: &[TelemetryBreakdownRow],
+    search: &str,
+    sort_by: &str,
+    ascending: bool,
+) -> Vec<TelemetryBreakdownRow> {
+    let mut rows = filtered_breakdown(rows, search);
+    rows.sort_by(|a, b| {
+        let ordering = if sort_by == "label" {
+            a.label
+                .to_lowercase()
+                .cmp(
+                    &b.label
+                        .to_lowercase(),
+                )
+        } else {
+            stats_metric(&a.stats, sort_by).total_cmp(&stats_metric(&b.stats, sort_by))
+        };
+        if ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    });
+    rows
 }
 
 fn sorted_recent(
@@ -962,7 +1053,6 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
     let mut applied = use_signal(QueryConfig::default);
     let mut data = use_signal(|| None::<TelemetryExploreResponse>);
     let mut previous = use_signal(|| None::<TelemetryExploreResponse>);
-    let mut status_data = use_signal(|| None::<TelemetryExploreResponse>);
     let mut options = use_signal(TelemetryFilterOptions::default);
     let mut loading = use_signal(|| true);
     let mut refreshing = use_signal(|| false);
@@ -985,6 +1075,14 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
             .map(|(key, _)| (*key).to_string())
             .collect::<Vec<_>>()
     });
+    let mut columns_open = use_signal(|| false);
+    // Monotonic id for explore requests, used to discard superseded responses.
+    let mut request_seq = use_signal(|| 0_u64);
+    // Breakdown sort lives outside `applied` so reordering does not re-run the
+    // server-side aggregation. It is only pushed back into `applied` when the
+    // grouping has more rows than the server returns (see BREAKDOWN_LIMIT).
+    let mut table_sort_by = use_signal(|| QueryConfig::default().sort_by);
+    let mut table_sort_asc = use_signal(|| QueryConfig::default().sort_dir == "asc");
     let mut views = use_signal(Vec::<TelemetrySavedView>::new);
     let mut view_name = use_signal(String::new);
     let mut view_message = use_signal(String::new);
@@ -994,9 +1092,15 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
         .clone();
     use_effect(move || {
         let query = applied();
-        let generation = *refresh.read();
+        // Read so pressing Refresh (which bumps the counter) re-runs this effect.
+        let _generation = *refresh.read();
         let compare = *compare_previous.read();
         let api = telemetry_client.clone();
+        // Claim this run. Effect re-runs do not cancel the task already in
+        // flight, so each task checks on completion whether it is still the
+        // newest before touching shared state.
+        let seq = *request_seq.peek() + 1;
+        request_seq.set(seq);
         if data
             .peek()
             .is_none()
@@ -1007,33 +1111,54 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
         }
         spawn(async move {
             let primary_request = request(&query, 0, &query.group_by);
-            let status_request = request(&query, 0, "status");
             let primary_api = api.clone();
-            let status_api = api.clone();
-            let (primary_result, status_result) = futures::join!(
-                primary_api.execute(primary_request),
-                status_api.execute(status_request)
-            );
-            let comparison_result = if compare {
-                api.execute(request(&query, query.hours, &query.group_by))
-                    .await
-                    .ok()
-            } else {
-                None
-            };
-            match primary_result {
-                Ok(value) => {
-                    options.with_mut(|target| merge_options(target, &value.filters));
-                    data.set(Some(value));
-                    previous.set(comparison_result);
-                    status_data.set(status_result.ok());
-                    error.set(None);
+            let fetch = async move {
+                if compare {
+                    let comparison_request =
+                        request(&query, query.hours, &query.group_by);
+                    let (primary_result, comparison_result) = futures::join!(
+                        primary_api.execute(primary_request),
+                        api.execute(comparison_request)
+                    );
+                    (primary_result, comparison_result.ok())
+                } else {
+                    (
+                        primary_api
+                            .execute(primary_request)
+                            .await,
+                        None,
+                    )
                 }
-                Err(err) => {
-                    error.set(Some(format!("Telemetry could not be loaded: {err}")));
+            };
+            let outcome = with_timeout(fetch, REQUEST_TIMEOUT_MS).await;
+
+            // Superseded by a newer request: that one owns the data and the
+            // loading flags, so leave both alone.
+            if *request_seq.peek() != seq {
+                return;
+            }
+
+            match outcome {
+                Some((primary_result, comparison_result)) => match primary_result {
+                    Ok(value) => {
+                        options
+                            .with_mut(|target| merge_options(target, &value.filters));
+                        data.set(Some(value));
+                        previous.set(comparison_result);
+                        error.set(None);
+                    }
+                    Err(err) => {
+                        error
+                            .set(Some(format!("Telemetry could not be loaded: {err}")));
+                    }
+                },
+                None => {
+                    error.set(Some(
+                        "Telemetry request timed out. Try a shorter time range, then press Refresh."
+                            .into(),
+                    ));
                 }
             }
-            let _ = generation;
             loading.set(false);
             refreshing.set(false);
         });
@@ -1065,6 +1190,12 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
                 if *auto_refresh_secs.peek() != seconds || seconds == 0 {
                     break;
                 }
+                // Skip the tick while a request is still in flight. The Refresh
+                // button is guarded the same way; without this, ticks queue up
+                // faster than slow responses complete.
+                if *refreshing.peek() || *loading.peek() {
+                    continue;
+                }
                 refresh += 1;
             }
         });
@@ -1075,9 +1206,28 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
     let options_snapshot = options();
     let result = data();
     let comparison = previous();
+    // True when the server had to truncate the breakdown, so the returned rows
+    // are only the top N under the *server's* sort and reordering locally would
+    // silently sort the wrong subset.
+    let breakdown_truncated = result
+        .as_ref()
+        .map(|value| {
+            value
+                .breakdown
+                .len()
+                >= BREAKDOWN_LIMIT
+        })
+        .unwrap_or(false);
     let breakdown_rows = result
         .as_ref()
-        .map(|value| filtered_breakdown(&value.breakdown, &table_search()))
+        .map(|value| {
+            sorted_breakdown(
+                &value.breakdown,
+                &table_search(),
+                &table_sort_by(),
+                *table_sort_asc.read(),
+            )
+        })
         .unwrap_or_default();
     let recent_rows = result
         .as_ref()
@@ -1108,11 +1258,8 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
         })
         .unwrap_or_default();
     let filter_count = active_filter_count(&applied_snapshot);
-    let breakdown_arrow = if applied_snapshot.sort_dir == "asc" {
-        "↑"
-    } else {
-        "↓"
-    };
+    let breakdown_arrow = if *table_sort_asc.read() { "↑" } else { "↓" };
+    let breakdown_sort = table_sort_by();
     let recent_arrow = if *recent_ascending.read() {
         "↑"
     } else {
@@ -1232,7 +1379,7 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
                     for saved in views.read().clone(){
                         {let apply_view=saved.clone();let remove=saved.clone();rsx!{
                             span { class:"telemetry-view-chip",
-                                button { title:"Apply shared view",onclick:move |_|{if let Ok(config)=serde_json::from_str::<ViewConfig>(&apply_view.config_json){let query=config.query();draft.set(query.clone());applied.set(query);metric_key.set(config.metric);chart_type.set(config.chart_type);series_limit.set(config.series_limit.clamp(1,10));show_points.set(config.show_points);compare_previous.set(config.compare_previous);auto_refresh_secs.set(config.auto_refresh_secs);if !config.columns.is_empty(){columns.set(config.columns);}}},"{saved.name}" }
+                                button { title:"Apply shared view",onclick:move |_|{if let Ok(config)=serde_json::from_str::<ViewConfig>(&apply_view.config_json){let query=config.query();table_sort_by.set(query.sort_by.clone());table_sort_asc.set(query.sort_dir=="asc");draft.set(query.clone());applied.set(query);metric_key.set(config.metric);chart_type.set(config.chart_type);series_limit.set(config.series_limit.clamp(1,10));show_points.set(config.show_points);compare_previous.set(config.compare_previous);auto_refresh_secs.set(config.auto_refresh_secs);if !config.columns.is_empty(){columns.set(config.columns);}}},"{saved.name}" }
                                 button { class:"telemetry-view-delete",title:"Delete shared view",onclick:{let api=app_state.client.clone();move |_|{let api=api.clone();let id=remove.id.clone();spawn(async move{match api.execute(DeleteTelemetryView{id}).await{Ok(_)=>{if let Ok(value)=api.execute(GetTelemetryViews).await{views.set(value);}},Err(err)=>view_message.set(format!("Delete failed: {err}"))}});}},"×" }
                             }
                         }}
@@ -1240,7 +1387,7 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
                 }
                 div { class:"telemetry-view-actions",
                     input { class:"form-input",placeholder:"Name this view",value:"{view_name}",oninput:move|e|view_name.set(e.value()) }
-                    button { class:"btn btn-ghost",disabled:view_name.read().trim().is_empty(),onclick:{let api=app_state.client.clone();move |_|{let api=api.clone();let query=applied();let config=ViewConfig{hours:query.hours,bucket_minutes:query.bucket_minutes,group_by:query.group_by,metric:metric_key(),route:query.route,device:query.device,client:query.client,user:query.user,content:query.content,method:query.method,status_class:query.status_class,sample_reason:query.sample_reason,sort_by:query.sort_by,sort_dir:query.sort_dir,chart_type:chart_type(),series_limit:*series_limit.read(),show_points:*show_points.read(),compare_previous:*compare_previous.read(),auto_refresh_secs:*auto_refresh_secs.read(),columns:columns()};let name=view_name().trim().to_string();spawn(async move{match api.execute(SaveTelemetryView{name,config:serde_json::to_value(config).unwrap_or_default()}).await{Ok(_)=>{view_name.set(String::new());view_message.set("Shared view saved".into());if let Ok(value)=api.execute(GetTelemetryViews).await{views.set(value);}},Err(err)=>view_message.set(format!("Save failed: {err}"))}});}},"Save current view" }
+                    button { class:"btn btn-ghost",disabled:view_name.read().trim().is_empty(),onclick:{let api=app_state.client.clone();move |_|{let api=api.clone();let query=applied();let config=ViewConfig{hours:query.hours,bucket_minutes:query.bucket_minutes,group_by:query.group_by,metric:metric_key(),route:query.route,device:query.device,client:query.client,user:query.user,content:query.content,method:query.method,status_class:query.status_class,sample_reason:query.sample_reason,sort_by:table_sort_by(),sort_dir:if *table_sort_asc.read(){"asc".into()}else{"desc".into()},chart_type:chart_type(),series_limit:*series_limit.read(),show_points:*show_points.read(),compare_previous:*compare_previous.read(),auto_refresh_secs:*auto_refresh_secs.read(),columns:columns()};let name=view_name().trim().to_string();spawn(async move{match api.execute(SaveTelemetryView{name,config:serde_json::to_value(config).unwrap_or_default()}).await{Ok(_)=>{view_name.set(String::new());view_message.set("Shared view saved".into());if let Ok(value)=api.execute(GetTelemetryViews).await{views.set(value);}},Err(err)=>view_message.set(format!("Save failed: {err}"))}});}},"Save current view" }
                 }
             }
             if !view_message.read().is_empty(){div{class:"telemetry-message","{view_message}"}}
@@ -1281,7 +1428,7 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
                         BreakdownBars { rows:result.breakdown.clone(),metric_key:metric_key(),on_drilldown:move|label:String|{if let Some(next)=drilldown(&applied(),&label){draft.set(next.clone());applied.set(next);}} }
                     }
                     Card { title:"HTTP status distribution",
-                        StatusDonut { rows:status_data.read().as_ref().map(|value|value.breakdown.clone()).unwrap_or_default() }
+                        StatusDonut { rows:result.status_breakdown.clone() }
                     }
                 }
 
@@ -1298,13 +1445,40 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
                     action: rsx! {
                         div { class:"telemetry-table-actions",
                             input { class:"form-input",placeholder:"Search breakdown",value:"{table_search}",oninput:move|e|table_search.set(e.value()) }
-                            details { class:"telemetry-columns",
-                                summary { "Columns ({columns.read().len()})" }
-                                div {
-                                    for (key,label) in TABLE_COLUMNS {
-                                        label {
-                                            input { r#type:"checkbox",checked:column_enabled(&columns(),key),onchange:move|e|columns.with_mut(|values|{if e.checked(){if !values.iter().any(|value|value==key){values.push(key.into());}}else{values.retain(|value|value!=key);}}) }
-                                            "{label}"
+                            // Was a native <details>/<summary>, which only toggles from its
+                            // summary and so could not be dismissed by clicking away or by
+                            // Escape. Uses the same backdrop pattern as `Select` instead.
+                            div { class:"telemetry-columns",
+                                onkeydown: move |e| {
+                                    if e.key() == Key::Escape && *columns_open.read() {
+                                        e.stop_propagation();
+                                        columns_open.set(false);
+                                    }
+                                },
+                                button {
+                                    r#type:"button",
+                                    class:"telemetry-columns-trigger",
+                                    aria_expanded: if *columns_open.read() { "true" } else { "false" },
+                                    onclick: move |_| {
+                                        let next = !*columns_open.read();
+                                        columns_open.set(next);
+                                    },
+                                    "Columns ({columns.read().len()})"
+                                }
+                                if *columns_open.read() {
+                                    div {
+                                        class:"cselect-backdrop",
+                                        onclick: move |e| {
+                                            e.prevent_default();
+                                            columns_open.set(false);
+                                        },
+                                    }
+                                    div { class:"telemetry-columns-menu",
+                                        for (key,label) in TABLE_COLUMNS {
+                                            label {
+                                                input { r#type:"checkbox",checked:column_enabled(&columns(),key),onchange:move|e|columns.with_mut(|values|{if e.checked(){if !values.iter().any(|value|value==key){values.push(key.into());}}else{values.retain(|value|value!=key);}}) }
+                                                "{label}"
+                                            }
                                         }
                                     }
                                 }
@@ -1318,13 +1492,13 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
                         div { class:"data-table-container telemetry-table",
                             table {
                                 thead { tr {
-                                    th { button { onclick:move |_|{let mut next=applied();if next.sort_by=="label"{next.sort_dir=if next.sort_dir=="asc"{"desc".into()}else{"asc".into()};}else{next.sort_by="label".into();next.sort_dir="asc".into();}draft.set(next.clone());applied.set(next);},
-                                        "Name" if applied_snapshot.sort_by=="label" { span { " {breakdown_arrow}" } }
+                                    th { button { onclick:move |_|{sort_breakdown_by("label",true,breakdown_truncated,table_sort_by,table_sort_asc,draft,applied);},
+                                        "Name" if breakdown_sort=="label" { span { " {breakdown_arrow}" } }
                                     } }
                                     for (key,label) in TABLE_COLUMNS {
                                         if column_enabled(&columns(),key) {
-                                            th { button { onclick:move |_|{let mut next=applied();if next.sort_by==key{next.sort_dir=if next.sort_dir=="desc"{"asc".into()}else{"desc".into()};}else{next.sort_by=key.into();next.sort_dir="desc".into();}draft.set(next.clone());applied.set(next);},
-                                                "{label}" if applied_snapshot.sort_by==key { span { " {breakdown_arrow}" } }
+                                            th { button { onclick:move |_|{sort_breakdown_by(key,false,breakdown_truncated,table_sort_by,table_sort_asc,draft,applied);},
+                                                "{label}" if breakdown_sort==key { span { " {breakdown_arrow}" } }
                                             } }
                                         }
                                     }

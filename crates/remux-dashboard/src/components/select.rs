@@ -170,7 +170,16 @@ pub fn Select(
             if *open.read() {
                 div {
                     class: "cselect-backdrop",
-                    onclick: move |_| open.set(false),
+                    // `prevent_default` is required, not cosmetic: this control is often
+                    // wrapped in a `<label>`, and the backdrop is then a descendant of it.
+                    // A click would run the label's activation behaviour, forwarding a
+                    // synthetic click to the labeled control (the trigger button), which
+                    // would immediately reopen the menu we just closed. Cancelling the
+                    // event's default action suppresses that forwarding.
+                    onclick: move |e| {
+                        e.prevent_default();
+                        open.set(false);
+                    },
                 }
                 div {
                     class: "cselect-menu",
@@ -401,7 +410,17 @@ pub fn SearchSelect(
                 }
             }
             if *open.read() {
-                div { class: "cselect-backdrop", onmousedown: move |_| open.set(false) }
+                div {
+                    class: "cselect-backdrop",
+                    onmousedown: move |_| open.set(false),
+                    // See the note on `Select`'s backdrop: without cancelling the click's
+                    // default action, an enclosing `<label>` forwards it to the input,
+                    // which refocuses it and reopens the menu via `onfocus`.
+                    onclick: move |e| {
+                        e.prevent_default();
+                        open.set(false);
+                    },
+                }
                 div {
                     class: "cselect-menu ccombobox-menu",
                     role: "listbox",

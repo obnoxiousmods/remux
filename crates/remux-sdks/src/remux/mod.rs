@@ -5096,6 +5096,9 @@ pub struct TelemetryExploreResponse {
     pub summary: TelemetryStats,
     pub series: Vec<TelemetrySeriesPoint>,
     pub breakdown: Vec<TelemetryBreakdownRow>,
+    /// The same rows grouped by status class, so the status donut does not need
+    /// a second identical request.
+    pub status_breakdown: Vec<TelemetryBreakdownRow>,
     pub recent: Vec<TelemetryRequestEvent>,
     pub filters: TelemetryFilterOptions,
     pub playback_readiness: TelemetryPlaybackReadiness,
