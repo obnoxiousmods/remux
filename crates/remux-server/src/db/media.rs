@@ -3418,12 +3418,13 @@ impl Media {
                             format!("title COLLATE NOCASE {}", dir)
                         }
                         api::ItemSortBy::DateCreated => {
-                            // Tiebreak equal timestamps by id for a stable total
-                            // order (deterministic pagination). Matching the
-                            // trailing `id` and direction lets the composite
-                            // index idx_media_created_at_id (datetime(created_at),
-                            // id) serve this ORDER BY without a temp b-tree sort.
-                            format!("datetime(created_at) {dir}, id {dir}")
+                            // NOTE: the `id` tiebreaker is appended once after
+                            // the join below, NOT here. Appending it inside this
+                            // closure makes `id` sort key #2 for a multi-key
+                            // request, which silently kills every later key
+                            // (`SortBy=DateCreated,SortName` would never apply
+                            // SortName). See the tiebreaker block after the join.
+                            format!("datetime(created_at) {dir}")
                         }
                         api::ItemSortBy::PremiereDate
                         | api::ItemSortBy::ProductionYear => {
@@ -3566,6 +3567,73 @@ impl Media {
                     col
                 })
                 .collect();
+
+            // Append a unique tiebreaker ONCE, after every client-requested key,
+            // so the ordering is a deterministic total order (stable pagination:
+            // without it, rows tying on the sort key can be duplicated across or
+            // skipped between pages).
+            //
+            // It must go last. Injecting `id` inside the per-sort closure would
+            // make it sort key #2 and silently dead-end every subsequent client
+            // key — `SortBy=DateCreated,SortName` would never apply SortName.
+            //
+            // The direction follows the *last* key so that a single-key sort
+            // renders `expr {dir}, id {dir}`: matching directions are what let a
+            // composite `(expr, id)` index satisfy the ORDER BY by scanning the
+            // index (forward for ASC, backward for DESC). A mixed pair such as
+            // `expr DESC, id ASC` reintroduces a temp b-tree sort.
+            //
+            // Only applied when EVERY requested key is one of the sorts that has
+            // a matching `(expr, id)` index. That restriction is not just scope
+            // discipline, it is required for correctness of the plan: appending
+            // `id` to a sort whose index does not include it *breaks* that
+            // index's ability to satisfy the ORDER BY and reintroduces a temp
+            // b-tree. `SortName` is the cautionary case — `idx_media_title` is
+            // `(title COLLATE NOCASE)` with no `id`, and that sort currently
+            // costs under a millisecond; appending a tiebreaker would regress it.
+            //
+            // Sorts left alone therefore keep today's behaviour exactly:
+            // `SortName`/`Name`, `DatePlayed`, `Random`, the popularity and
+            // trending clauses, `SimilarityScore`, `CatalogOrder`,
+            // `ChannelOrder`/`DisplayOrder`, and the title fallback.
+            let tiebreakable = |s: &api::ItemSortBy| {
+                matches!(
+                    s,
+                    api::ItemSortBy::DateCreated
+                        | api::ItemSortBy::PremiereDate
+                        | api::ItemSortBy::ProductionYear
+                        | api::ItemSortBy::DigitalReleaseDate
+                        | api::ItemSortBy::CommunityRating
+                        | api::ItemSortBy::Runtime
+                )
+            };
+            if filter
+                .sort_by
+                .iter()
+                .all(tiebreakable)
+            {
+                let last_dir = filter
+                    .sort_order
+                    .get(
+                        filter
+                            .sort_by
+                            .len()
+                            .saturating_sub(1),
+                    )
+                    .or_else(|| {
+                        filter
+                            .sort_order
+                            .first()
+                    })
+                    .copied()
+                    .unwrap_or(api::SortOrder::Ascending);
+                let dir = match last_dir {
+                    api::SortOrder::Ascending => "ASC",
+                    api::SortOrder::Descending => "DESC",
+                };
+                order_clauses.push(format!("id {dir}"));
+            }
+
             records_qb.push(" ORDER BY ");
             records_qb.push(order_clauses.join(", "));
         } else if is_manual_collection {
@@ -7971,6 +8039,92 @@ mod created_at_ordering_tests {
         assert_eq!(
             descending, expected_descending,
             "descending must be the exact reverse of ascending"
+        );
+    }
+
+    /// A client may send several sort keys, e.g. `SortBy=DateCreated,SortName`.
+    /// Every key must still count: the second one decides the order of rows that
+    /// tie on the first.
+    ///
+    /// This is a regression test. The id tiebreaker was once appended inside the
+    /// per-key builder, which made `id` sort key #2 — and because ids are unique,
+    /// nothing after it could ever change the order, so the client's SortName was
+    /// silently ignored. The tiebreaker now goes last, after every client key.
+    #[tokio::test]
+    async fn multi_key_sort_still_applies_the_second_key() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+
+        // Same creation time for all three, so DateCreated ties and SortName is
+        // the only key that can order them. Titles are deliberately NOT in id
+        // order, so sorting by id instead of title is detectable.
+        let same_creation_time = chrono::NaiveDate::from_ymd_opt(2021, 6, 1)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for (imdb_id, title) in [
+            ("tt7100001", "Zebra"),
+            ("tt7100002", "Apple"),
+            ("tt7100003", "Mango"),
+        ] {
+            let external_ids = ExternalIds {
+                imdb: Some(NonEmptyString::try_new(imdb_id.to_string()).unwrap()),
+                ..Default::default()
+            };
+            let id = uuid::Uuid::from(&MediaIdRaw {
+                kind: MediaKind::Movie,
+                external_ids: external_ids.clone(),
+                season: None,
+                episode: None,
+            });
+            ids.push(id);
+            Media {
+                id,
+                title: title.to_string(),
+                kind: MediaKind::Movie,
+                external_ids,
+                created_at: same_creation_time,
+                ..Default::default()
+            }
+            .save(db)
+            .await
+            .unwrap();
+        }
+
+        let titles: Vec<String> = Media::get_by_filter(
+            db,
+            &MediaFilter {
+                kind: Some(vec![MediaKind::Movie]),
+                sort_by: vec![api::ItemSortBy::DateCreated, api::ItemSortBy::SortName],
+                sort_order: vec![api::SortOrder::Ascending, api::SortOrder::Ascending],
+                limit: Some(1000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .records
+        .into_iter()
+        .filter(|movie| ids.contains(&movie.id))
+        .map(|movie| movie.title)
+        .collect();
+
+        assert_eq!(
+            titles,
+            vec![
+                "Apple".to_string(),
+                "Mango".to_string(),
+                "Zebra".to_string()
+            ],
+            "rows tying on DateCreated must be ordered by the client's second \
+             key (SortName); getting a different order means the id tiebreaker \
+             was injected before it and swallowed the key"
         );
     }
 }
