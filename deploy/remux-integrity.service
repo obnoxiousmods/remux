@@ -1,0 +1,7 @@
+[Unit]
+Description=Verify the active Remux release provenance and hashes
+After=remux.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/remux-verify-release

@@ -1,0 +1,27 @@
+[Unit]
+Description=Remux Media Server
+After=network.target
+
+[Service]
+Type=simple
+User=jellyflix
+Group=media
+WorkingDirectory=/opt/remux/data
+Environment="DATABASE_URL=sqlite:///opt/remux/data/db.sqlite?mode=rwc"
+Environment="DATA_DIR=/opt/remux/data"
+Environment="FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg"
+Environment="FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe"
+Environment="WEB_PATH=/opt/remux/jellyfin-web"
+Environment="DASHBOARD_PATH=/opt/remux/current/dashboard"
+Environment="TORRENT_DATA_DIR=/opt/remux/data/torrents"
+Environment="LOG_FILE=/opt/remux/data/logs/remux.jsonl"
+Environment="PORT=3008"
+Environment="RUST_LOG=info,remux_server=debug"
+LimitNOFILE=524288
+ExecStartPre=/usr/local/sbin/remux-verify-release --release-only
+ExecStart=/opt/remux/current/remux-server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

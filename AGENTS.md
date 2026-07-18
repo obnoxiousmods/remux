@@ -2,6 +2,20 @@
 
 Jellyfin-compatible media server written in Rust.
 
+## Canonical production checkout and deployment
+
+- The only production source checkout is `/home/s/remux-server-wip`.
+- Never deploy a binary or dashboard from `/tmp`, another worktree, a recovery
+  directory, `/home/joey`, `/opt/jellyflix`, or `/opt/remux/build`.
+- Never install directly to `/usr/local/bin/remux-server`. Production executes
+  the immutable release selected by `/opt/remux/current`.
+- Commit every intended change and leave the canonical tree clean, then deploy
+  only with `deploy/remux-canonical-deploy.sh` from this checkout.
+- The deploy command binds the artifact to its Git commit and SHA-256 manifest,
+  atomically selects it, restarts the service, and verifies `/proc/$pid/exe`.
+- Use `deploy/remux-rollback.sh` for a verified rollback; do not copy an old
+  executable over the live path.
+
 ## Crates
 
 | Crate | Purpose |
