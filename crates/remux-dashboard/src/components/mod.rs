@@ -19,7 +19,7 @@ pub use form::{FormActions, FormGroup, ToggleRow};
 pub use icons::NavIcon;
 pub use metrics::MetricsCard;
 pub use modal::{Modal, ModalSize};
-pub use select::{Select, SelectOption};
+pub use select::{SearchSelect, Select, SelectOption};
 pub use server_info::{MediaStatsCard, ServerInfoCard};
 pub use sessions::SessionsCard;
 pub use states::{EmptyState, ErrorAlert, LoadingText, SuccessAlert};

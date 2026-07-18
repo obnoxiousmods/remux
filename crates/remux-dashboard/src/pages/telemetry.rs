@@ -1,5 +1,5 @@
 use crate::{
-    components::{Card, EmptyState, LoadingText},
+    components::{Card, EmptyState, LoadingText, SearchSelect, Select, SelectOption},
     state::AppState,
 };
 use dioxus::prelude::*;
@@ -451,6 +451,13 @@ fn merge_options(target: &mut TelemetryFilterOptions, source: &TelemetryFilterOp
     merge(&mut target.contents, &source.contents);
     merge(&mut target.methods, &source.methods);
     merge(&mut target.sample_reasons, &source.sample_reasons);
+}
+
+fn select_options(values: &[String]) -> Vec<SelectOption> {
+    values
+        .iter()
+        .map(|value| SelectOption::new(value, value))
+        .collect()
 }
 
 fn request(
@@ -1131,8 +1138,17 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
                 }
                 div { class:"telemetry-header-actions",
                     label { class:"telemetry-auto-refresh",span { "Auto refresh" }
-                        select { value:"{auto_refresh_secs}",onchange:move|event|if let Ok(value)=event.value().parse(){auto_refresh_secs.set(value);},
-                            option { value:"0","Off" } option { value:"10","10 sec" } option { value:"30","30 sec" } option { value:"60","1 min" } option { value:"300","5 min" }
+                        Select {
+                            class: "telemetry-compact",
+                            value: auto_refresh_secs.read().to_string(),
+                            options: vec![
+                                SelectOption::new("0", "Off"),
+                                SelectOption::new("10", "10 sec"),
+                                SelectOption::new("30", "30 sec"),
+                                SelectOption::new("60", "1 min"),
+                                SelectOption::new("300", "5 min"),
+                            ],
+                            on_change: move |value: String| if let Ok(value) = value.parse() { auto_refresh_secs.set(value); },
                         }
                     }
                     button { class:"btn btn-primary telemetry-refresh",disabled:*refreshing.read(),onclick:move |_|refresh+=1,
@@ -1156,28 +1172,37 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
                 summary { span { "Query builder" } if filter_count>0 { b { "{filter_count} active filters" } } i { "▾" } }
                 div { class:"telemetry-query-body",
                     div { class:"telemetry-query-grid",
-                        label { "Group by" select { value:"{draft_snapshot.group_by}",onchange:move|e|draft.with_mut(|value|value.group_by=e.value()),
-                            option{value:"route","Endpoint"} option{value:"device","Device"} option{value:"client","Client"} option{value:"deviceClient","Device + client"}
-                            option{value:"routeClient","Endpoint + client"} option{value:"routeDevice","Endpoint + device"} option{value:"user","User"} option{value:"content","Content"}
-                            option{value:"method","Method"} option{value:"status","HTTP status"} option{value:"none","All requests"}
-                        } }
-                        label { "Bucket size" select { value:"{draft_snapshot.bucket_minutes}",onchange:move|e|if let Ok(value)=e.value().parse(){draft.with_mut(|query|query.bucket_minutes=value);},
-                            option{value:"1","1 minute"} option{value:"5","5 minutes"} option{value:"15","15 minutes"} option{value:"30","30 minutes"} option{value:"60","1 hour"} option{value:"240","4 hours"} option{value:"720","12 hours"} option{value:"1440","1 day"}
-                        } }
-                        label { "Endpoint" input { class:"form-input",list:"telemetry-routes",placeholder:"All endpoints",value:"{draft_snapshot.route}",oninput:move|e|draft.with_mut(|query|query.route=e.value()) } }
-                        label { "Device" input { class:"form-input",list:"telemetry-devices",placeholder:"All devices",value:"{draft_snapshot.device}",oninput:move|e|draft.with_mut(|query|query.device=e.value()) } }
-                        label { "Client" input { class:"form-input",list:"telemetry-clients",placeholder:"All clients",value:"{draft_snapshot.client}",oninput:move|e|draft.with_mut(|query|query.client=e.value()) } }
-                        label { "User" input { class:"form-input",list:"telemetry-users",placeholder:"All users",value:"{draft_snapshot.user}",oninput:move|e|draft.with_mut(|query|query.user=e.value()) } }
-                        label { "Content" input { class:"form-input",list:"telemetry-contents",placeholder:"All content",value:"{draft_snapshot.content}",oninput:move|e|draft.with_mut(|query|query.content=e.value()) } }
-                        label { "Method" select { value:"{draft_snapshot.method}",onchange:move|e|draft.with_mut(|query|query.method=e.value()),option{value:"","All methods"} for value in &options_snapshot.methods{option{value:"{value}","{value}"}} } }
-                        label { "HTTP status" select { value:"{draft_snapshot.status_class}",onchange:move|e|draft.with_mut(|query|query.status_class=e.value()),option{value:"","All statuses"}option{value:"2xx","2xx success"}option{value:"3xx","3xx redirect"}option{value:"4xx","4xx client error"}option{value:"5xx","5xx server error"}option{value:"errors","All errors"} } }
-                        label { "Capture reason" select { value:"{draft_snapshot.sample_reason}",onchange:move|e|draft.with_mut(|query|query.sample_reason=e.value()),option{value:"","All captures"} for value in &options_snapshot.sample_reasons{option{value:"{value}","{value}"}} } }
+                        label { "Group by"
+                            Select { value: draft_snapshot.group_by.clone(), options: vec![
+                                SelectOption::new("route", "Endpoint"), SelectOption::new("device", "Device"), SelectOption::new("client", "Client"),
+                                SelectOption::new("deviceClient", "Device + client"), SelectOption::new("routeClient", "Endpoint + client"),
+                                SelectOption::new("routeDevice", "Endpoint + device"), SelectOption::new("user", "User"), SelectOption::new("content", "Content"),
+                                SelectOption::new("method", "Method"), SelectOption::new("status", "HTTP status"), SelectOption::new("none", "All requests"),
+                            ], on_change: move |value: String| draft.with_mut(|query| query.group_by = value) }
+                        }
+                        label { "Bucket size"
+                            Select { value: draft_snapshot.bucket_minutes.to_string(), options: vec![
+                                SelectOption::new("1", "1 minute"), SelectOption::new("5", "5 minutes"), SelectOption::new("15", "15 minutes"),
+                                SelectOption::new("30", "30 minutes"), SelectOption::new("60", "1 hour"), SelectOption::new("240", "4 hours"),
+                                SelectOption::new("720", "12 hours"), SelectOption::new("1440", "1 day"),
+                            ], on_change: move |value: String| if let Ok(value) = value.parse() { draft.with_mut(|query| query.bucket_minutes = value); } }
+                        }
+                        label { "Endpoint" SearchSelect { value: draft_snapshot.route.clone(), options: select_options(&options_snapshot.routes), placeholder: "All endpoints", on_change: move |value| draft.with_mut(|query| query.route = value) } }
+                        label { "Device" SearchSelect { value: draft_snapshot.device.clone(), options: select_options(&options_snapshot.devices), placeholder: "Search devices", on_change: move |value| draft.with_mut(|query| query.device = value) } }
+                        label { "Client" SearchSelect { value: draft_snapshot.client.clone(), options: select_options(&options_snapshot.clients), placeholder: "Search clients", on_change: move |value| draft.with_mut(|query| query.client = value) } }
+                        label { "User" SearchSelect { value: draft_snapshot.user.clone(), options: select_options(&options_snapshot.users), placeholder: "Search users", on_change: move |value| draft.with_mut(|query| query.user = value) } }
+                        label { "Content" SearchSelect { value: draft_snapshot.content.clone(), options: select_options(&options_snapshot.contents), placeholder: "Search content", on_change: move |value| draft.with_mut(|query| query.content = value) } }
+                        label { "Method" Select { value: draft_snapshot.method.clone(), options: {
+                            let mut values = vec![SelectOption::new("", "All methods")]; values.extend(select_options(&options_snapshot.methods)); values
+                        }, on_change: move |value| draft.with_mut(|query| query.method = value) } }
+                        label { "HTTP status" Select { value: draft_snapshot.status_class.clone(), options: vec![
+                            SelectOption::new("", "All statuses"), SelectOption::new("2xx", "2xx success"), SelectOption::new("3xx", "3xx redirect"),
+                            SelectOption::new("4xx", "4xx client error"), SelectOption::new("5xx", "5xx server error"), SelectOption::new("errors", "All errors"),
+                        ], on_change: move |value| draft.with_mut(|query| query.status_class = value) } }
+                        label { "Capture reason" Select { value: draft_snapshot.sample_reason.clone(), options: {
+                            let mut values = vec![SelectOption::new("", "All captures")]; values.extend(select_options(&options_snapshot.sample_reasons)); values
+                        }, on_change: move |value| draft.with_mut(|query| query.sample_reason = value) } }
                     }
-                    datalist { id:"telemetry-routes",for value in &options_snapshot.routes{option{value:"{value}"}} }
-                    datalist { id:"telemetry-devices",for value in &options_snapshot.devices{option{value:"{value}"}} }
-                    datalist { id:"telemetry-clients",for value in &options_snapshot.clients{option{value:"{value}"}} }
-                    datalist { id:"telemetry-users",for value in &options_snapshot.users{option{value:"{value}"}} }
-                    datalist { id:"telemetry-contents",for value in &options_snapshot.contents{option{value:"{value}"}} }
                     div { class:"telemetry-query-actions",
                         button { class:"btn btn-primary",onclick:move |_|apply_draft(),"Apply query" }
                         button { class:"btn btn-ghost",onclick:move |_|{let mut next=QueryConfig::default();next.hours=applied().hours;next.bucket_minutes=applied().bucket_minutes;draft.set(next.clone());applied.set(next);},"Clear filters" }
@@ -1235,11 +1260,15 @@ pub fn TelemetryPage(app_state: AppState) -> Element {
 
                 Card { title:format!("{} over time",metric_label(&metric_key())),action:rsx!{
                     div { class:"telemetry-chart-controls",
-                        select { aria_label:"Metric",value:"{metric_key}",onchange:move|e|metric_key.set(e.value()),
-                            option{value:"p95","p95 latency"} option{value:"p99","p99 latency"} option{value:"p50","p50 latency"} option{value:"mean","Mean latency"} option{value:"max","Maximum latency"} option{value:"count","Request count"} option{value:"errors","Error count"} option{value:"errorRate","Error rate"}
-                        }
+                        Select { class:"telemetry-chart-select", value:metric_key(), options:vec![
+                            SelectOption::new("p95","p95 latency"), SelectOption::new("p99","p99 latency"), SelectOption::new("p50","p50 latency"),
+                            SelectOption::new("mean","Mean latency"), SelectOption::new("max","Maximum latency"), SelectOption::new("count","Request count"),
+                            SelectOption::new("errors","Error count"), SelectOption::new("errorRate","Error rate"),
+                        ], on_change:move |value|metric_key.set(value) }
                         div { class:"telemetry-segmented",for (value,label) in [("line","Line"),("area","Area"),("bar","Bars")]{button{class:if chart_type()==value{"active"}else{""},onclick:move |_|chart_type.set(value.into()),"{label}"}} }
-                        select { aria_label:"Series count",value:"{series_limit}",onchange:move|e|if let Ok(value)=e.value().parse(){series_limit.set(value);},option{value:"1","Top 1"}option{value:"3","Top 3"}option{value:"6","Top 6"}option{value:"10","Top 10"} }
+                        Select { class:"telemetry-series-select", value:series_limit.read().to_string(), options:vec![
+                            SelectOption::new("1","Top 1"), SelectOption::new("3","Top 3"), SelectOption::new("6","Top 6"), SelectOption::new("10","Top 10"),
+                        ], on_change:move |value: String|if let Ok(value)=value.parse(){series_limit.set(value);} }
                         label { class:"telemetry-check",input{r#type:"checkbox",checked:*show_points.read(),onchange:move|e|show_points.set(e.checked())}"Points" }
                         label { class:"telemetry-check",input{r#type:"checkbox",checked:*compare_previous.read(),onchange:move|e|compare_previous.set(e.checked())}"Compare previous" }
                     }

@@ -213,6 +213,232 @@ pub fn Select(
     }
 }
 
+fn matching_options(
+    options: &[SelectOption],
+    query: &str,
+    limit: usize,
+) -> Vec<SelectOption> {
+    let query = query
+        .trim()
+        .to_lowercase();
+    let mut matches: Vec<SelectOption> = options
+        .iter()
+        .filter(|option| {
+            query.is_empty()
+                || option
+                    .label
+                    .to_lowercase()
+                    .contains(&query)
+                || option
+                    .value
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .cloned()
+        .collect();
+    matches.sort_by_key(|option| {
+        let label = option
+            .label
+            .to_lowercase();
+        let value = option
+            .value
+            .to_lowercase();
+        if label == query || value == query {
+            0
+        } else if label.starts_with(&query) || value.starts_with(&query) {
+            1
+        } else {
+            2
+        }
+    });
+    matches.truncate(limit);
+    matches
+}
+
+fn next_option_index(
+    current: Option<usize>,
+    len: usize,
+    forward: bool,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (current, forward) {
+        (None, true) => 0,
+        (None, false) => len - 1,
+        (Some(index), true) => (index + 1).min(len - 1),
+        (Some(index), false) => index.saturating_sub(1),
+    })
+}
+
+/// Searchable, keyboard-accessible combobox for server-provided option sets.
+///
+/// Typing updates the value immediately (so operators may still enter a value
+/// not yet present in the sampled filter list), while the popover ranks exact
+/// and prefix matches ahead of substring matches. Arrow keys move through the
+/// visible results, Enter accepts the highlighted result, and Escape closes it.
+#[component]
+pub fn SearchSelect(
+    value: String,
+    options: Vec<SelectOption>,
+    on_change: EventHandler<String>,
+    #[props(default)] placeholder: Option<String>,
+    #[props(default)] class: Option<String>,
+) -> Element {
+    let mut open = use_signal(|| false);
+    let mut active_index = use_signal(|| None::<usize>);
+    let mut menu_style: Signal<Option<String>> = use_signal(|| None);
+    let mut control_el: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
+    let matches = matching_options(&options, &value, 100);
+    let wrapper_class = class
+        .map(|class| format!("cselect ccombobox {class}"))
+        .unwrap_or_else(|| "cselect ccombobox".to_string());
+
+    rsx! {
+        div {
+            class: "{wrapper_class}",
+            div {
+                class: if *open.read() { "ccombobox-control cselect-trigger--open" } else { "ccombobox-control" },
+                onmounted: move |event| control_el.set(Some(event.data())),
+                input {
+                    class: "ccombobox-input",
+                    role: "combobox",
+                    aria_autocomplete: "list",
+                    aria_expanded: if *open.read() { "true" } else { "false" },
+                    autocomplete: "off",
+                    placeholder: placeholder.unwrap_or_default(),
+                    value: "{value}",
+                    onfocus: move |_| {
+                        let el = control_el.read().clone();
+                        spawn(async move {
+                            if let Some(el) = el {
+                                if let Ok(rect) = el.get_client_rect().await {
+                                    let viewport_h = web_sys::window()
+                                        .and_then(|window| window.inner_height().ok())
+                                        .and_then(|height| height.as_f64())
+                                        .unwrap_or(0.0);
+                                    menu_style.set(Some(menu_position_style(
+                                        rect.min_x(),
+                                        rect.min_y(),
+                                        rect.max_y(),
+                                        rect.width(),
+                                        viewport_h,
+                                    )));
+                                }
+                            }
+                            active_index.set(None);
+                            open.set(true);
+                        });
+                    },
+                    oninput: move |event| {
+                        active_index.set(None);
+                        open.set(true);
+                        on_change.call(event.value());
+                    },
+                    onkeydown: {
+                        let keyboard_matches = matches.clone();
+                        move |event: KeyboardEvent| match event.key() {
+                            Key::ArrowDown => {
+                                event.prevent_default();
+                                let next = next_option_index(
+                                    *active_index.read(),
+                                    keyboard_matches.len(),
+                                    true,
+                                );
+                                active_index.set(next);
+                                open.set(true);
+                            }
+                            Key::ArrowUp => {
+                                event.prevent_default();
+                                let next = next_option_index(
+                                    *active_index.read(),
+                                    keyboard_matches.len(),
+                                    false,
+                                );
+                                active_index.set(next);
+                                open.set(true);
+                            }
+                            Key::Enter if *open.read() => {
+                                event.prevent_default();
+                                let index = (*active_index.read()).unwrap_or(0);
+                                if let Some(option) = keyboard_matches.get(index) {
+                                    on_change.call(option.value.clone());
+                                    open.set(false);
+                                }
+                            }
+                            Key::Escape => {
+                                event.stop_propagation();
+                                open.set(false);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !value.is_empty() {
+                    button {
+                        r#type: "button",
+                        class: "ccombobox-clear",
+                        aria_label: "Clear selection",
+                        onclick: move |_| {
+                            active_index.set(None);
+                            on_change.call(String::new());
+                            open.set(true);
+                        },
+                        "×"
+                    }
+                }
+                svg {
+                    class: "cselect-chevron",
+                    width: "16",
+                    height: "16",
+                    view_box: "0 0 24 24",
+                    fill: "none",
+                    stroke: "currentColor",
+                    stroke_width: "2",
+                    stroke_linecap: "round",
+                    stroke_linejoin: "round",
+                    polyline { points: "6 9 12 15 18 9" }
+                }
+            }
+            if *open.read() {
+                div { class: "cselect-backdrop", onmousedown: move |_| open.set(false) }
+                div {
+                    class: "cselect-menu ccombobox-menu",
+                    role: "listbox",
+                    style: if let Some(style) = menu_style.read().as_ref() { "{style}" } else { "" },
+                    if matches.is_empty() {
+                        div { class: "ccombobox-empty", "No matching values" }
+                    }
+                    for (index, option) in matches.iter().cloned().enumerate() {
+                        {
+                            let option_value = option.value.clone();
+                            let selected = option.value == value;
+                            let active = Some(index) == *active_index.read();
+                            rsx! {
+                                button {
+                                    r#type: "button",
+                                    key: "{option.value}",
+                                    role: "option",
+                                    aria_selected: if selected { "true" } else { "false" },
+                                    class: if selected { "cselect-option cselect-option--selected" } else if active { "cselect-option cselect-option--active" } else { "cselect-option" },
+                                    onmouseenter: move |_| active_index.set(Some(index)),
+                                    onmousedown: move |event| {
+                                        event.prevent_default();
+                                        on_change.call(option_value.clone());
+                                        open.set(false);
+                                    },
+                                    span { "{option.label}" }
+                                    if selected { span { class: "cselect-check", "✓" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +483,42 @@ mod tests {
         let style = menu_position_style(100.0, 260.0, 300.0, 220.0, 0.0);
         assert!(style.contains("top:306px"));
         assert!(style.contains("max-height:280px"));
+    }
+
+    #[test]
+    fn searchable_options_rank_exact_prefix_then_substring() {
+        let options = vec![
+            SelectOption::new("Finamp Beta", "Finamp Beta"),
+            SelectOption::new("Beta Player", "Beta Player"),
+            SelectOption::new("Beta", "Beta"),
+            SelectOption::new("Discrete", "Discrete"),
+        ];
+        let values: Vec<String> = matching_options(&options, "beta", 10)
+            .into_iter()
+            .map(|option| option.value)
+            .collect();
+        assert_eq!(values, vec!["Beta", "Beta Player", "Finamp Beta"]);
+    }
+
+    #[test]
+    fn searchable_options_are_case_insensitive_and_limited() {
+        let options = vec![
+            SelectOption::new("iPhone 15", "Joey's iPhone 15"),
+            SelectOption::new("iPad", "Living Room iPad"),
+            SelectOption::new("TV", "Television"),
+        ];
+        let values = matching_options(&options, "IP", 1);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].value, "iPhone 15");
+    }
+
+    #[test]
+    fn keyboard_navigation_enters_and_clamps_the_option_list() {
+        assert_eq!(next_option_index(None, 3, true), Some(0));
+        assert_eq!(next_option_index(Some(0), 3, true), Some(1));
+        assert_eq!(next_option_index(Some(2), 3, true), Some(2));
+        assert_eq!(next_option_index(None, 3, false), Some(2));
+        assert_eq!(next_option_index(Some(0), 3, false), Some(0));
+        assert_eq!(next_option_index(None, 0, true), None);
     }
 }
