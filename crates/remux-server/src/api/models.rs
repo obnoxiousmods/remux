@@ -759,7 +759,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
         // Jellyfin initializes these arrays for music DTOs, including sparse
         // tracks with no linked artist. Some clients distinguish [] from an
         // omitted field, so preserve the stock wire shape here.
-        album_artists: if is_music_metadata_item(&media.kind) {
+        album_artists: is_music_metadata_item(&media.kind).then(|| {
             media
                 .grandparent_id
                 .zip(
@@ -773,10 +773,8 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                 )
                 .map(|(id, name)| vec![NameIdPair { id, name }])
                 .unwrap_or_default()
-        } else {
-            vec![]
-        },
-        artists: if is_music_metadata_item(&media.kind) {
+        }),
+        artists: is_music_metadata_item(&media.kind).then(|| {
             media
                 .grandparent
                 .as_ref()
@@ -787,10 +785,8 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                     ]
                 })
                 .unwrap_or_default()
-        } else {
-            vec![]
-        },
-        artist_items: if is_music_metadata_item(&media.kind) {
+        }),
+        artist_items: is_music_metadata_item(&media.kind).then(|| {
             media
                 .grandparent_id
                 .zip(
@@ -804,9 +800,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                 )
                 .map(|(id, name)| vec![NameIdPair { id, name }])
                 .unwrap_or_default()
-        } else {
-            vec![]
-        },
+        }),
         tags: media
             .tags
             .clone(),

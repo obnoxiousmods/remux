@@ -510,7 +510,7 @@ async fn items_playbackinfo_inner(
 /// The `Range` header is forwarded to the upstream server. If no `Range` is provided,
 /// the full video is sent.
 ///
-#[get("/items/{id}/file", "/items/{id}/download")]
+#[get("/items/{id}/file")]
 pub async fn items_file(
     headers: headers::HeaderMap,
     State(state): State<AppState>,
@@ -518,7 +518,53 @@ pub async fn items_file(
     Query(mut q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
     q.static_ = Some(true);
-    let filename = db::Media::get_by_id(
+    // Match Jellyfin's GetFile behavior: range-enabled original bytes with the
+    // real media Content-Type and no Content-Disposition override. In
+    // particular, do not label audio as an attachment ending in `.mkv` —
+    // AVFoundation clients use that metadata when selecting a decoder.
+    videos_stream_inner(headers, state, id, q).await
+}
+
+fn extension_for_content_type(
+    content_type: Option<&http::HeaderValue>,
+) -> &'static str {
+    match content_type
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+        })
+        .and_then(|value| {
+            value
+                .split(';')
+                .next()
+        })
+        .map(str::trim)
+    {
+        Some("audio/flac") => "flac",
+        Some("audio/mpeg") => "mp3",
+        Some("audio/mp4") => "m4a",
+        Some("audio/aac") => "aac",
+        Some("audio/ogg") => "ogg",
+        Some("audio/opus") => "opus",
+        Some("audio/wav") | Some("audio/wave") | Some("audio/x-wav") => "wav",
+        Some("video/mp4") => "mp4",
+        Some("video/webm") => "webm",
+        Some("video/x-matroska") => "mkv",
+        Some("video/mp2t") => "ts",
+        _ => "bin",
+    }
+}
+
+#[get("/items/{id}/download")]
+pub async fn items_download(
+    headers: headers::HeaderMap,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(mut q): Query<api::VideoStreamQuery>,
+) -> Result<impl IntoResponse> {
+    q.static_ = Some(true);
+    let item = db::Media::get_by_id(
         &state
             .ctx
             .db,
@@ -526,19 +572,39 @@ pub async fn items_file(
     )
     .await
     .ok()
-    .flatten()
-    .map(|m| {
-        m.stream_info
-            .and_then(|si| si.filename)
-            .unwrap_or_else(|| format!("{}.mkv", m.title))
-    })
-    .unwrap_or_else(|| "download.mkv".to_string());
-    let safe = filename
-        .replace('"', "")
-        .replace('\\', "");
+    .flatten();
+    let explicit_filename = item
+        .as_ref()
+        .and_then(|media| {
+            media
+                .stream_info
+                .as_ref()
+        })
+        .and_then(|stream| {
+            stream
+                .filename
+                .clone()
+        });
+    let title = item
+        .map(|media| media.title)
+        .unwrap_or_else(|| "download".to_string());
     let mut response = videos_stream_inner(headers, state, id, q)
         .await?
         .into_response();
+    let filename = explicit_filename.unwrap_or_else(|| {
+        format!(
+            "{}.{}",
+            title,
+            extension_for_content_type(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+            )
+        )
+    });
+    let safe = filename
+        .replace('"', "")
+        .replace('\\', "");
     if let Ok(val) =
         http::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", safe))
     {
@@ -873,6 +939,7 @@ async fn videos_stream_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::extension_for_content_type;
     use http::{StatusCode, header::HeaderValue};
     use serde_json::json;
 
@@ -880,6 +947,85 @@ mod tests {
         AUTH_HEADER, auth_header_with_token, authenticated_server, insert_test_source,
         new_test_server,
     };
+
+    #[test]
+    fn download_extension_follows_response_media_type() {
+        assert_eq!(
+            extension_for_content_type(Some(&HeaderValue::from_static("audio/flac"))),
+            "flac"
+        );
+        assert_eq!(
+            extension_for_content_type(Some(&HeaderValue::from_static(
+                "audio/mp4; charset=binary"
+            ))),
+            "m4a"
+        );
+        assert_eq!(extension_for_content_type(None), "bin");
+    }
+
+    #[tokio::test]
+    async fn file_is_inline_codec_correct_while_download_is_attachment() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("paramore.flac");
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        let mut source = crate::db::Media {
+            title: "C'est Comme Ca".to_string(),
+            kind: crate::db::MediaKind::Stream,
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local(path),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        source
+            .save(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+
+        let file = server
+            .get(&format!("/items/{}/file", source.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_header(http::header::RANGE, HeaderValue::from_static("bytes=2-5"))
+            .await;
+        file.assert_status(StatusCode::PARTIAL_CONTENT);
+        file.assert_header(http::header::CONTENT_TYPE, "audio/flac");
+        assert!(
+            file.maybe_header(http::header::CONTENT_DISPOSITION)
+                .is_none()
+        );
+        assert_eq!(&file.as_bytes()[..], b"2345");
+
+        let download = server
+            .get(&format!("/items/{}/download", source.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_header(http::header::RANGE, HeaderValue::from_static("bytes=0-1"))
+            .await;
+        download.assert_status(StatusCode::PARTIAL_CONTENT);
+        download.assert_header(http::header::CONTENT_TYPE, "audio/flac");
+        assert_eq!(
+            download
+                .header(http::header::CONTENT_DISPOSITION)
+                .to_str()
+                .unwrap(),
+            "attachment; filename=\"C'est Comme Ca.flac\""
+        );
+        assert_eq!(&download.as_bytes()[..], b"01");
+    }
 
     #[tokio::test]
     async fn test_playback_start() {

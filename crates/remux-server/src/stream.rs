@@ -2,8 +2,14 @@ use crate::ResultExt;
 use async_trait::async_trait;
 use axum::{body::Body, http::HeaderMap, response::Response};
 use axum_anyhow::ApiResult as Result;
-use futures_util::TryStreamExt;
-use std::{io, path::PathBuf};
+use futures_util::{StreamExt, TryStreamExt};
+use std::{
+    collections::HashMap,
+    io,
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
+};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -211,6 +217,95 @@ pub struct HttpSource {
     pub response_headers: std::collections::HashMap<String, String>,
 }
 
+#[derive(Clone)]
+struct SegmentedMp4Layout {
+    discovered_at: Instant,
+    lengths: Arc<[u64]>,
+}
+
+/// Tidal's lossless delivery URLs expose one fragmented-MP4 resource per
+/// segment (`0.mp4` is only the initialization fragment). Jellyfin clients,
+/// however, request `/Items/{id}/File` as one seekable byte resource. Cache the
+/// small header-derived virtual layout so AVFoundation's initial 0-1 probe and
+/// subsequent range requests do not rediscover every segment.
+static SEGMENTED_MP4_LAYOUTS: LazyLock<
+    tokio::sync::RwLock<HashMap<String, SegmentedMp4Layout>>,
+> = LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
+
+const SEGMENTED_LAYOUT_TTL: Duration = Duration::from_secs(5 * 60);
+const SEGMENTED_LAYOUT_LIMIT: usize = 256;
+const MAX_SEGMENT_COUNT: usize = 2048;
+const MAX_INIT_SEGMENT_BYTES: u64 = 128 * 1024;
+const SEGMENT_DISCOVERY_BATCH_SIZE: usize = 16;
+
+fn tidal_segment_zero_url(raw: &str) -> Option<url::Url> {
+    let parsed = url::Url::parse(raw).ok()?;
+    let host = parsed.host_str()?;
+    if host != "audio.tidal.com" && !host.ends_with(".audio.tidal.com") {
+        return None;
+    }
+    parsed
+        .path()
+        .ends_with("/0.mp4")
+        .then_some(parsed)
+}
+
+fn numbered_segment_url(base: &url::Url, index: usize) -> url::Url {
+    let mut url = base.clone();
+    let prefix = base
+        .path()
+        .strip_suffix("0.mp4")
+        .expect("numbered_segment_url requires a segment-zero URL");
+    url.set_path(&format!("{prefix}{index}.mp4"));
+    url
+}
+
+fn upstream_resource_length(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(http::header::CONTENT_RANGE)
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+        })
+        .and_then(|value| value.rsplit_once('/'))
+        .and_then(|(_, total)| {
+            total
+                .parse::<u64>()
+                .ok()
+        })
+        .or_else(|| response.content_length())
+        .filter(|length| *length > 0)
+}
+
+/// Convert one virtual byte range into concrete per-segment ranges.
+fn segmented_ranges(lengths: &[u64], start: u64, end: u64) -> Vec<(usize, u64, u64)> {
+    let mut ranges = Vec::new();
+    let mut offset = 0_u64;
+    for (index, length) in lengths
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let segment_start = offset;
+        let segment_end = offset + length.saturating_sub(1);
+        offset = offset.saturating_add(length);
+        if length == 0 || end < segment_start {
+            break;
+        }
+        if start > segment_end {
+            continue;
+        }
+        ranges.push((
+            index,
+            start.saturating_sub(segment_start),
+            end.min(segment_end) - segment_start,
+        ));
+    }
+    ranges
+}
+
 pub struct LocalSource {
     pub path: PathBuf,
 }
@@ -257,16 +352,292 @@ impl TorrentSource {
     }
 }
 
+impl HttpSource {
+    fn apply_request_headers(
+        &self,
+        mut request: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        for (name, value) in &self.request_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        request
+    }
+
+    async fn segmented_mp4_layout(
+        &self,
+        client: &reqwest::Client,
+        base: &url::Url,
+    ) -> Result<Arc<[u64]>> {
+        if let Some(cached) = SEGMENTED_MP4_LAYOUTS
+            .read()
+            .await
+            .get(&self.url)
+            .filter(|layout| {
+                layout
+                    .discovered_at
+                    .elapsed()
+                    < SEGMENTED_LAYOUT_TTL
+            })
+            .cloned()
+        {
+            return Ok(cached.lengths);
+        }
+
+        let mut lengths = Vec::new();
+        'discovery: for batch_start in
+            (0..MAX_SEGMENT_COUNT).step_by(SEGMENT_DISCOVERY_BATCH_SIZE)
+        {
+            let batch_end =
+                (batch_start + SEGMENT_DISCOVERY_BATCH_SIZE).min(MAX_SEGMENT_COUNT);
+            let mut inspected = futures_util::stream::iter(batch_start..batch_end)
+                .map(|index| async move {
+                    // A 0-0 GET works with CDNs that reject or omit size
+                    // metadata from HEAD. If honored, Content-Range supplies
+                    // the full segment size; if ignored, Content-Length does.
+                    let response = self
+                        .apply_request_headers(
+                            client
+                                .get(numbered_segment_url(base, index))
+                                .header(http::header::RANGE, "bytes=0-0"),
+                        )
+                        .send()
+                        .await;
+                    (index, response)
+                })
+                .buffer_unordered(SEGMENT_DISCOVERY_BATCH_SIZE)
+                .collect::<Vec<_>>()
+                .await;
+            inspected.sort_by_key(|(index, _)| *index);
+
+            for (index, response) in inspected {
+                let response = response.context_bad_request(
+                    "failed to inspect fragmented audio segment",
+                )?;
+                if response
+                    .status()
+                    .is_success()
+                {
+                    let length =
+                        upstream_resource_length(&response).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "fragmented audio segment {index} has no length"
+                            )
+                        })?;
+                    lengths.push(length);
+                    continue;
+                }
+                if index == 0 {
+                    return Err(anyhow::anyhow!(
+                        "fragmented audio initialization request returned {}",
+                        response.status()
+                    )
+                    .into());
+                }
+                if matches!(
+                    response.status(),
+                    reqwest::StatusCode::BAD_REQUEST
+                        | reqwest::StatusCode::NOT_FOUND
+                        | reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+                ) {
+                    break 'discovery;
+                }
+                return Err(anyhow::anyhow!(
+                    "fragmented audio segment {index} request returned {}",
+                    response.status()
+                )
+                .into());
+            }
+        }
+
+        if lengths.len() < 2 {
+            return Err(
+                anyhow::anyhow!("fragmented audio has no media segments").into()
+            );
+        }
+        if lengths.len() == MAX_SEGMENT_COUNT {
+            return Err(anyhow::anyhow!(
+                "fragmented audio exceeded {MAX_SEGMENT_COUNT} segments"
+            )
+            .into());
+        }
+        if lengths[0] > MAX_INIT_SEGMENT_BYTES {
+            return Err(anyhow::anyhow!(
+                "fragmented audio initialization segment is unexpectedly large"
+            )
+            .into());
+        }
+
+        let lengths: Arc<[u64]> = lengths.into();
+        let mut cache = SEGMENTED_MP4_LAYOUTS
+            .write()
+            .await;
+        cache.retain(|_, layout| {
+            layout
+                .discovered_at
+                .elapsed()
+                < SEGMENTED_LAYOUT_TTL
+        });
+        if cache.len() >= SEGMENTED_LAYOUT_LIMIT {
+            cache.clear();
+        }
+        cache.insert(
+            self.url
+                .clone(),
+            SegmentedMp4Layout {
+                discovered_at: Instant::now(),
+                lengths: lengths.clone(),
+            },
+        );
+        Ok(lengths)
+    }
+
+    async fn serve_segmented_mp4(
+        &self,
+        client: &reqwest::Client,
+        headers: &HeaderMap,
+        base: url::Url,
+    ) -> Result<Response> {
+        let lengths = self
+            .segmented_mp4_layout(client, &base)
+            .await?;
+        let total_size = lengths
+            .iter()
+            .copied()
+            .sum::<u64>();
+        let requested_range = headers
+            .get(http::header::RANGE)
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+            });
+        let (start, end, status) = if let Some(range) = requested_range {
+            let (start, end) = parse_range(range, total_size)
+                .context_bad_request("invalid Range header")?;
+            (start, end, http::StatusCode::PARTIAL_CONTENT)
+        } else {
+            (0, total_size - 1, http::StatusCode::OK)
+        };
+        let parts = segmented_ranges(&lengths, start, end);
+        let body_length = end - start + 1;
+        let request_headers = self
+            .request_headers
+            .clone();
+        let stream_client = client.clone();
+        let body_stream = async_stream::stream! {
+            'segments: for (index, local_start, local_end) in parts {
+                let mut request = stream_client
+                    .get(numbered_segment_url(&base, index))
+                    .header(http::header::RANGE, format!("bytes={local_start}-{local_end}"));
+                for (name, value) in &request_headers {
+                    request = request.header(name.as_str(), value.as_str());
+                }
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        yield Err::<bytes::Bytes, io::Error>(io::Error::other(error));
+                        break;
+                    }
+                };
+                if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+                    && response.status() != reqwest::StatusCode::OK
+                {
+                    yield Err::<bytes::Bytes, io::Error>(io::Error::other(format!(
+                        "fragmented audio segment {index} returned {}",
+                        response.status()
+                    )));
+                    break;
+                }
+                // Some CDNs ignore Range and answer 200 with the full segment.
+                // Preserve the virtual resource's exact byte contract by
+                // trimming that response and by never yielding past the
+                // requested local end.
+                let mut skip = if response.status() == reqwest::StatusCode::OK {
+                    local_start
+                } else {
+                    0
+                };
+                let mut remaining = local_end - local_start + 1;
+                let mut chunks = response.bytes_stream();
+                while let Some(chunk) = chunks.next().await {
+                    match chunk {
+                        Ok(mut chunk) => {
+                            if skip >= chunk.len() as u64 {
+                                skip -= chunk.len() as u64;
+                                continue;
+                            }
+                            if skip > 0 {
+                                chunk = chunk.slice(skip as usize..);
+                                skip = 0;
+                            }
+                            if chunk.len() as u64 > remaining {
+                                chunk = chunk.slice(..remaining as usize);
+                            }
+                            remaining -= chunk.len() as u64;
+                            yield Ok::<bytes::Bytes, io::Error>(chunk);
+                            if remaining == 0 {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            yield Err::<bytes::Bytes, io::Error>(io::Error::other(error));
+                            break 'segments;
+                        }
+                    }
+                }
+                if remaining != 0 {
+                    yield Err::<bytes::Bytes, io::Error>(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("fragmented audio segment {index} ended {remaining} bytes early"),
+                    ));
+                    break;
+                }
+            }
+        };
+
+        let mut response = Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, "audio/mp4")
+            .header(http::header::CONTENT_LENGTH, body_length)
+            .header(http::header::ACCEPT_RANGES, "bytes");
+        if status == http::StatusCode::PARTIAL_CONTENT {
+            response = response.header(
+                http::header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{total_size}"),
+            );
+        }
+        let mut response = response
+            .body(Body::from_stream(body_stream))
+            .unwrap();
+        for (name, value) in &self.response_headers {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::try_from(name.as_str()),
+                http::HeaderValue::from_str(value),
+            ) {
+                response
+                    .headers_mut()
+                    .insert(name, value);
+            }
+        }
+        Ok(response)
+    }
+}
+
 #[async_trait]
 impl StreamSource for HttpSource {
     async fn serve(&self, _state: &AppState, headers: &HeaderMap) -> Result<Response> {
-        let mut req = reqwest::Client::new().get(&self.url);
+        let client = reqwest::Client::new();
+        if let Some(base) = tidal_segment_zero_url(&self.url) {
+            return self
+                .serve_segmented_mp4(&client, headers, base)
+                .await;
+        }
+
+        let mut req = client.get(&self.url);
         if let Some(v) = headers.get(http::header::RANGE) {
             req = req.header(http::header::RANGE, v.clone());
         }
-        for (k, v) in &self.request_headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        req = self.apply_request_headers(req);
 
         let upstream = req
             .send()
@@ -302,6 +673,14 @@ impl StreamSource for HttpSource {
                 http::header::CONTENT_TYPE,
                 http::HeaderValue::from_static("application/octet-stream"),
             );
+        }
+        for (name, value) in &self.response_headers {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::try_from(name.as_str()),
+                http::HeaderValue::from_str(value),
+            ) {
+                out.insert(name, value);
+            }
         }
 
         Ok(resp)
@@ -387,19 +766,31 @@ impl StreamSource for TorrentSource {
 }
 
 pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
+    if file_size == 0 {
+        anyhow::bail!("cannot range an empty resource");
+    }
     let bytes = range
         .strip_prefix("bytes=")
         .ok_or_else(|| anyhow::anyhow!("expected bytes= prefix"))?;
+    if bytes.contains(',') {
+        anyhow::bail!("multiple byte ranges are not supported");
+    }
     let (start_str, end_str) = bytes
         .split_once('-')
         .ok_or_else(|| anyhow::anyhow!("malformed range"))?;
 
     if start_str.is_empty() {
         let suffix: u64 = end_str.parse()?;
+        if suffix == 0 {
+            anyhow::bail!("suffix length must be greater than zero");
+        }
         return Ok((file_size.saturating_sub(suffix), file_size - 1));
     }
 
     let start: u64 = start_str.parse()?;
+    if start >= file_size {
+        anyhow::bail!("range starts beyond the resource");
+    }
     let end: u64 = if end_str.is_empty() {
         file_size - 1
     } else {
@@ -407,6 +798,9 @@ pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
             .parse::<u64>()?
             .min(file_size - 1)
     };
+    if end < start {
+        anyhow::bail!("range end precedes its start");
+    }
 
     Ok((start, end))
 }
@@ -451,4 +845,152 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
         .query_pairs()
         .find(|(k, _)| k == param)
         .map(|(_, v)| v.into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        numbered_segment_url, parse_range, segmented_ranges, tidal_segment_zero_url,
+    };
+    use axum::{
+        Router,
+        body::Body,
+        extract::Path,
+        http::{HeaderMap, Method, StatusCode, header},
+        response::Response,
+        routing::any,
+    };
+
+    #[test]
+    fn recognizes_only_tidal_segment_zero_urls() {
+        assert!(
+            tidal_segment_zero_url(
+                "https://listen.audio.tidal.com/path/0.mp4?token=secret"
+            )
+            .is_some()
+        );
+        assert!(
+            tidal_segment_zero_url("https://audio.tidal.com/path/0.mp4?token=secret")
+                .is_some()
+        );
+        assert!(tidal_segment_zero_url("https://example.com/path/0.mp4").is_none());
+        assert!(
+            tidal_segment_zero_url("https://listen.audio.tidal.com/path/10.mp4")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn numbered_segment_preserves_signed_query() {
+        let base = tidal_segment_zero_url(
+            "https://listen.audio.tidal.com/path/0.mp4?token=a%2Bb&expires=123",
+        )
+        .unwrap();
+        let segment = numbered_segment_url(&base, 42);
+        assert_eq!(segment.path(), "/path/42.mp4");
+        assert_eq!(segment.query(), base.query());
+    }
+
+    #[test]
+    fn splits_virtual_ranges_exactly_across_segments() {
+        let lengths = [3, 5, 2];
+        assert_eq!(segmented_ranges(&lengths, 0, 1), vec![(0, 0, 1)]);
+        assert_eq!(segmented_ranges(&lengths, 2, 5), vec![(0, 2, 2), (1, 0, 2)]);
+        assert_eq!(segmented_ranges(&lengths, 8, 9), vec![(2, 0, 1)]);
+    }
+
+    #[test]
+    fn parses_open_ended_and_suffix_ranges() {
+        assert_eq!(parse_range("bytes=2-5", 10).unwrap(), (2, 5));
+        assert_eq!(parse_range("bytes=7-", 10).unwrap(), (7, 9));
+        assert_eq!(parse_range("bytes=-3", 10).unwrap(), (7, 9));
+        assert_eq!(parse_range("bytes=-30", 10).unwrap(), (0, 9));
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_or_ambiguous_ranges() {
+        assert!(parse_range("bytes=10-", 10).is_err());
+        assert!(parse_range("bytes=7-6", 10).is_err());
+        assert!(parse_range("bytes=-0", 10).is_err());
+        assert!(parse_range("bytes=0-1,4-5", 10).is_err());
+        assert!(parse_range("bytes=0-", 0).is_err());
+    }
+
+    async fn mock_segment(method: Method, Path(name): Path<String>) -> Response {
+        let index = name
+            .strip_suffix(".mp4")
+            .and_then(|value| {
+                value
+                    .parse::<usize>()
+                    .ok()
+            });
+        let bytes: &'static [u8] = match index {
+            Some(0) => b"abc",
+            Some(1) => b"DEFGH",
+            Some(2) => b"ij",
+            _ => {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+                    .unwrap();
+            }
+        };
+        let body = if method == Method::HEAD {
+            Body::empty()
+        } else {
+            // Deliberately ignore Range. The virtual stream must still trim
+            // each full segment to the exact requested byte interval.
+            Body::from(bytes)
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(body)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn serves_exact_virtual_bytes_when_upstream_ignores_range() {
+        let app = Router::new().route("/{segment}", any(mock_segment));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener
+            .local_addr()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap()
+        });
+
+        let base =
+            url::Url::parse(&format!("http://{address}/0.mp4?signature=kept")).unwrap();
+        let source = super::HttpSource {
+            url: base.to_string(),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::RANGE,
+            "bytes=2-5"
+                .parse()
+                .unwrap(),
+        );
+        let response = source
+            .serve_segmented_mp4(&reqwest::Client::new(), &headers, base)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "4");
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+        let body = axum::body::to_bytes(response.into_body(), 16)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"cDEF");
+
+        server.abort();
+    }
 }
