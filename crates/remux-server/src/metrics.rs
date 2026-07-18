@@ -678,6 +678,10 @@ fn server_playback_event(
         } else {
             "server-manifest-error"
         })
+    } else if route.contains("{segment_file}") || route.contains("/hls1/") {
+        // Segment delivery is already represented by request telemetry. It is
+        // high-frequency transfer traffic, not a playback startup milestone.
+        None
     } else if method == "GET"
         && (route.contains("/audio/") || route.contains("/videos/"))
     {
@@ -885,6 +889,10 @@ mod tests {
         assert_eq!(
             server_playback_event("GET", "/videos/{id}/master.m3u8", 500),
             Some("server-manifest-error")
+        );
+        assert_eq!(
+            server_playback_event("GET", "/videos/{id}/{segment_file}", 200),
+            None
         );
         assert_eq!(
             server_playback_event("POST", "/sessions/playing/progress", 204),
