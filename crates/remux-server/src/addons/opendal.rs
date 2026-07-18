@@ -317,6 +317,38 @@ pub struct OpendalFile {
     pub size: Option<i64>,
 }
 
+#[derive(sqlx::FromRow)]
+struct LocalTrackCandidate {
+    #[sqlx(flatten)]
+    file: OpendalFile,
+    media_title: String,
+    album_title: String,
+}
+
+/// Normalize the parts of a music identity that metadata providers commonly
+/// spell differently while still referring to the same recording.
+///
+/// SQLite's built-in LOWER/NOCASE only handles ASCII, so it cannot match
+/// `Ça` with `ça`. Providers also routinely disagree on typographic quotes
+/// (`'` versus `’`) and dash glyphs. Do this narrow normalization in Rust and
+/// still require artist + album + track title (and track number when known),
+/// so similarly named recordings on other albums are never conflated.
+fn normalize_music_identity(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .flat_map(|ch| match ch {
+            '\u{2018}' | '\u{2019}' | '\u{02bc}' | '\u{ff07}' => '\''.to_lowercase(),
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}'
+            | '\u{2212}' => '-'.to_lowercase(),
+            _ => ch.to_lowercase(),
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[async_trait]
 impl AddonKind for OpendalAddon {
     fn id(&self) -> &'static str {
@@ -628,14 +660,13 @@ impl StreamAddon for OpendalAddon {
                 // Fallback for a NON-local track (e.g. a streaming/addon-backed
                 // track) that has a local library copy. Match strictly on track
                 // title + album + artist against the `media` table — which
-                // GroupLocalMusic populates reliably — rather than the old
-                // `LOWER(opendal_files.title)` match, because that column is derived
-                // from filenames and is untrustworthy (it frequently holds the
-                // artist name, so it both missed real twins and matched unrelated
-                // songs that merely shared a title). Requiring an unambiguous single
-                // match means two different songs sharing a title are never
-                // conflated. This makes the reliable local file an available source,
-                // healing streaming tracks whose signed upstream URL is dead (410).
+                // GroupLocalMusic populates reliably — rather than the filename-
+                // derived `opendal_files.title`. Candidate selection is bounded by
+                // artist and track number in SQL, then Unicode-aware matching is
+                // performed in Rust because SQLite LOWER/NOCASE is ASCII-only.
+                // This makes reliable local files available when providers differ
+                // only by `Ça`/`ça`, straight/curly quotes, or dash glyphs, healing
+                // streaming tracks whose signed upstream URL is dead (403/410).
                 let album_title: Option<String> = match media.parent_id {
                     Some(pid) => {
                         sqlx::query_scalar("SELECT title FROM media WHERE id = ?")
@@ -645,46 +676,51 @@ impl StreamAddon for OpendalAddon {
                     }
                     None => None,
                 };
-                let artist_title: Option<String> = match media.grandparent_id {
-                    Some(gid) => {
-                        sqlx::query_scalar("SELECT title FROM media WHERE id = ?")
-                            .bind(gid)
-                            .fetch_optional(&ctx.db)
-                            .await?
-                    }
-                    None => None,
-                };
-                // Without both album and artist we cannot match strictly — skip
+                // Without both album and artist identity we cannot match strictly — skip
                 // rather than guess.
-                let (Some(album_title), Some(artist_title)) =
-                    (album_title, artist_title)
+                let (Some(album_title), Some(artist_id)) =
+                    (album_title, media.grandparent_id)
                 else {
                     return Ok(vec![]);
                 };
-                let candidates: Vec<OpendalFile> = sqlx::query_as(
+                let candidates: Vec<LocalTrackCandidate> = sqlx::query_as(
                     "SELECT f.path, f.name, f.title, f.imdb_id, f.season, f.episode, \
-                            f.track_number, f.year, f.size \
+                            f.track_number, f.year, f.size, \
+                            m.title AS media_title, alb.title AS album_title \
                      FROM opendal_files f \
                      JOIN media m ON m.id = f.id \
                      JOIN media alb ON alb.id = m.parent_id \
-                     JOIN media art ON art.id = m.grandparent_id \
                      WHERE f.addon_id = ? AND f.media_kind = 'track' \
-                       AND LOWER(m.title) = LOWER(?) \
-                       AND LOWER(alb.title) = LOWER(?) \
-                       AND LOWER(art.title) = LOWER(?)",
+                       AND m.grandparent_id = ? \
+                       AND (? IS NULL OR COALESCE(m.idx, f.track_number) = ?)",
                 )
                 .bind(self.addon_id)
-                .bind(&media.title)
-                .bind(&album_title)
-                .bind(&artist_title)
+                .bind(artist_id)
+                .bind(media.idx)
+                .bind(media.idx)
                 .fetch_all(&ctx.db)
                 .await?;
-                // Only a single, unambiguous local candidate is trusted.
-                if candidates.len() == 1 {
-                    candidates
-                } else {
-                    Vec::new()
-                }
+                let wanted_title = normalize_music_identity(&media.title);
+                let wanted_album = normalize_music_identity(&album_title);
+                let mut candidates: Vec<OpendalFile> = candidates
+                    .into_iter()
+                    .filter(|candidate| {
+                        normalize_music_identity(&candidate.media_title) == wanted_title
+                            && normalize_music_identity(&candidate.album_title)
+                                == wanted_album
+                    })
+                    .map(|candidate| candidate.file)
+                    .collect();
+                // Multiple local copies with the same strict identity are safe.
+                // Pick a stable path so playback never depends on SQLite row order.
+                candidates.sort_by(|a, b| {
+                    a.path
+                        .cmp(&b.path)
+                });
+                candidates
+                    .into_iter()
+                    .take(1)
+                    .collect()
             }
         } else {
             // Episodes are identified by series_imdb (the show's IMDB ID scraped from the
@@ -1778,6 +1814,22 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn music_identity_normalizes_unicode_case_quotes_dashes_and_spacing() {
+        assert_eq!(
+            normalize_music_identity("  C’est   Comme Ça  "),
+            normalize_music_identity("C'EST COMME ÇA")
+        );
+        assert_eq!(
+            normalize_music_identity("For a Pessimist, I’m Pretty Optimistic"),
+            normalize_music_identity("For a Pessimist, I'm Pretty Optimistic")
+        );
+        assert_eq!(
+            normalize_music_identity("Rose‐Colored Boy"),
+            normalize_music_identity("Rose-Colored Boy")
+        );
+    }
     use crate::{
         Config,
         addons::{Addon, AddonPresetRef},
@@ -3682,6 +3734,108 @@ mod tests {
                 item.title
             );
         }
+    }
+
+    #[tokio::test]
+    async fn opendal_remote_track_finds_unicode_local_twins_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let (addon, db_addon) = make_local_addon(ctx, dir.path(), "track").await;
+
+        let artist_id = Uuid::new_v4();
+        let local_album_id = Uuid::new_v4();
+        let remote_album_id = Uuid::new_v4();
+        let local_b_id = Uuid::new_v4();
+        let local_a_id = Uuid::new_v4();
+        let artist = db::Media {
+            id: artist_id,
+            title: "Paramore".to_string(),
+            kind: db::MediaKind::Artist,
+            external_ids: db::ExternalIds {
+                custom_stremio_id: Some("test:artist:paramore".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let album = |id, external_id: &str| db::Media {
+            id,
+            title: "This Is Why".to_string(),
+            kind: db::MediaKind::Album,
+            grandparent_id: Some(artist_id),
+            external_ids: db::ExternalIds {
+                custom_stremio_id: Some(external_id.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let local_track = |id, title: &str, external_id: &str| db::Media {
+            id,
+            title: title.to_string(),
+            kind: db::MediaKind::Track,
+            parent_id: Some(local_album_id),
+            grandparent_id: Some(artist_id),
+            idx: Some(4),
+            external_ids: db::ExternalIds {
+                custom_stremio_id: Some(external_id.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        db::Media::insert(
+            &ctx.db,
+            &[
+                artist,
+                album(local_album_id, "test:album:local"),
+                album(remote_album_id, "test:album:remote"),
+                local_track(local_b_id, "C’est comme ça", "test:track:local-b"),
+                local_track(local_a_id, "C’EST COMME ÇA", "test:track:local-a"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        for (id, path) in [(local_b_id, "/b.flac"), (local_a_id, "/a.flac")] {
+            sqlx::query(
+                "INSERT INTO opendal_files \
+                 (id, addon_id, media_kind, path, name, title, track_number, scanned_at) \
+                 VALUES (?, ?, 'track', ?, ?, ?, 4, ?)",
+            )
+            .bind(id)
+            .bind(db_addon.id)
+            .bind(path)
+            .bind(path)
+            .bind("filename metadata is intentionally irrelevant")
+            .bind(Utc::now().naive_utc().to_string())
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        }
+
+        let remote = db::Media {
+            id: Uuid::new_v4(),
+            title: "C'EST COMME ÇA".to_string(),
+            kind: db::MediaKind::Track,
+            parent_id: Some(remote_album_id),
+            grandparent_id: Some(artist_id),
+            idx: Some(4),
+            external_ids: db::ExternalIds {
+                deezer_track: Some(123),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let streams = addon
+            .get_streams(&remote, ctx)
+            .await
+            .unwrap();
+        assert_eq!(streams.len(), 1);
+        assert!(matches!(
+            &streams[0].descriptor,
+            StreamDescriptor::Local(path) if path == std::path::Path::new("/a.flac")
+        ));
     }
 
     // -----------------------------------------------------------------------
