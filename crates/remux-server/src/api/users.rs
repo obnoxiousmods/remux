@@ -738,7 +738,7 @@ fn build_auth_response(
     })
 }
 
-#[post("/users/authenticatebyname")]
+#[post("/users/authenticatebyname", "/users/authenticatebyname/")]
 pub async fn users_authenticatebyname(
     State(state): State<AppState>,
     auth_header: auth::JellyfinAuthHeader,
@@ -1932,6 +1932,31 @@ mod e2e_tests {
             body["AccessToken"]
                 .as_str()
                 .is_some_and(|t| !t.is_empty())
+        );
+        assert_eq!(body["User"]["Name"], "test");
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_valid_credentials_with_trailing_slash() {
+        let (server, _ctx) = new_test_server()
+            .await
+            .unwrap();
+
+        let resp = server
+            .post("/users/authenticatebyname/")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(AUTH_HEADER),
+            )
+            .json(&json!({ "Username": "test", "Pw": "test" }))
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["AccessToken"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
         );
         assert_eq!(body["User"]["Name"], "test");
     }
