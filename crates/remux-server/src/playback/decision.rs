@@ -153,12 +153,8 @@ fn build_video_transcode(
         })
         .unwrap_or_else(|| ("ts".to_string(), "hls".to_string()));
 
-    let needs_video_transcode = reasons
-        .contains(&api::TranscodeReason::VideoCodecNotSupported(String::new()))
-        || reasons.contains(&api::TranscodeReason::ContainerBitrateExceedsLimit)
-        || reasons.contains(&api::TranscodeReason::VideoRangeTypeNotSupported(
-            String::new(),
-        ));
+    let needs_video_transcode =
+        requires_video_transcode(reasons, q.allow_video_stream_copy);
 
     let video_transcode_allowed = cfg
         .encoding_cfg
@@ -182,7 +178,7 @@ fn build_video_transcode(
     }
     .to_string();
     let needs_audio_transcode =
-        reasons.contains(&api::TranscodeReason::AudioCodecNotSupported(String::new()));
+        requires_audio_transcode(reasons, q.allow_audio_stream_copy);
     let audio_codec = if needs_audio_transcode { "aac" } else { "copy" }.to_string();
 
     let subtitle_method = subtitle_burn_method(
@@ -263,6 +259,28 @@ fn build_video_transcode(
         container,
         sub_protocol: protocol,
     })
+}
+
+fn requires_video_transcode(
+    reasons: &api::TranscodeReasons,
+    allow_video_stream_copy: Option<bool>,
+) -> bool {
+    allow_video_stream_copy == Some(false)
+        || reasons
+            .contains(&api::TranscodeReason::VideoCodecNotSupported(String::new()))
+        || reasons.contains(&api::TranscodeReason::ContainerBitrateExceedsLimit)
+        || reasons.contains(&api::TranscodeReason::VideoRangeTypeNotSupported(
+            String::new(),
+        ))
+}
+
+fn requires_audio_transcode(
+    reasons: &api::TranscodeReasons,
+    allow_audio_stream_copy: Option<bool>,
+) -> bool {
+    allow_audio_stream_copy == Some(false)
+        || reasons
+            .contains(&api::TranscodeReason::AudioCodecNotSupported(String::new()))
 }
 
 /// Determines if a subtitle stream should be burned in by FFmpeg.
@@ -419,5 +437,41 @@ pub(crate) fn apply_subtitle_delivery(
             stream.is_external_url = Some(false);
             stream.is_external = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_copy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_video_copy_denial_forces_h264_even_without_profile_reasons() {
+        let reasons = api::TranscodeReasons::default();
+        assert!(requires_video_transcode(&reasons, Some(false)));
+        assert!(!requires_video_transcode(&reasons, Some(true)));
+        assert!(!requires_video_transcode(&reasons, None));
+    }
+
+    #[test]
+    fn explicit_audio_copy_denial_forces_aac_even_without_profile_reasons() {
+        let reasons = api::TranscodeReasons::default();
+        assert!(requires_audio_transcode(&reasons, Some(false)));
+        assert!(!requires_audio_transcode(&reasons, Some(true)));
+        assert!(!requires_audio_transcode(&reasons, None));
+    }
+
+    #[test]
+    fn incompatible_source_reasons_still_force_transcoding_when_copy_is_allowed() {
+        let mut video_reasons = api::TranscodeReasons::default();
+        video_reasons.insert(api::TranscodeReason::VideoCodecNotSupported(
+            "hevc".to_string(),
+        ));
+        assert!(requires_video_transcode(&video_reasons, Some(true)));
+
+        let mut audio_reasons = api::TranscodeReasons::default();
+        audio_reasons.insert(api::TranscodeReason::AudioCodecNotSupported(
+            "eac3".to_string(),
+        ));
+        assert!(requires_audio_transcode(&audio_reasons, Some(true)));
     }
 }
