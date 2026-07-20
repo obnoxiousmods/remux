@@ -809,7 +809,14 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     // Hardware acceleration input flags (before -ss and -i).
     // For QSV+HDR without VPP tonemapping: SW-decode so CPU filters can run.
     // For QSV+HDR with VPP tonemapping: keep VAAPI hw-decode (tonemap_vaapi needs GPU frames).
-    if hdr && matches!(accel, HardwareAccelerationType::Qsv) && !do_vpp_tonemap {
+    if ffmpeg_video_codec != "copy" && matches!(accel, HardwareAccelerationType::Nvenc) {
+        args.extend([
+            "-hwaccel".into(),
+            "cuda".into(),
+            "-hwaccel_output_format".into(),
+            "cuda".into(),
+        ]);
+    } else if hdr && matches!(accel, HardwareAccelerationType::Qsv) && !do_vpp_tonemap {
         args.extend(qsv_init_only_args(
             &params.vaapi_device,
             &params.vaapi_driver,
@@ -885,6 +892,17 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     } else {
         hw_filter_suffix(accel)
     };
+    let nvenc_download = if ffmpeg_video_codec != "copy"
+        && matches!(accel, HardwareAccelerationType::Nvenc)
+    {
+        Some(if hdr {
+            "hwdownload,format=p010le".to_string()
+        } else {
+            "hwdownload,format=nv12".to_string()
+        })
+    } else {
+        None
+    };
 
     // Stream mapping
     if params.burn_subtitle {
@@ -910,8 +928,13 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             let main_scale_part = build_scale_filter(params)
                 .map(|s| format!("{s}"))
                 .unwrap_or_default();
+            let main_preproc = match (nvenc_download.as_deref(), main_scale_part.as_str()) {
+                (Some(download), "") => download.to_string(),
+                (Some(download), scale) => format!("{download},{scale}"),
+                (None, scale) => scale.to_string(),
+            };
             let overlay = "overlay=eof_action=pass:repeatlast=0";
-            let filter = if main_scale_part.is_empty() {
+            let filter = if main_preproc.is_empty() {
                 match &hw_suffix {
                     Some(suf) => format!(
                         "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0][sub]{overlay}[vraw];[vraw]{suf}[v]"
@@ -923,10 +946,10 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             } else {
                 match &hw_suffix {
                     Some(suf) => format!(
-                        "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_scale_part}[main];[main][sub]{overlay}[vraw];[vraw]{suf}[v]"
+                        "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_preproc}[main];[main][sub]{overlay}[vraw];[vraw]{suf}[v]"
                     ),
                     None => format!(
-                        "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_scale_part}[main];[main][sub]{overlay}[v]"
+                        "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_preproc}[main];[main][sub]{overlay}[v]"
                     ),
                 }
             };
@@ -1010,6 +1033,11 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             }
         } else {
             vf
+        };
+        let vf = match (nvenc_download.as_deref(), vf) {
+            (Some(download), Some(filter)) => Some(format!("{download},{filter}")),
+            (Some(download), None) => Some(download.to_string()),
+            (None, filter) => filter,
         };
         if let Some(ref filter) = vf {
             args.extend(["-vf".into(), filter.clone()]);
@@ -3027,12 +3055,12 @@ mod tests {
             ..default_hls(dir)
         });
 
-        // The current scale chain operates on system-memory frames, so decode
-        // in software and upload only when NVENC consumes the frame.
+        assert_eq!(arg_after(&args, "-hwaccel"), Some("cuda"));
+        assert_eq!(arg_after(&args, "-hwaccel_output_format"), Some("cuda"));
         assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "-hwaccel")
+            arg_after(&args, "-vf")
+                .is_some_and(|filter| filter.starts_with("hwdownload,format=nv12")),
+            "NVDEC frames must be downloaded before CPU filters"
         );
         assert_eq!(arg_after(&args, "-c:v"), Some("h264_nvenc"));
         // h264_nvenc cannot encode 10-bit. Omitting the output format lets a
