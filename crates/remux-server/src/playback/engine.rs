@@ -844,8 +844,14 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         ]);
     }
 
+    // A resumed transcode must begin a fresh output timeline. Preserving the
+    // source timestamps after an input-side seek can leave the HLS muxer
+    // waiting at the original media offset without publishing a first
+    // segment. Stream-copy/remux retains its established source timeline.
+    if ffmpeg_video_codec == "copy" {
+        args.push("-copyts".into());
+    }
     args.extend([
-        "-copyts".into(),
         "-i".into(),
         params
             .input_url
@@ -3018,6 +3024,24 @@ mod tests {
         );
         assert_eq!(arg_after(&args, "-profile:v"), Some("high"));
         assert_eq!(arg_after(&args, "-preset"), Some("p1"));
+        assert!(
+            !args.iter().any(|arg| arg == "-copyts"),
+            "transcoded HLS must start on a fresh output timeline"
+        );
+    }
+
+    #[test]
+    fn hls_stream_copy_retains_source_timestamps() {
+        let dir = PathBuf::from("/tmp/test_stream_copy_timestamps");
+        let args = build_hls_args(&TranscodeParams {
+            video_codec: "copy".into(),
+            ..default_hls(dir)
+        });
+
+        assert!(
+            args.iter().any(|arg| arg == "-copyts"),
+            "stream-copy HLS must retain source timestamps"
+        );
     }
 
     #[test]
