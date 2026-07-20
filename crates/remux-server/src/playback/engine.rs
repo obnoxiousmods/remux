@@ -306,6 +306,19 @@ fn hw_accel_locked_out() -> bool {
     HW_LOCKED_OUT.load(Ordering::Relaxed)
 }
 
+/// Map the shared x264-style preset onto NVENC's p1..p7 scale (p1 fastest).
+fn nvenc_preset(preset: EncodingPreset) -> &'static str {
+    match preset {
+        EncodingPreset::Ultrafast => "p1",
+        EncodingPreset::Superfast => "p2",
+        EncodingPreset::Veryfast => "p3",
+        EncodingPreset::Faster | EncodingPreset::Fast => "p4",
+        EncodingPreset::Medium => "p5",
+        EncodingPreset::Slow => "p6",
+        EncodingPreset::Slower | EncodingPreset::Slowest => "p7",
+    }
+}
+
 /// Max seconds to buffer ahead of the current playback position.
 const MAX_BUFFER_SECS: u32 = 86_400; // was 300
 /// Seconds behind the playback position before a segment is eligible for deletion.
@@ -1016,8 +1029,46 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             }
         }
     } else if is_hw {
-        // HW encoders use bitrate control; CRF/preset/profile flags don't apply.
-        if let Some(bitrate) = params.video_bitrate {
+        if ffmpeg_video_codec == "h264_nvenc" {
+            // h264_nvenc is 8-bit only. Without an explicit output format a 10-bit
+            // source (HDR/HEVC) reaches the encoder unconverted and NVENC rejects
+            // it with "No capable devices found", which then looks like a hardware
+            // fault and downgrades the session to libx264.
+            args.extend([
+                "-pix_fmt".into(),
+                "yuv420p".into(),
+                "-profile:v".into(),
+                "high".into(),
+                "-preset".into(),
+                nvenc_preset(
+                    params
+                        .encoding_preset
+                        .unwrap_or_default(),
+                )
+                .into(),
+                // Low-latency tuning matches libx264's `-tune zerolatency`, which
+                // matters for HLS segments served while still transcoding.
+                "-tune".into(),
+                "ll".into(),
+                // Quality-targeted VBR, mirroring the CRF used for software.
+                "-rc".into(),
+                "vbr".into(),
+                "-cq".into(),
+                params
+                    .h264_crf
+                    .to_string(),
+            ]);
+            // Treat the client's bitrate as a ceiling, not a CBR target.
+            if let Some(bitrate) = params.video_bitrate {
+                args.extend([
+                    "-maxrate".into(),
+                    bitrate.to_string(),
+                    "-bufsize".into(),
+                    (bitrate * 2).to_string(),
+                ]);
+            }
+        } else if let Some(bitrate) = params.video_bitrate {
+            // Other HW encoders use plain bitrate control.
             args.extend(["-b:v".into(), bitrate.to_string()]);
         }
     } else if ffmpeg_video_codec == "libx264" {
@@ -2957,6 +3008,16 @@ mod tests {
                 .any(|arg| arg == "-hwaccel")
         );
         assert_eq!(arg_after(&args, "-c:v"), Some("h264_nvenc"));
+        // h264_nvenc cannot encode 10-bit. Omitting the output format lets a
+        // 10-bit HDR source reach the encoder, which fails with "No capable
+        // devices found" and silently downgrades the session to libx264.
+        assert_eq!(
+            arg_after(&args, "-pix_fmt"),
+            Some("yuv420p"),
+            "NVENC must pin an 8-bit output format"
+        );
+        assert_eq!(arg_after(&args, "-profile:v"), Some("high"));
+        assert_eq!(arg_after(&args, "-preset"), Some("p1"));
     }
 
     #[test]
