@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 use tokio::sync::RwLock;
@@ -68,21 +68,46 @@ pub async fn detect_vaapi_driver(vaapi_device: &str) -> String {
     }
 }
 
+/// PCI vendor IDs as reported by `/sys/class/drm/renderD128/device/vendor`.
+const PCI_VENDOR_INTEL: &str = "0x8086";
+/// NVIDIA's kernel driver creates a DRM render node just like Intel/AMD, but its
+/// VA-API shim (nvidia-vaapi-driver) is **decode-only** — `vainfo` reports every
+/// profile as `VAEntrypointVLD` and no `VAEntrypointEncSlice`. Selecting VAAPI on
+/// NVIDIA therefore always fails at encoder-open time with
+/// "No usable encoding entrypoint found", so the vendor must be excluded.
+const PCI_VENDOR_NVIDIA: &str = "0x10de";
+
+/// The h264 encoder implementing each acceleration type. Encoder availability is
+/// the only trustworthy capability signal — `ffmpeg -hwaccels` lists *decode*
+/// methods and says nothing about whether the matching encoder exists.
+fn h264_encoder_for(accel: HardwareAccelerationType) -> Option<&'static str> {
+    match accel {
+        HardwareAccelerationType::Nvenc => Some("h264_nvenc"),
+        HardwareAccelerationType::Qsv => Some("h264_qsv"),
+        HardwareAccelerationType::Vaapi => Some("h264_vaapi"),
+        HardwareAccelerationType::Amf => Some("h264_amf"),
+        HardwareAccelerationType::VideoToolbox => Some("h264_videotoolbox"),
+        HardwareAccelerationType::V4l2m2m => Some("h264_v4l2m2m"),
+        HardwareAccelerationType::Rkmpp => Some("h264_rkmpp"),
+        HardwareAccelerationType::None => None,
+    }
+}
+
 async fn probe_hw_accel() -> HardwareAccelerationType {
-    let supported = match tokio::process::Command::new(ffmpeg_bin())
-        .args(["-hide_banner", "-hwaccels"])
+    let encoders = match tokio::process::Command::new(ffmpeg_bin())
+        .args(["-hide_banner", "-encoders"])
         .output()
         .await
     {
         Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
         Err(e) => {
-            warn!("Could not run ffmpeg to detect hwaccels: {e}");
+            warn!("Could not run ffmpeg to detect encoders: {e}");
             String::new()
         }
     };
 
-    select_hw_accel(
-        &supported,
+    let candidates = hw_accel_candidates(
+        &encoders,
         |p| std::path::Path::new(p).exists(),
         || {
             std::fs::read_to_string("/sys/class/drm/renderD128/device/vendor")
@@ -92,38 +117,193 @@ async fn probe_hw_accel() -> HardwareAccelerationType {
                         .to_string()
                 })
         },
-    )
+    );
+
+    // A candidate passing the static checks above can still fail to open at
+    // runtime (wrong driver, no free session, kernel/userspace mismatch). Prove
+    // each one with a real one-frame encode before committing to it.
+    for accel in candidates {
+        match encoder_smoke_test(accel).await {
+            Ok(()) => return accel,
+            Err(e) => warn!(
+                ?accel,
+                error = %e,
+                "Hardware encoder failed its smoke test — trying next candidate"
+            ),
+        }
+    }
+
+    HardwareAccelerationType::None
 }
 
-pub(crate) fn select_hw_accel(
-    hwaccels_output: &str,
+/// Run a one-frame encode to prove the accelerator can actually encode.
+async fn encoder_smoke_test(accel: HardwareAccelerationType) -> Result<(), String> {
+    let Some(encoder) = h264_encoder_for(accel) else {
+        return Ok(());
+    };
+
+    let mut args: Vec<String> = vec!["-hide_banner".into(), "-v".into(), "error".into()];
+    // VAAPI and QSV encode from GPU surfaces, so the test frame must be uploaded.
+    // NVENC/VideoToolbox/V4L2/RKMPP accept system-memory frames directly.
+    let needs_upload = matches!(
+        accel,
+        HardwareAccelerationType::Vaapi | HardwareAccelerationType::Qsv
+    );
+    if needs_upload {
+        args.extend(["-vaapi_device".into(), "/dev/dri/renderD128".into()]);
+    }
+    args.extend([
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        "testsrc=size=320x240:rate=1:duration=1".into(),
+    ]);
+    if needs_upload {
+        args.extend(["-vf".into(), "format=nv12,hwupload".into()]);
+    }
+    args.extend([
+        "-c:v".into(),
+        encoder.into(),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ]);
+
+    let out = tokio::process::Command::new(ffmpeg_bin())
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| format!("could not spawn ffmpeg: {e}"))?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .to_string())
+    }
+}
+
+/// Acceleration types viable on this host, in preference order.
+///
+/// `encoders_output` is the stdout of `ffmpeg -encoders`.
+pub(crate) fn hw_accel_candidates(
+    encoders_output: &str,
     device_exists: impl Fn(&str) -> bool,
     drm_vendor: impl Fn() -> Option<String>,
-) -> HardwareAccelerationType {
-    let has = |name: &str| {
-        hwaccels_output
-            .lines()
-            .any(|l| l.trim() == name)
+) -> Vec<HardwareAccelerationType> {
+    // `ffmpeg -encoders` rows look like " V....D h264_nvenc  NVIDIA NVENC ...".
+    let has_encoder = |name: &str| {
+        encoders_output.lines().any(|l| {
+            l.split_whitespace()
+                .nth(1)
+                == Some(name)
+        })
     };
 
     let has_render_node = device_exists("/dev/dri/renderD128");
-    let is_intel = drm_vendor().as_deref() == Some("0x8086");
+    let vendor = drm_vendor();
+    let is_intel = vendor.as_deref() == Some(PCI_VENDOR_INTEL);
+    let is_nvidia = vendor.as_deref() == Some(PCI_VENDOR_NVIDIA);
 
-    if has("cuda") && device_exists("/dev/nvidia0") {
-        HardwareAccelerationType::Nvenc
-    } else if has("qsv") && has_render_node && is_intel {
-        HardwareAccelerationType::Qsv
-    } else if has("vaapi") && has_render_node {
-        HardwareAccelerationType::Vaapi
-    } else if has("videotoolbox") && cfg!(target_os = "macos") {
-        HardwareAccelerationType::VideoToolbox
-    } else if has("v4l2m2m") && device_exists("/dev/video0") {
-        HardwareAccelerationType::V4l2m2m
-    } else if has("rkmpp") && device_exists("/dev/mpp_service") {
-        HardwareAccelerationType::Rkmpp
-    } else {
-        HardwareAccelerationType::None
+    let viable = |accel: HardwareAccelerationType| -> bool {
+        let encoder_present = h264_encoder_for(accel)
+            .is_some_and(has_encoder);
+        encoder_present
+            && match accel {
+                HardwareAccelerationType::Nvenc => device_exists("/dev/nvidia0"),
+                HardwareAccelerationType::Qsv => has_render_node && is_intel,
+                HardwareAccelerationType::Vaapi => has_render_node && !is_nvidia,
+                HardwareAccelerationType::VideoToolbox => cfg!(target_os = "macos"),
+                HardwareAccelerationType::V4l2m2m => device_exists("/dev/video0"),
+                HardwareAccelerationType::Rkmpp => device_exists("/dev/mpp_service"),
+                HardwareAccelerationType::Amf | HardwareAccelerationType::None => false,
+            }
+    };
+
+    [
+        HardwareAccelerationType::Nvenc,
+        HardwareAccelerationType::Qsv,
+        HardwareAccelerationType::Vaapi,
+        HardwareAccelerationType::VideoToolbox,
+        HardwareAccelerationType::V4l2m2m,
+        HardwareAccelerationType::Rkmpp,
+    ]
+    .into_iter()
+    .filter(|a| viable(*a))
+    .collect()
+}
+
+/// First viable acceleration type, ignoring runtime validation.
+#[cfg(test)]
+pub(crate) fn select_hw_accel(
+    encoders_output: &str,
+    device_exists: impl Fn(&str) -> bool,
+    drm_vendor: impl Fn() -> Option<String>,
+) -> HardwareAccelerationType {
+    hw_accel_candidates(encoders_output, device_exists, drm_vendor)
+        .first()
+        .copied()
+        .unwrap_or(HardwareAccelerationType::None)
+}
+
+/// Substrings that identify a failure originating in the hardware encoder or its
+/// device stack, as opposed to an I/O, network, or muxer fault that merely
+/// occurred while hardware acceleration was enabled.
+const HW_FAILURE_SIGNATURES: &[&str] = &[
+    "no usable encoding entrypoint",
+    "error while opening encoder",
+    "could not open encoder",
+    "openencodesessionex failed",
+    "initializeencoder failed",
+    "no capable devices found",
+    "cannot load libcuda",
+    "device creation failed",
+    "failed to create",
+    "hwupload",
+    "impossible to convert between the formats",
+    "function not implemented",
+    "the requested vaprofile is not supported",
+    "no nvenc capable devices",
+];
+
+/// Whether ffmpeg's stderr implicates the hardware encoder itself.
+///
+/// Returning false for an unrelated fault keeps the session on hardware; the old
+/// behaviour blamed HW accel for *any* non-zero exit, so a missing output
+/// directory would silently downgrade a session to libx264 for its whole life.
+pub(crate) fn is_hw_encoder_failure(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    HW_FAILURE_SIGNATURES
+        .iter()
+        .any(|sig| lower.contains(sig))
+}
+
+/// Consecutive hardware-encoder failures before hardware is abandoned
+/// process-wide. Without this, every new session re-attempts a doomed encoder,
+/// burning one wasted ffmpeg spawn apiece.
+const HW_FAILURE_LIMIT: u32 = 3;
+static HW_FAILURES: AtomicU32 = AtomicU32::new(0);
+static HW_LOCKED_OUT: AtomicBool = AtomicBool::new(false);
+
+fn note_hw_failure(accel: HardwareAccelerationType) {
+    let failures = HW_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures >= HW_FAILURE_LIMIT && !HW_LOCKED_OUT.swap(true, Ordering::Relaxed) {
+        warn!(
+            ?accel,
+            failures,
+            "Hardware encoding failed {HW_FAILURE_LIMIT} times — falling back to software for \
+             all new sessions until restart"
+        );
     }
+}
+
+fn note_hw_success() {
+    HW_FAILURES.store(0, Ordering::Relaxed);
+}
+
+fn hw_accel_locked_out() -> bool {
+    HW_LOCKED_OUT.load(Ordering::Relaxed)
 }
 
 /// Max seconds to buffer ahead of the current playback position.
@@ -1110,8 +1290,25 @@ pub async fn start_transcode(
     tokio::spawn(async move {
         let mut params = params;
         let mut sw_fallback = false;
+        let mut hw_intact_retry = false;
         let mut live_restarts = 0u32;
         const MAX_LIVE_RESTARTS: u32 = 10;
+
+        // Respect a process-wide hardware lockout from earlier failures so this
+        // session doesn't pay for a spawn we already know is doomed.
+        if hw_accel_locked_out()
+            && !matches!(
+                params.hardware_acceleration_type,
+                HardwareAccelerationType::None
+            )
+        {
+            debug!(
+                accel = ?params.hardware_acceleration_type,
+                "Hardware acceleration locked out after repeated failures — starting in software"
+            );
+            params.hardware_acceleration_type = HardwareAccelerationType::None;
+            sw_fallback = true;
+        }
 
         loop {
             let args = build_hls_args(&params);
@@ -1164,22 +1361,43 @@ pub async fn start_transcode(
                 HardwareAccelerationType::None
             );
 
-            // If HW accel caused the failure, retry once with software encoding.
-            if !sw_fallback
-                && using_hw
-                && matches!(&result, Some(Ok(s)) if !s.success())
-            {
+            let ffmpeg_failed = matches!(&result, Some(Ok(s)) if !s.success());
+
+            // Only blame the encoder when ffmpeg's stderr actually implicates it.
+            // A missing output directory or unreadable input can fail a session
+            // while HW accel happens to be on; downgrading for those costs ~3x the
+            // CPU for the rest of the session and hides the real fault.
+            if ffmpeg_failed && using_hw && !sw_fallback && is_hw_encoder_failure(&stderr_out) {
                 warn!(
                     accel = ?params.hardware_acceleration_type,
                     stderr = stderr_out.trim(),
                     "HW-accelerated transcode failed — retrying with software encoding"
                 );
+                note_hw_failure(params.hardware_acceleration_type);
                 // Clean partial output so the retry starts fresh.
                 let _ = std::fs::remove_dir_all(&params.output_dir);
                 let _ = std::fs::create_dir_all(&params.output_dir);
                 params.hardware_acceleration_type = HardwareAccelerationType::None;
                 sw_fallback = true;
                 continue;
+            }
+
+            // Failure unrelated to the encoder: retry once keeping HW accel,
+            // recreating the output dir in case it was the cause.
+            if ffmpeg_failed && using_hw && !hw_intact_retry {
+                warn!(
+                    accel = ?params.hardware_acceleration_type,
+                    stderr = stderr_out.trim(),
+                    "Transcode failed for a non-encoder reason — retrying with hardware encoding intact"
+                );
+                let _ = std::fs::remove_dir_all(&params.output_dir);
+                let _ = std::fs::create_dir_all(&params.output_dir);
+                hw_intact_retry = true;
+                continue;
+            }
+
+            if !ffmpeg_failed && using_hw {
+                note_hw_success();
             }
 
             let mut s = session_clone
@@ -2030,6 +2248,42 @@ mod tests {
         true
     }
 
+    /// Render an `ffmpeg -encoders` listing containing exactly `encoders`.
+    fn encoders_listing(encoders: &[&str]) -> String {
+        std::iter::once("Encoders:".to_string())
+            .chain(
+                encoders
+                    .iter()
+                    .map(|e| format!(" V....D {e} test encoder")),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The tests below predate encode-capability gating and are written against
+    /// `ffmpeg -hwaccels` output. Translate to an encoder listing under the old
+    /// assumption that every decode hwaccel implies its matching encoder, so they
+    /// keep asserting the device/vendor precedence rules they were written for.
+    fn select_hw_accel(
+        hwaccels_output: &str,
+        device_exists: impl Fn(&str) -> bool,
+        drm_vendor: impl Fn() -> Option<String>,
+    ) -> HardwareAccelerationType {
+        let encoders: Vec<&str> = hwaccels_output
+            .lines()
+            .filter_map(|l| match l.trim() {
+                "cuda" => Some("h264_nvenc"),
+                "qsv" => Some("h264_qsv"),
+                "vaapi" => Some("h264_vaapi"),
+                "videotoolbox" => Some("h264_videotoolbox"),
+                "v4l2m2m" => Some("h264_v4l2m2m"),
+                "rkmpp" => Some("h264_rkmpp"),
+                _ => None,
+            })
+            .collect();
+        super::select_hw_accel(&encoders_listing(&encoders), device_exists, drm_vendor)
+    }
+
     #[test]
     fn hw_none_when_no_hwaccels_listed() {
         assert_eq!(
@@ -2162,6 +2416,135 @@ mod tests {
         assert_eq!(
             select_hw_accel(hwaccels, |p| p == "/dev/mpp_service", || None),
             HardwareAccelerationType::Rkmpp
+        );
+    }
+
+    // ── HW-failure attribution (verbatim stderr captured in production) ───────
+
+    /// Real VAAPI-on-NVIDIA failure: genuinely the encoder, so fall back.
+    #[test]
+    fn hw_failure_detected_for_missing_vaapi_entrypoint() {
+        let stderr = "[h264_vaapi @ 0x55baa0438440] No usable encoding entrypoint found for \
+             profile VAProfileH264High (7).\n[vost#0:0/h264_vaapi @ 0x55baa04313c0] Error while \
+             opening encoder - maybe incorrect parameters such as bit_rate, rate, width or \
+             height.\n[out#0/hls @ 0x55ba9fcccd80] Nothing was written into output file";
+        assert!(is_hw_encoder_failure(stderr));
+    }
+
+    /// Real VAAPI tonemap failure.
+    #[test]
+    fn hw_failure_detected_for_unsupported_vaapi_profile() {
+        let stderr = "[Parsed_tonemap_vaapi_2 @ 0x7f414c004a00] Failed to create processing \
+             pipeline config: 12 (the requested VAProfile is not supported).";
+        assert!(is_hw_encoder_failure(stderr));
+    }
+
+    /// Real NVENC session that failed because its output directory vanished. The
+    /// encoder opened fine — this must NOT be attributed to hardware, which is
+    /// what previously downgraded live sessions to libx264.
+    #[test]
+    fn io_failure_not_attributed_to_hw_encoder() {
+        let stderr = "[hls @ 0x562e2c6285c0] Failed to open file \
+             'transcode_sessions/106d41f9211549a78cc66230de74726e/segment_00000.ts'\n\
+             [vost#0:0/h264_nvenc @ 0x562e2c647040] Error submitting a packet to the muxer: No \
+             such file or directory\n[out#0/hls @ 0x562e2c61b000] Error muxing a packet\n\
+             [out#0/hls @ 0x562e2c61b000] Task finished with error code: -2 (No such file or \
+             directory)\n[hls @ 0x562e2c6285c0] failed to rename file \
+             transcode_sessions/106d41f9211549a78cc66230de74726e/main.m3u8.tmp to \
+             transcode_sessions/106d41f9211549a78cc66230de74726e/main.m3u8: No such file or \
+             directory";
+        assert!(
+            !is_hw_encoder_failure(stderr),
+            "a vanished output dir is not an encoder fault"
+        );
+    }
+
+    #[test]
+    fn network_failure_not_attributed_to_hw_encoder() {
+        let stderr = "[in#0 @ 0x55b0] Error opening input: Server returned 404 Not Found\n\
+             Error opening input file https://example.invalid/movie.mkv.";
+        assert!(!is_hw_encoder_failure(stderr));
+    }
+
+    #[test]
+    fn hw_failure_detected_for_exhausted_nvenc_sessions() {
+        let stderr = "[h264_nvenc @ 0x5566] OpenEncodeSessionEx failed: out of memory (10): \
+             (no details)";
+        assert!(is_hw_encoder_failure(stderr));
+    }
+
+    // ── encode-capability / vendor gating (regression: NVIDIA box chose VAAPI) ──
+
+    /// The production failure: an NVIDIA host whose ffmpeg lists `h264_vaapi` and
+    /// whose NVIDIA driver supplies /dev/dri/renderD128. nvidia-vaapi-driver is
+    /// decode-only, so VAAPI would fail at encoder-open. Must not be selected.
+    #[test]
+    fn hw_never_selects_vaapi_on_nvidia_hardware() {
+        let encoders = encoders_listing(&["h264_vaapi"]);
+        assert_eq!(
+            super::select_hw_accel(
+                &encoders,
+                |p| p == "/dev/dri/renderD128",
+                || Some("0x10de".to_string()),
+            ),
+            HardwareAccelerationType::None,
+            "VAAPI is decode-only on NVIDIA and must never be selected"
+        );
+    }
+
+    /// VAAPI stays selectable on non-NVIDIA hardware with a render node.
+    #[test]
+    fn hw_selects_vaapi_on_amd() {
+        let encoders = encoders_listing(&["h264_vaapi"]);
+        assert_eq!(
+            super::select_hw_accel(
+                &encoders,
+                |p| p == "/dev/dri/renderD128",
+                || Some("0x1002".to_string()),
+            ),
+            HardwareAccelerationType::Vaapi
+        );
+    }
+
+    /// Selection keys off `ffmpeg -encoders`, never the decode-side `-hwaccels`
+    /// list: a build advertising `cuda` decode but lacking h264_nvenc is not NVENC.
+    #[test]
+    fn hw_nvenc_requires_encoder_not_decode_support() {
+        let encoders = encoders_listing(&["h264_vaapi"]);
+        assert_eq!(
+            super::select_hw_accel(&encoders, all_devices, || None),
+            HardwareAccelerationType::Vaapi,
+            "cuda decode without h264_nvenc must not yield Nvenc"
+        );
+    }
+
+    #[test]
+    fn hw_selects_nvenc_when_encoder_and_device_present() {
+        let encoders = encoders_listing(&["h264_nvenc", "h264_vaapi"]);
+        assert_eq!(
+            super::select_hw_accel(&encoders, all_devices, || Some("0x10de".to_string())),
+            HardwareAccelerationType::Nvenc
+        );
+    }
+
+    /// On NVIDIA, NVENC is the only candidate — VAAPI must be filtered out, so a
+    /// failed NVENC smoke test falls through to software rather than to VAAPI.
+    #[test]
+    fn hw_candidates_on_nvidia_exclude_vaapi() {
+        let encoders = encoders_listing(&["h264_nvenc", "h264_vaapi"]);
+        assert_eq!(
+            hw_accel_candidates(&encoders, all_devices, || Some("0x10de".to_string())),
+            vec![HardwareAccelerationType::Nvenc]
+        );
+    }
+
+    /// An encoder listed by ffmpeg but with no matching device is not viable.
+    #[test]
+    fn hw_nvenc_requires_device_node() {
+        let encoders = encoders_listing(&["h264_nvenc"]);
+        assert_eq!(
+            super::select_hw_accel(&encoders, no_devices, || None),
+            HardwareAccelerationType::None
         );
     }
 

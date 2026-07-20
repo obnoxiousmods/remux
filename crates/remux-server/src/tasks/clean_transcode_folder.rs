@@ -8,6 +8,23 @@ use tracing::{info, warn};
 use super::{ProgressReporter, Task, TaskCategory, TaskService};
 use crate::AppContext;
 
+/// How long a transcode directory is protected from cleanup after creation,
+/// covering the window between `create_dir_all` and session registration.
+const ORPHAN_GRACE_SECS: u64 = 120;
+
+/// Seconds since the directory was created, or `None` if unavailable.
+fn dir_age_secs(path: &std::path::Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let created = meta
+        .created()
+        .or_else(|_| meta.modified())
+        .ok()?;
+    created
+        .elapsed()
+        .ok()
+        .map(|d| d.as_secs())
+}
+
 pub struct CleanTranscodeFolderTask;
 
 #[async_trait]
@@ -50,6 +67,14 @@ impl Task for CleanTranscodeFolderTask {
                 .to_string_lossy()
                 .into_owned();
             if !active.contains(&name) {
+                // A session's directory is created before the session is
+                // registered as active, so a dir that is merely young may be a
+                // starting session rather than an orphan. Reaping it mid-startup
+                // kills the transcode and (previously) got misread as a hardware
+                // encoder failure. Leave recent dirs for the next run.
+                if dir_age_secs(&entry.path()).is_some_and(|age| age < ORPHAN_GRACE_SECS) {
+                    continue;
+                }
                 // Kill any orphaned ffmpeg process before removing the dir.
                 #[cfg(unix)]
                 if let Ok(pid_str) = std::fs::read_to_string(

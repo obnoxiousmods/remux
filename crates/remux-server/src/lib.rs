@@ -206,8 +206,8 @@ pub async fn init_app(
         .ok();
     crate::db::Settings::init_server_id(&conn).await?;
 
-    // Probe hardware and persist results at startup.
-    // vaapi_driver is always re-detected (regardless of auto_detect) because
+    // Probe hardware and persist results at startup. vaapi_driver is re-detected
+    // (regardless of auto_detect) whenever a VAAPI-based accel is in play, because
     // it is a runtime property of the host, not a user preference.
     {
         let mut enc_opts = db::Settings::get_encoding_config(&conn).await?;
@@ -219,12 +219,21 @@ pub async fn init_app(
                 crate::playback::engine::detect_hardware_acceleration().await;
             enc_opts.hardware_acceleration_type = Some(detected);
         }
-        let device = enc_opts
-            .vaapi_device
-            .as_deref()
-            .unwrap_or("/dev/dri/renderD128");
-        let driver = crate::playback::engine::detect_vaapi_driver(device).await;
-        enc_opts.vaapi_driver = Some(driver);
+        // Only probe the VAAPI driver when an accel type actually uses it —
+        // otherwise this spawns an ffmpeg process at every startup to answer a
+        // question nothing will ask (e.g. on NVENC hosts).
+        if matches!(
+            enc_opts.hardware_acceleration_type,
+            Some(remux_sdks::remux::HardwareAccelerationType::Vaapi)
+                | Some(remux_sdks::remux::HardwareAccelerationType::Qsv)
+        ) {
+            let device = enc_opts
+                .vaapi_device
+                .as_deref()
+                .unwrap_or("/dev/dri/renderD128");
+            let driver = crate::playback::engine::detect_vaapi_driver(device).await;
+            enc_opts.vaapi_driver = Some(driver);
+        }
         db::Settings::set_encoding_config(&conn, &enc_opts).await?;
     }
 
