@@ -827,6 +827,15 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         if let Some(ticks) = params.start_time_ticks {
             let secs = ticks as f64 / 10_000_000.0;
             args.extend(["-ss".into(), format!("{:.6}", secs)]);
+            // Remote media can have a sparse or expensive seek index. During
+            // a transcode FFmpeg's default accurate seek decodes and discards
+            // every frame between the preceding keyframe and the requested
+            // time, delaying the first HLS segment for tens of seconds. Start
+            // from that keyframe instead; the playlist sequence still carries
+            // the requested resume position.
+            if ffmpeg_video_codec != "copy" {
+                args.push("-noaccurate_seek".into());
+            }
         }
     }
 
@@ -3028,6 +3037,19 @@ mod tests {
             !args.iter().any(|arg| arg == "-copyts"),
             "transcoded HLS must start on a fresh output timeline"
         );
+    }
+
+    #[test]
+    fn hls_resumed_transcode_uses_fast_keyframe_seek() {
+        let dir = PathBuf::from("/tmp/test_resumed_transcode_seek");
+        let args = build_hls_args(&TranscodeParams {
+            video_codec: "libx264".into(),
+            start_time_ticks: Some(10_340_000_000),
+            ..default_hls(dir)
+        });
+
+        assert!(args.iter().any(|arg| arg == "-noaccurate_seek"));
+        assert!(!args.iter().any(|arg| arg == "-copyts"));
     }
 
     #[test]
