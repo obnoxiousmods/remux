@@ -1141,6 +1141,18 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         args.extend(["-b:v".into(), bitrate.to_string()]);
     }
 
+    // HLS can only close a segment on a video keyframe. Hardware encoders may
+    // otherwise choose a very long GOP, leaving one ever-growing .ts file and
+    // no playlist until the muxer overflows. Force a boundary at the requested
+    // segment cadence for every encoded-video path; copied video keeps the
+    // source GOP unchanged.
+    if ffmpeg_video_codec != "copy" {
+        args.extend([
+            "-force_key_frames".into(),
+            format!("expr:gte(t,n_forced*{})", params.segment_length),
+        ]);
+    }
+
     // Audio codec
     args.extend(["-c:a".into(), ffmpeg_audio_codec.into()]);
     if ffmpeg_audio_codec == "copy" {
@@ -3050,6 +3062,30 @@ mod tests {
 
         assert!(args.iter().any(|arg| arg == "-noaccurate_seek"));
         assert!(!args.iter().any(|arg| arg == "-copyts"));
+        assert_eq!(
+            arg_after(&args, "-force_key_frames"),
+            Some("expr:gte(t,n_forced*6)")
+        );
+    }
+
+    #[test]
+    fn hls_transcode_forces_segment_keyframes_but_stream_copy_does_not() {
+        let encoded = build_hls_args(&TranscodeParams {
+            video_codec: "libx264".into(),
+            segment_length: 4,
+            ..default_hls(PathBuf::from("/tmp/test_encoded_keyframes"))
+        });
+        let copied = build_hls_args(&TranscodeParams {
+            video_codec: "copy".into(),
+            segment_length: 4,
+            ..default_hls(PathBuf::from("/tmp/test_copied_keyframes"))
+        });
+
+        assert_eq!(
+            arg_after(&encoded, "-force_key_frames"),
+            Some("expr:gte(t,n_forced*4)")
+        );
+        assert_eq!(arg_after(&copied, "-force_key_frames"), None);
     }
 
     #[test]
