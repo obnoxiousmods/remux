@@ -672,6 +672,22 @@ fn build_scale_filter(params: &TranscodeParams) -> Option<String> {
     }
 }
 
+fn build_cuda_video_filter(params: &TranscodeParams, hdr: bool) -> String {
+    let scale = match (params.max_width, params.max_height) {
+        (Some(w), Some(h)) => format!(
+            "scale_cuda=w='min({w},iw)':h='min({h},ih)':format=yuv420p:force_original_aspect_ratio=decrease"
+        ),
+        (Some(w), None) => format!("scale_cuda=w='min({w},iw)':h=-2:format=yuv420p"),
+        (None, Some(h)) => format!("scale_cuda=w=-2:h='min({h},ih)':format=yuv420p"),
+        _ => "scale_cuda=format=yuv420p".to_string(),
+    };
+    if hdr {
+        format!("tonemap_cuda=format=yuv420p,{scale}")
+    } else {
+        scale
+    }
+}
+
 /// Build a VAAPI hardware scale filter for QSV transcoding.
 ///
 /// When using QSV (VAAPI-decode → QSV-encode pipeline) frames live in VAAPI
@@ -809,7 +825,10 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     // Hardware acceleration input flags (before -ss and -i).
     // For QSV+HDR without VPP tonemapping: SW-decode so CPU filters can run.
     // For QSV+HDR with VPP tonemapping: keep VAAPI hw-decode (tonemap_vaapi needs GPU frames).
-    if ffmpeg_video_codec != "copy" && matches!(accel, HardwareAccelerationType::Nvenc) {
+    if ffmpeg_video_codec != "copy"
+        && !params.burn_subtitle
+        && matches!(accel, HardwareAccelerationType::Nvenc)
+    {
         args.extend([
             "-hwaccel".into(),
             "cuda".into(),
@@ -882,7 +901,12 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     // QSV+VPP: tonemap_vaapi in VAAPI memory then hwmap to QSV surface.
     // QSV+HDR (SW decode, no VPP): just format=nv12 — QSV encoder accepts system-memory NV12.
     // Otherwise: standard hw_filter_suffix (e.g. format=nv12,hwupload for VAAPI).
-    let hw_suffix = if do_vpp_tonemap && matches!(accel, HardwareAccelerationType::Qsv)
+    let cuda_native = ffmpeg_video_codec != "copy"
+        && !params.burn_subtitle
+        && matches!(accel, HardwareAccelerationType::Nvenc);
+    let hw_suffix = if cuda_native {
+        Some(build_cuda_video_filter(params, hdr))
+    } else if do_vpp_tonemap && matches!(accel, HardwareAccelerationType::Qsv)
     {
         let vpp =
             "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709:extra_hw_frames=32";
@@ -891,17 +915,6 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         Some("format=nv12".to_string())
     } else {
         hw_filter_suffix(accel)
-    };
-    let nvenc_download = if ffmpeg_video_codec != "copy"
-        && matches!(accel, HardwareAccelerationType::Nvenc)
-    {
-        Some(if hdr {
-            "hwdownload,format=p010le".to_string()
-        } else {
-            "hwdownload,format=nv12".to_string()
-        })
-    } else {
-        None
     };
 
     // Stream mapping
@@ -928,11 +941,7 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             let main_scale_part = build_scale_filter(params)
                 .map(|s| format!("{s}"))
                 .unwrap_or_default();
-            let main_preproc = match (nvenc_download.as_deref(), main_scale_part.as_str()) {
-                (Some(download), "") => download.to_string(),
-                (Some(download), scale) => format!("{download},{scale}"),
-                (None, scale) => scale.to_string(),
-            };
+            let main_preproc = main_scale_part;
             let overlay = "overlay=eof_action=pass:repeatlast=0";
             let filter = if main_preproc.is_empty() {
                 match &hw_suffix {
@@ -966,7 +975,9 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         // (frames already in VAAPI memory from hw decode). SW tonemap + HDR always
         // uses CPU scale regardless of hw type.
         let scale_filter = if ffmpeg_video_codec != "copy" {
-            if matches!(accel, HardwareAccelerationType::Qsv)
+            if cuda_native {
+                None
+            } else if matches!(accel, HardwareAccelerationType::Qsv)
                 && (!hdr || do_vpp_tonemap)
             {
                 Some(build_qsv_scale_filter(params.max_width, params.max_height))
@@ -983,7 +994,9 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             _ => None,
         };
         let vf = if hdr && ffmpeg_video_codec != "copy" {
-            if do_vpp_tonemap && matches!(accel, HardwareAccelerationType::Vaapi) {
+            if cuda_native {
+                vf
+            } else if do_vpp_tonemap && matches!(accel, HardwareAccelerationType::Vaapi) {
                 // VAAPI VPP: frames are in VAAPI memory after hwupload; append tonemap_vaapi.
                 let vpp = "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709:extra_hw_frames=32";
                 let base = vf.unwrap_or_default();
@@ -1033,11 +1046,6 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             }
         } else {
             vf
-        };
-        let vf = match (nvenc_download.as_deref(), vf) {
-            (Some(download), Some(filter)) => Some(format!("{download},{filter}")),
-            (Some(download), None) => Some(download.to_string()),
-            (None, filter) => filter,
         };
         if let Some(ref filter) = vf {
             args.extend(["-vf".into(), filter.clone()]);
@@ -3059,8 +3067,8 @@ mod tests {
         assert_eq!(arg_after(&args, "-hwaccel_output_format"), Some("cuda"));
         assert!(
             arg_after(&args, "-vf")
-                .is_some_and(|filter| filter.starts_with("hwdownload,format=nv12")),
-            "NVDEC frames must be downloaded before CPU filters"
+                .is_some_and(|filter| filter == "scale_cuda=format=yuv420p"),
+            "NVDEC frames must remain on the GPU through format conversion"
         );
         assert_eq!(arg_after(&args, "-c:v"), Some("h264_nvenc"));
         // h264_nvenc cannot encode 10-bit. Omitting the output format lets a
@@ -3076,6 +3084,21 @@ mod tests {
         assert!(
             !args.iter().any(|arg| arg == "-copyts"),
             "transcoded HLS must start on a fresh output timeline"
+        );
+    }
+
+    #[test]
+    fn hls_nvenc_hdr_uses_gpu_native_tonemap() {
+        let args = build_hls_args(&TranscodeParams {
+            video_codec: "libx264".into(),
+            hardware_acceleration_type: HardwareAccelerationType::Nvenc,
+            source_video_range_type: Some(VideoRangeType::Hdr10),
+            ..default_hls(PathBuf::from("/tmp/test_nvenc_hdr"))
+        });
+
+        assert_eq!(
+            arg_after(&args, "-vf"),
+            Some("tonemap_cuda=format=yuv420p,scale_cuda=format=yuv420p")
         );
     }
 
