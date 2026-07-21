@@ -820,6 +820,18 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         "1000000".into(),
         "-probesize".into(),
         "1000000".into(),
+        "-reconnect".into(),
+        "1".into(),
+        "-reconnect_at_eof".into(),
+        "1".into(),
+        "-reconnect_streamed".into(),
+        "1".into(),
+        "-reconnect_delay_max".into(),
+        "5".into(),
+        "-timeout".into(),
+        "30000000".into(),
+        "-rw_timeout".into(),
+        "30000000".into(),
     ];
 
     // Hardware acceleration input flags (before -ss and -i).
@@ -3383,5 +3395,14 @@ mod tests {
         assert!(args_contains(&args, "-reconnect"));
         assert!(args_contains(&args, "-reconnect_at_eof"));
         assert!(args_contains(&args, "-reconnect_streamed"));
+    }
+
+    #[test]
+    fn hls_reconnect_flags_present() {
+        let args = build_hls_args(&default_hls(PathBuf::from("/tmp/hls-test-out")));
+        assert!(args_contains(&args, "-reconnect"));
+        assert!(args_contains(&args, "-reconnect_at_eof"));
+        assert!(args_contains(&args, "-reconnect_streamed"));
+        assert!(args_contains(&args, "-rw_timeout"));
     }
 }

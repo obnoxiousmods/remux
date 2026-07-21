@@ -648,11 +648,16 @@ async fn variant_hls_video_inner(
         // keyframe boundaries so actual durations differ from our target.
         // For resumed TS-HLS sessions, ffmpeg's playlist carries the correct
         // non-zero MEDIA-SEQUENCE and segment filenames after -start_number.
-        // Poll until ffmpeg has written at least the first segment entry.
+        // Poll until ffmpeg has opened the playlist and written its header:
+        // the muxer emits #EXT-X-TARGETDURATION at open, while the first
+        // #EXTINF only appears when the first full segment closes. Clients
+        // poll EVENT playlists, so serving the header lets the decoder mount
+        // one segment earlier without inventing boundaries ffmpeg will never
+        // create.
         let content = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if let Ok(text) = tokio::fs::read_to_string(&playlist_path).await {
-                    if text.contains("#EXTINF") {
+                    if text.contains("#EXT-X-TARGETDURATION") {
                         return text;
                     }
                 }
@@ -662,10 +667,10 @@ async fn variant_hls_video_inner(
         .await
         .unwrap_or_default();
 
-        // FFmpeg has not published a playlist entry within the bounded wait.
+        // FFmpeg has not opened a playlist within the bounded wait.
         // A 200 with an empty body is a terminal parser failure for Media3 and
         // other strict HLS clients; a 503 lets the client's playlist loader
-        // back off and retry until the transcode writes its first segment.
+        // back off and retry until the transcode writes its header.
         if content.is_empty() {
             return Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
