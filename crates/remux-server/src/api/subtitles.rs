@@ -97,9 +97,31 @@ fn is_valid_ass_document(bytes: &[u8]) -> bool {
             })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SubtitleExtractionPlan {
+    pub stream_index: i64,
+    pub preserve_raw_ass: bool,
+}
+
+pub(crate) fn subtitle_extraction_plan(
+    stream_index: i64,
+    codec: Option<&str>,
+) -> SubtitleExtractionPlan {
+    let preserve_raw_ass = codec
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|codec| matches!(codec.as_str(), "ass" | "ssa"));
+    SubtitleExtractionPlan {
+        stream_index,
+        preserve_raw_ass,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_ass_document, subtitle_cache_source_id};
+    use super::{
+        is_valid_ass_document, subtitle_cache_source_id, subtitle_extraction_plan,
+    };
     use crate::{db, stream};
     use uuid::Uuid;
 
@@ -140,6 +162,26 @@ mod tests {
             subtitle_cache_source_id(&refreshed, Some(1_450_000_000))
         );
     }
+
+    #[test]
+    fn extraction_plan_preserves_only_native_ass_formats() {
+        for codec in [Some("ass"), Some("SSA"), Some(" ass ")] {
+            assert!(subtitle_extraction_plan(3, codec).preserve_raw_ass);
+        }
+        for codec in [
+            Some("srt"),
+            Some("subrip"),
+            Some("vtt"),
+            Some("webvtt"),
+            Some("pgssub"),
+            Some("dvdsub"),
+            Some("dvbsub"),
+            Some("hdmv_pgs_subtitle"),
+            None,
+        ] {
+            assert!(!subtitle_extraction_plan(3, codec).preserve_raw_ass);
+        }
+    }
 }
 
 /// Extract an embedded subtitle stream to the SRT cache and return the cache path.
@@ -160,6 +202,10 @@ pub(crate) async fn extract_subtitle_to_cache(
         .map_err(|e| anyhow!("failed to create subtitle cache dir: {e}"))?;
     let cache_path =
         cache_dir.join(format!("{item_id}_{cache_source_id}_{stream_index}.srt"));
+    let temp_path = cache_dir.join(format!(
+        "{item_id}_{cache_source_id}_{stream_index}_{}.srt.tmp",
+        Uuid::new_v4()
+    ));
 
     // Return cached copy if it exists and is non-empty.
     if cache_path.exists() {
@@ -191,7 +237,7 @@ pub(crate) async fn extract_subtitle_to_cache(
         "srt",
         "-f",
         "srt",
-        cache_path
+        temp_path
             .to_str()
             .ok_or_else(|| anyhow!("invalid cache path"))?,
     ]);
@@ -203,7 +249,7 @@ pub(crate) async fn extract_subtitle_to_cache(
         tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
             .await
             .map_err(|_| {
-                let p = cache_path.clone();
+                let p = temp_path.clone();
                 tokio::spawn(async move {
                     let _ = tokio::fs::remove_file(p).await;
                 });
@@ -215,21 +261,109 @@ pub(crate) async fn extract_subtitle_to_cache(
         .status
         .success()
     {
+        let _ = tokio::fs::remove_file(&temp_path).await;
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("ffmpeg subtitle extraction failed: {stderr}");
     }
 
-    let bytes = tokio::fs::read(&cache_path)
+    let bytes = tokio::fs::read(&temp_path)
         .await
         .map_err(|e| anyhow!("failed to read cached subtitle: {e}"))?;
     if bytes
         .iter()
         .all(|b| b.is_ascii_whitespace())
     {
-        let _ = tokio::fs::remove_file(&cache_path).await;
+        let _ = tokio::fs::remove_file(&temp_path).await;
         anyhow::bail!("subtitle extraction produced empty output");
     }
 
+    if let Err(error) = tokio::fs::rename(&temp_path, &cache_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        anyhow::bail!("failed to publish subtitle cache entry: {error}");
+    }
+
+    Ok(cache_path)
+}
+
+async fn extract_raw_ass_to_cache(
+    cache_dir: &std::path::Path,
+    input_url: &str,
+    map_spec: &str,
+    item_id: Uuid,
+    cache_source_id: Uuid,
+    stream_index: i64,
+) -> anyhow::Result<std::path::PathBuf> {
+    let cache_path =
+        cache_dir.join(format!("{item_id}_{cache_source_id}_{stream_index}.ass"));
+    if tokio::fs::read(&cache_path)
+        .await
+        .ok()
+        .is_some_and(|bytes| is_valid_ass_document(&bytes))
+    {
+        return Ok(cache_path);
+    }
+
+    let temp_path = cache_dir.join(format!(
+        "{item_id}_{cache_source_id}_{stream_index}_{}.tmp.ass",
+        Uuid::new_v4()
+    ));
+    let mut cmd = tokio::process::Command::new(ffmpeg_bin());
+    cmd.kill_on_drop(true);
+    cmd.args([
+        "-y",
+        "-nostdin",
+        "-copyts",
+        "-i",
+        input_url,
+        "-map",
+        map_spec,
+        "-an",
+        "-vn",
+        "-c:s",
+        "copy",
+        "-f",
+        "ass",
+        temp_path
+            .to_str()
+            .ok_or_else(|| anyhow!("invalid ASS cache path"))?,
+    ]);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let output =
+        match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
+            .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(anyhow!("failed to run ffmpeg: {error}"));
+            }
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                anyhow::bail!("ASS subtitle extraction timed out");
+            }
+        };
+    if !output
+        .status
+        .success()
+    {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ASS subtitle extraction failed: {stderr}");
+    }
+    let bytes = tokio::fs::read(&temp_path)
+        .await
+        .map_err(|e| anyhow!("failed to read ASS subtitle: {e}"))?;
+    if !is_valid_ass_document(&bytes) {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        anyhow::bail!("ASS subtitle extraction produced no dialogue events");
+    }
+    if let Err(error) = tokio::fs::rename(&temp_path, &cache_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        anyhow::bail!("failed to publish ASS subtitle cache entry: {error}");
+    }
     Ok(cache_path)
 }
 
@@ -242,7 +376,7 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
     input_url: String,
     item_id: uuid::Uuid,
     cache_source_id: uuid::Uuid,
-    subtitle_streams: Vec<(i64, bool)>,
+    subtitle_streams: Vec<SubtitleExtractionPlan>,
 ) {
     let cache_dir = data_dir.join("subtitle-cache");
     let _ = tokio::fs::create_dir_all(&cache_dir).await;
@@ -266,25 +400,24 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
             .unwrap_or(false)
     };
     let mut to_extract = Vec::new();
-    for (idx, preserve_ass) in &subtitle_streams {
+    for plan in &subtitle_streams {
+        let idx = plan.stream_index;
         let srt_path = cache_dir.join(format!("{item_id}_{cache_source_id}_{idx}.srt"));
         let raw_ass_path =
             cache_dir.join(format!("{item_id}_{cache_source_id}_{idx}.ass"));
         let needs_srt = !cache_is_populated(&srt_path);
-        let needs_raw_ass = *preserve_ass && !cache_is_populated(&raw_ass_path);
+        let needs_raw_ass = plan.preserve_raw_ass && !cache_is_populated(&raw_ass_path);
         if needs_srt || needs_raw_ass {
-            let raw_ass_temp_path = needs_raw_ass.then(|| {
-                cache_dir.join(format!(
-                    "{item_id}_{cache_source_id}_{idx}_{}.ass.batch.tmp",
-                    Uuid::new_v4()
-                ))
+            let srt_output = needs_srt.then(|| {
+                (
+                    cache_dir.join(format!(
+                        "{item_id}_{cache_source_id}_{idx}_{}.batch.tmp.srt",
+                        Uuid::new_v4()
+                    )),
+                    srt_path,
+                )
             });
-            to_extract.push((
-                *idx,
-                needs_srt.then_some(srt_path),
-                raw_ass_temp_path,
-                raw_ass_path,
-            ));
+            to_extract.push((idx, srt_output, needs_raw_ass.then_some(raw_ass_path)));
         } else {
             debug!(%item_id, stream_index = idx, "subtitle caches hit, skipping");
         }
@@ -297,7 +430,7 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
 
     let indices: Vec<i64> = to_extract
         .iter()
-        .map(|(i, _, _, _)| *i)
+        .map(|(i, _, _)| *i)
         .collect();
     info!(
         %item_id,
@@ -322,101 +455,113 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
         extracting.insert(extraction_key, done_rx);
     }
 
-    let mut cmd = tokio::process::Command::new(ffmpeg_bin());
-    cmd.kill_on_drop(true);
-    // -y: overwrite without prompting (hangs forever waiting for stdin otherwise)
-    // -nostdin: don't read from stdin at all
-    // -c:s srt: convert to SRT so the cache is always valid SRT (not raw ASS/VTT bytes)
-    cmd.args(["-y", "-nostdin", "-i", &input_url]);
-    for (idx, srt_path, raw_ass_temp_path, _) in &to_extract {
-        if let Some(p) = srt_path
-            .as_ref()
-            .and_then(|path| path.to_str())
-        {
-            cmd.args([
-                "-map",
-                &format!("0:{idx}"),
-                "-an",
-                "-vn",
-                "-c:s",
-                "srt",
-                "-flush_packets",
-                "1",
-                p,
-            ]);
-        }
-        if let Some(p) = raw_ass_temp_path
-            .as_ref()
-            .and_then(|path| path.to_str())
-        {
-            cmd.args([
-                "-map",
-                &format!("0:{idx}"),
-                "-an",
-                "-vn",
-                "-c:s",
-                "copy",
-                "-f",
-                "ass",
-                p,
-            ]);
-        }
-    }
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let start = std::time::Instant::now();
-    match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await
+    if to_extract
+        .iter()
+        .any(|(_, srt_output, _)| srt_output.is_some())
     {
-        Ok(Ok(output)) => {
-            let elapsed = start
-                .elapsed()
-                .as_secs_f32();
-            if output
-                .status
-                .success()
+        let mut cmd = tokio::process::Command::new(ffmpeg_bin());
+        cmd.kill_on_drop(true);
+        // -y: overwrite without prompting (hangs forever waiting for stdin otherwise)
+        // -nostdin: don't read from stdin at all
+        // -c:s srt: convert to SRT so the cache is always valid SRT (not raw ASS/VTT bytes)
+        cmd.args(["-y", "-nostdin", "-i", &input_url]);
+        for (idx, srt_output, _) in &to_extract {
+            if let Some(p) = srt_output
+                .as_ref()
+                .and_then(|(temp_path, _)| temp_path.to_str())
             {
-                for (_, _, raw_ass_temp_path, raw_ass_path) in &to_extract {
-                    if let Some(temp_path) = raw_ass_temp_path {
-                        if cache_is_populated(temp_path) {
-                            if tokio::fs::rename(temp_path, raw_ass_path)
-                                .await
-                                .is_err()
-                            {
+                cmd.args([
+                    "-map",
+                    &format!("0:{idx}"),
+                    "-an",
+                    "-vn",
+                    "-c:s",
+                    "srt",
+                    "-flush_packets",
+                    "1",
+                    "-f",
+                    "srt",
+                    p,
+                ]);
+            }
+        }
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let start = std::time::Instant::now();
+        match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
+            .await
+        {
+            Ok(Ok(output)) => {
+                let elapsed = start
+                    .elapsed()
+                    .as_secs_f32();
+                if output
+                    .status
+                    .success()
+                {
+                    for (_, srt_output, _) in &to_extract {
+                        if let Some((temp_path, cache_path)) = srt_output {
+                            if cache_is_populated(temp_path) {
+                                if tokio::fs::rename(temp_path, cache_path)
+                                    .await
+                                    .is_err()
+                                {
+                                    let _ = tokio::fs::remove_file(temp_path).await;
+                                }
+                            } else {
                                 let _ = tokio::fs::remove_file(temp_path).await;
                             }
-                        } else {
+                        }
+                    }
+                    info!(%item_id, %cache_source_id, ?indices, elapsed_secs = elapsed, "batch subtitle extraction completed");
+                } else {
+                    for (_, srt_output, _) in &to_extract {
+                        if let Some((temp_path, _)) = srt_output {
                             let _ = tokio::fs::remove_file(temp_path).await;
                         }
                     }
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!(%item_id, %cache_source_id, ?indices, elapsed_secs = elapsed, %stderr, "batch subtitle extraction non-zero exit");
                 }
-                info!(%item_id, %cache_source_id, ?indices, elapsed_secs = elapsed, "batch subtitle extraction completed");
-            } else {
-                for (_, _, raw_ass_temp_path, _) in &to_extract {
-                    if let Some(temp_path) = raw_ass_temp_path {
+            }
+            Ok(Err(e)) => {
+                for (_, srt_output, _) in &to_extract {
+                    if let Some((temp_path, _)) = srt_output {
                         let _ = tokio::fs::remove_file(temp_path).await;
                     }
                 }
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!(%item_id, %cache_source_id, ?indices, elapsed_secs = elapsed, %stderr, "batch subtitle extraction non-zero exit");
+                warn!(%item_id, %cache_source_id, ?indices, "failed to spawn ffmpeg for batch subtitle extraction: {e}");
+            }
+            Err(_) => {
+                for (_, srt_output, _) in &to_extract {
+                    if let Some((temp_path, _)) = srt_output {
+                        let _ = tokio::fs::remove_file(temp_path).await;
+                    }
+                }
+                warn!(%item_id, %cache_source_id, ?indices, "batch subtitle extraction timed out after 120s");
             }
         }
-        Ok(Err(e)) => {
-            for (_, _, raw_ass_temp_path, _) in &to_extract {
-                if let Some(temp_path) = raw_ass_temp_path {
-                    let _ = tokio::fs::remove_file(temp_path).await;
-                }
-            }
-            warn!(%item_id, %cache_source_id, ?indices, "failed to spawn ffmpeg for batch subtitle extraction: {e}");
+    }
+
+    // Preserve styled ASS/SSA artifacts independently. A failure here must
+    // never invalidate the normalized SRT cache used by VTT and JSON clients.
+    for (stream_index, _, raw_ass_path) in &to_extract {
+        if raw_ass_path.is_none() {
+            continue;
         }
-        Err(_) => {
-            for (_, _, raw_ass_temp_path, _) in &to_extract {
-                if let Some(temp_path) = raw_ass_temp_path {
-                    let _ = tokio::fs::remove_file(temp_path).await;
-                }
-            }
-            warn!(%item_id, %cache_source_id, ?indices, "batch subtitle extraction timed out after 120s");
+        if let Err(error) = extract_raw_ass_to_cache(
+            &cache_dir,
+            &input_url,
+            &format!("0:{stream_index}"),
+            item_id,
+            cache_source_id,
+            *stream_index,
+        )
+        .await
+        {
+            warn!(%item_id, %cache_source_id, stream_index, %error, "raw ASS subtitle extraction failed");
         }
     }
 
@@ -684,63 +829,18 @@ pub async fn subtitles_stream(
             debug!(%item_id, %media_source_id, stream_index, "raw ASS subtitle cache hit");
             bytes
         } else {
-            let temp_path = cache_dir.join(format!(
-                "{item_id}_{cache_source_id}_{stream_index}_{}.ass.tmp",
-                Uuid::new_v4()
-            ));
-            let mut cmd = tokio::process::Command::new(ffmpeg_bin());
-            cmd.kill_on_drop(true);
-            cmd.args([
-                "-y",
-                "-nostdin",
-                "-copyts",
-                "-i",
+            let published_path = extract_raw_ass_to_cache(
+                &cache_dir,
                 &url,
-                "-map",
                 &map_spec,
-                "-an",
-                "-vn",
-                "-c:s",
-                "copy",
-                "-f",
-                "ass",
-                temp_path
-                    .to_str()
-                    .ok_or_else(|| anyhow!("invalid ASS cache path"))?,
-            ]);
-            cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::piped());
-            let output =
-                tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-                    .await
-                    .map_err(|_| anyhow!("ASS subtitle extraction timed out"))?
-                    .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
-            if !output
-                .status
-                .success()
-            {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow!("ASS subtitle extraction failed: {stderr}").into());
-            }
-            let bytes = tokio::fs::read(&temp_path)
+                item_id,
+                cache_source_id,
+                stream_index,
+            )
+            .await?;
+            tokio::fs::read(&published_path)
                 .await
-                .map_err(|e| anyhow!("failed to read ASS subtitle: {e}"))?;
-            if !is_valid_ass_document(&bytes) {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(anyhow!(
-                    "ASS subtitle extraction produced no dialogue events"
-                )
-                .into());
-            }
-            if tokio::fs::rename(&temp_path, &cache_path)
-                .await
-                .is_err()
-            {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-            }
-            bytes
+                .map_err(|e| anyhow!("failed to read ASS subtitle: {e}"))?
         };
 
         return Ok(Response::builder()

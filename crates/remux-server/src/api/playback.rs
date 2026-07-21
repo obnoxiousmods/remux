@@ -274,7 +274,7 @@ async fn items_playbackinfo_inner(
                     .server_input(effective_stream.id, port)
             });
         if let Some(ref input_url) = effective_url {
-            let text_sub_indices: Vec<i64> = source
+            let subtitle_plans = source
                 .media_streams
                 .iter()
                 .filter(|s| {
@@ -282,22 +282,36 @@ async fn items_playbackinfo_inner(
                         && !s.is_external
                         && s.is_text_subtitle_stream
                 })
-                .map(|s| s.index)
-                .collect();
-            if !text_sub_indices.is_empty() {
+                .map(|stream| {
+                    crate::api::subtitles::subtitle_extraction_plan(
+                        stream.index,
+                        stream
+                            .codec
+                            .as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !subtitle_plans.is_empty() {
                 let data_dir = state
                     .ctx
                     .config
                     .data_dir
                     .clone();
                 let url = input_url.clone();
+                let cache_source_id = crate::api::subtitles::subtitle_cache_source_id(
+                    &effective_stream,
+                    effective_stream
+                        .probe_data
+                        .as_ref()
+                        .and_then(|probe| probe.size),
+                );
                 tokio::spawn(
                     crate::api::subtitles::pre_extract_all_subtitles_to_cache(
                         data_dir,
                         url,
                         id,
-                        id,
-                        text_sub_indices.into_iter().map(|i| (i, true)).collect(),
+                        cache_source_id,
+                        subtitle_plans,
                     ),
                 );
             }

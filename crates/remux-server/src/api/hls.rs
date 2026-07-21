@@ -27,6 +27,22 @@ use crate::{
 static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
     crate::keyed_lock::KeyedLock::new();
 
+const PLAYBACK_START_TICKS_DATA_ID: &str = "com.remux.playback-start-ticks";
+
+fn add_playback_start_acknowledgement(
+    playlist: String,
+    start_time_ticks: Option<i64>,
+) -> String {
+    let Some(ticks) = start_time_ticks.filter(|ticks| *ticks > 0) else {
+        return playlist;
+    };
+    let acknowledgement = format!(
+        "#EXT-X-SESSION-DATA:DATA-ID=\"{}\",VALUE=\"{}\"\n",
+        PLAYBACK_START_TICKS_DATA_ID, ticks,
+    );
+    playlist.replacen("#EXTM3U\n", &format!("#EXTM3U\n{acknowledgement}"), 1)
+}
+
 /// Shared session setup: look up or create the transcode session for an HLS
 /// request. Returns the session handle and the resolved play_session_id.
 async fn create_hls_session(
@@ -550,12 +566,21 @@ pub async fn master_hls_video(
     let session_read = session
         .read()
         .await;
-    let master_playlist =
-        crate::playback::engine::generate_master_playlist(&session_read);
+    let master_playlist = add_playback_start_acknowledgement(
+        crate::playback::engine::generate_master_playlist(&session_read),
+        q.start_time_ticks,
+    );
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/vnd.apple.mpegurl")
         .header("Cache-Control", "no-cache, no-store")
+        .header(
+            "X-Remux-Playback-Start-Ticks",
+            q.start_time_ticks
+                .unwrap_or(0)
+                .max(0)
+                .to_string(),
+        )
         .body(Body::from(master_playlist))
         .unwrap())
 }
@@ -748,6 +773,28 @@ async fn variant_hls_video_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::add_playback_start_acknowledgement;
+
+    #[test]
+    fn master_playlist_acknowledges_applied_start_ticks() {
+        let playlist = add_playback_start_acknowledgement(
+            "#EXTM3U\n#EXT-X-VERSION:3\n".to_string(),
+            Some(1_543_905_219),
+        );
+        assert!(playlist.contains(
+            "#EXT-X-SESSION-DATA:DATA-ID=\"com.remux.playback-start-ticks\",VALUE=\"1543905219\""
+        ));
+    }
+
+    #[test]
+    fn master_playlist_omits_zero_start_acknowledgement() {
+        let playlist = "#EXTM3U\n#EXT-X-VERSION:3\n".to_string();
+        assert_eq!(
+            add_playback_start_acknowledgement(playlist.clone(), Some(0)),
+            playlist
+        );
+    }
+
     #[test]
     fn live_channel_forces_aac_over_copy() {
         assert_eq!(super::resolve_live_audio_codec(true, "copy"), "aac");
