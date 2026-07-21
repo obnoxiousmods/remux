@@ -19,7 +19,7 @@ pub mod ytdlp;
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, stream::FuturesUnordered};
+use futures::Stream;
 use sqlx::SqlitePool;
 use std::{
     pin::Pin,
@@ -33,7 +33,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{AppContext, api, common::ProgressReporter, db, sdks};
-pub use addon::{Addon, CatalogState};
+pub use addon::{Addon, CatalogState, set_user_addon_override, user_addon_override};
 
 pub use remux_sdks::remux::AddonPresetRef;
 use remux_sdks::remux::{LyricDto, MediaSegments, RemoteLyricInfoDto};
@@ -543,20 +543,9 @@ impl From<crate::stream::StreamInfo> for db::Media {
 pub struct AddonPresetRegistration(pub fn() -> Box<dyn AddonPreset>);
 inventory::collect!(AddonPresetRegistration);
 
-pub(super) fn make_http_client(config: &crate::Config) -> reqwest::Client {
+pub(super) fn make_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("remux-server/1.0")
-        // Bound request and connect time (operator-tunable via Config) so a
-        // stalled upstream (e.g. a hung stream-resolver worker) cannot pin a
-        // playback resolution forever and starve the resolver-concurrency
-        // budget. A timed-out request is a retryable error (see
-        // `eclipse::worker_get_json`).
-        .timeout(std::time::Duration::from_secs(
-            config.addon_http_timeout_secs,
-        ))
-        .connect_timeout(std::time::Duration::from_secs(
-            config.addon_http_connect_timeout_secs,
-        ))
         .build()
         .expect("failed to build HTTP client")
 }
@@ -944,6 +933,33 @@ impl AddonRuntime {
     }
 }
 
+/// Returns true when `runtime` should run for the given user context.
+///
+/// `override_ids = None`        → no override active; only `is_default` addons run (background
+///                                tasks and users whose addon list hasn't been customised).
+/// `override_ids = Some(ids)`   → user has a custom addon list; only those addon IDs run,
+///                                plus system addons which always run unconditionally.
+fn user_scoped(runtime: &AddonRuntime, override_ids: Option<&[Uuid]>) -> bool {
+    if runtime
+        .row
+        .system
+    {
+        return true;
+    }
+    match override_ids {
+        None => {
+            runtime
+                .row
+                .is_default
+        }
+        Some(ids) => ids.contains(
+            &runtime
+                .row
+                .id,
+        ),
+    }
+}
+
 fn kind_in_type_list(kind: &db::MediaKind, list: &[db::MediaKind]) -> bool {
     list.contains(kind)
         || (matches!(kind, db::MediaKind::Episode | db::MediaKind::Season)
@@ -1062,21 +1078,85 @@ impl PickCap<dyn SubtitleAddon> for AddonRuntime {
 }
 
 impl AddonService {
-    async fn addons_for<T>(&self, media: &db::Media) -> Vec<AddonRuntime>
+    async fn addons_for<T>(
+        &self,
+        media: &db::Media,
+        db: &SqlitePool,
+        user_id: Option<Uuid>,
+    ) -> Vec<AddonRuntime>
     where
         T: ?Sized + Send + Sync + 'static,
         AddonRuntime: PickCap<T>,
     {
-        let mut out = Vec::new();
-        for r in self
+        let override_ids = match user_id {
+            Some(uid) => match addon::user_addon_override(db, uid).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to load user addon override");
+                    return Vec::new();
+                }
+            },
+            None => None,
+        };
+        let all = self
             .inner
-            .load()
+            .load();
+        let mut out = Vec::new();
+        for r in all
             .iter()
             .filter(|r| r.supports_type(&media.kind))
+            .filter(|r| user_scoped(r, override_ids.as_deref()))
         {
             if PickCap::<T>::pick(r, media).await {
                 out.push(r.clone());
             }
+        }
+        if let Some(ids) = &override_ids {
+            out.sort_by_key(|r| {
+                ids.iter()
+                    .position(|id| {
+                        *id == r
+                            .row
+                            .id
+                    })
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        out
+    }
+
+    pub async fn list_for_user(
+        &self,
+        db: &SqlitePool,
+        user_id: Option<Uuid>,
+    ) -> Vec<AddonRuntime> {
+        let override_ids = match user_id {
+            Some(uid) => match addon::user_addon_override(db, uid).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to load user addon override");
+                    return Vec::new();
+                }
+            },
+            None => None,
+        };
+        let mut out: Vec<AddonRuntime> = self
+            .inner
+            .load()
+            .iter()
+            .filter(|r| user_scoped(r, override_ids.as_deref()))
+            .cloned()
+            .collect();
+        if let Some(ids) = &override_ids {
+            out.sort_by_key(|r| {
+                ids.iter()
+                    .position(|id| {
+                        *id == r
+                            .row
+                            .id
+                    })
+                    .unwrap_or(usize::MAX)
+            });
         }
         out
     }
@@ -1523,7 +1603,7 @@ impl AddonService {
         config: &api::ServerConfiguration,
     ) -> Result<()> {
         let applicable = self
-            .addons_for::<dyn MetaAddon>(media)
+            .addons_for::<dyn MetaAddon>(media, &ctx.db, None)
             .await;
 
         if applicable.is_empty() {
@@ -1734,17 +1814,6 @@ impl AddonService {
                         save_pending_relations(ctx, &batch).await;
                         save_pending_tags(ctx, &batch).await;
                         save_pending_popularity(ctx, &batch).await;
-                        let series_ids: Vec<_> = batch
-                            .iter()
-                            .filter(|item| item.kind == db::MediaKind::Series)
-                            .map(|item| item.id)
-                            .collect();
-                        if let Err(e) =
-                            db::Media::reconcile_series_identities(&ctx.db, &series_ids)
-                                .await
-                        {
-                            warn!(error = %e, "failed to reconcile series identities");
-                        }
                     }
                     Err(e) => error!(error = %e, "failed to upsert media batch"),
                 }
@@ -1761,17 +1830,6 @@ impl AddonService {
                     save_pending_relations(ctx, &batch).await;
                     save_pending_tags(ctx, &batch).await;
                     save_pending_popularity(ctx, &batch).await;
-                    let series_ids: Vec<_> = batch
-                        .iter()
-                        .filter(|item| item.kind == db::MediaKind::Series)
-                        .map(|item| item.id)
-                        .collect();
-                    if let Err(e) =
-                        db::Media::reconcile_series_identities(&ctx.db, &series_ids)
-                            .await
-                    {
-                        warn!(error = %e, "failed to reconcile series identities");
-                    }
                 }
                 Err(e) => error!(error = %e, "failed to upsert final media batch"),
             }
@@ -1892,7 +1950,14 @@ impl AddonService {
         query: &str,
         limit: usize,
         ctx: &AppContext,
+        user_id: Option<Uuid>,
     ) -> Result<Vec<db::Media>> {
+        let override_ids = match user_id {
+            Some(uid) => addon::user_addon_override(&ctx.db, uid)
+                .await
+                .unwrap_or(None),
+            None => None,
+        };
         let addons: Vec<AddonRuntime> = self
             .inner
             .load()
@@ -1904,6 +1969,7 @@ impl AddonService {
                         .contains(&ResourceType::Search)
                     && r.search
                         .is_some()
+                    && user_scoped(r, override_ids.as_deref())
             })
             .cloned()
             .collect();
@@ -1952,7 +2018,7 @@ impl AddonService {
         ctx: &AppContext,
     ) -> Result<Vec<crate::api::RemoteImageInfo>> {
         let addons = self
-            .addons_for::<dyn MetaAddon>(media)
+            .addons_for::<dyn MetaAddon>(media, &ctx.db, None)
             .await;
 
         let mut out = Vec::new();
@@ -1979,9 +2045,10 @@ impl AddonService {
         media: &db::Media,
         db: &SqlitePool,
         background: bool,
+        user_id: Option<Uuid>,
     ) -> Vec<SubtitleInfo> {
         let addons = self
-            .addons_for::<dyn SubtitleAddon>(media)
+            .addons_for::<dyn SubtitleAddon>(media, db, user_id)
             .await;
 
         debug!(count = addons.len(), "subtitle addons matched");
@@ -2013,108 +2080,14 @@ impl AddonService {
         subs
     }
 
-    async fn resolve_stream_addon(
-        runtime: AddonRuntime,
-        media: &db::Media,
-        ctx: &AppContext,
-    ) -> Vec<db::Media> {
-        let name = &runtime
-            .row
-            .name;
-        match runtime
-            .stream
-            .as_ref()
-            .expect("stream addon capability disappeared")
-            .get_streams(media, ctx)
-            .await
-        {
-            Ok(mut streams) => {
-                if streams.is_empty() {
-                    debug!(addon = %name, "addon: no streams");
-                } else {
-                    debug!(addon = %name, count = streams.len(), "addon: streams found");
-                    for stream in &mut streams {
-                        stream.source = Some(name.clone());
-                    }
-                }
-                streams
-                    .into_iter()
-                    .map(db::Media::from)
-                    .collect()
-            }
-            Err(error) => {
-                warn!(addon = %name, error = %error, "stream addon failed");
-                vec![]
-            }
-        }
-    }
-
-    async fn first_non_empty<T, F>(futures: impl IntoIterator<Item = F>) -> Vec<T>
-    where
-        F: std::future::Future<Output = Vec<T>>,
-    {
-        let mut pending: FuturesUnordered<F> = futures
-            .into_iter()
-            .collect();
-        while let Some(result) = pending
-            .next()
-            .await
-        {
-            if !result.is_empty() {
-                return result;
-            }
-        }
-        vec![]
-    }
-
-    async fn get_track_streams(
-        addons: Vec<AddonRuntime>,
-        media: &db::Media,
-        ctx: &AppContext,
-    ) -> Vec<db::Media> {
-        let mut start = 0;
-        while start < addons.len() {
-            let priority = addons[start]
-                .row
-                .priority;
-            let end = addons[start..]
-                .iter()
-                .position(|runtime| {
-                    runtime
-                        .row
-                        .priority
-                        != priority
-                })
-                .map_or(addons.len(), |offset| start + offset);
-            let tier = addons[start..end]
-                .iter()
-                .cloned()
-                .map(|runtime| Self::resolve_stream_addon(runtime, media, ctx));
-            let streams = Self::first_non_empty(tier).await;
-            if !streams.is_empty() {
-                debug!(
-                    priority,
-                    streams = streams.len(),
-                    "music stream tier selected"
-                );
-                return streams;
-            }
-            debug!(
-                priority,
-                "music stream tier exhausted; trying fallback tier"
-            );
-            start = end;
-        }
-        vec![]
-    }
-
     pub async fn get_streams(
         &self,
         media: &db::Media,
         ctx: &AppContext,
+        user_id: Option<Uuid>,
     ) -> Result<Vec<db::Media>> {
         let addons = self
-            .addons_for::<dyn StreamAddon>(media)
+            .addons_for::<dyn StreamAddon>(media, &ctx.db, user_id)
             .await;
 
         debug!(
@@ -2124,18 +2097,38 @@ impl AddonService {
             "resolving streams"
         );
 
-        if media.kind == db::MediaKind::Track {
-            return Ok(Self::get_track_streams(addons, media, ctx).await);
-        }
-
-        let tasks = addons
+        let tasks: Vec<_> = addons
             .into_iter()
-            .map(|runtime| Self::resolve_stream_addon(runtime, media, ctx));
-        Ok(futures::future::join_all(tasks)
+            .map(|r| async move {
+                let name = &r.row.name;
+                match r.stream.as_ref().unwrap().get_streams(media, ctx).await {
+                    Ok(mut streams) => {
+                        if streams.is_empty() {
+                            debug!(addon = %name, "addon: no streams");
+                        } else {
+                            debug!(addon = %name, count = streams.len(), "addon: streams found");
+                            let addon_id = r.row.id;
+                            for s in &mut streams {
+                                s.source = Some(name.clone());
+                                s.addon_id = Some(addon_id);
+                            }
+                        }
+                        streams
+                    }
+                    Err(e) => {
+                        warn!(addon = %name, error = %e, "stream addon failed");
+                        vec![]
+                    }
+                }
+            })
+            .collect();
+        let all: Vec<db::Media> = futures::future::join_all(tasks)
             .await
             .into_iter()
             .flatten()
-            .collect())
+            .map(db::Media::from)
+            .collect();
+        Ok(all)
     }
 
     fn stream_dedup_key(s: &db::Media) -> Option<String> {
@@ -2171,6 +2164,7 @@ impl AddonService {
         &self,
         media: &mut db::Media,
         ctx: &AppContext,
+        user_id: Option<Uuid>,
     ) -> Result<()> {
         const STREAMS_TTL_SECS: i64 = 60;
         static STREAM_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
@@ -2207,7 +2201,7 @@ impl AddonService {
 
         let instant = Instant::now();
         let raw = self
-            .get_streams(media, ctx)
+            .get_streams(media, ctx, user_id)
             .await?;
         debug!(raw_count = raw.len(), "raw streams fetched");
 
@@ -2490,32 +2484,6 @@ pub fn make_media_id(addon_id: Uuid, local_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{FutureExt, future::BoxFuture};
-
-    #[tokio::test]
-    async fn first_successful_stream_result_does_not_wait_for_slower_addons() {
-        let tasks: Vec<BoxFuture<'static, Vec<i32>>> = vec![
-            futures::future::pending().boxed(),
-            async { vec![42] }.boxed(),
-        ];
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(100),
-            AddonService::first_non_empty(tasks),
-        )
-        .await
-        .expect("successful provider should cancel the unfinished provider");
-
-        assert_eq!(result, vec![42]);
-    }
-
-    #[tokio::test]
-    async fn empty_stream_results_allow_another_provider_to_win() {
-        let tasks: Vec<BoxFuture<'static, Vec<i32>>> =
-            vec![async { vec![] }.boxed(), async { vec![7] }.boxed()];
-
-        assert_eq!(AddonService::first_non_empty(tasks).await, vec![7]);
-    }
 
     fn make_image(path: &str) -> db::MediaImage {
         db::MediaImage {

@@ -121,6 +121,11 @@ async fn items_playbackinfo_inner(
                 p.stream_filter
                     .clone()
             }),
+        user_id: Some(
+            session
+                .user
+                .id,
+        ),
     });
     let is_live = media.is_live();
     let is_track_item = media.is_track();
@@ -269,7 +274,7 @@ async fn items_playbackinfo_inner(
                     .server_input(effective_stream.id, port)
             });
         if let Some(ref input_url) = effective_url {
-            let text_sub_streams: Vec<(i64, bool)> = source
+            let text_sub_indices: Vec<i64> = source
                 .media_streams
                 .iter()
                 .filter(|s| {
@@ -277,40 +282,21 @@ async fn items_playbackinfo_inner(
                         && !s.is_external
                         && s.is_text_subtitle_stream
                 })
-                .map(|s| {
-                    let preserve_ass = s
-                        .codec
-                        .as_deref()
-                        .map(|codec| {
-                            matches!(
-                                codec
-                                    .to_ascii_lowercase()
-                                    .as_str(),
-                                "ass" | "ssa"
-                            )
-                        })
-                        .unwrap_or(false);
-                    (s.index, preserve_ass)
-                })
+                .map(|s| s.index)
                 .collect();
-            if !text_sub_streams.is_empty() {
+            if !text_sub_indices.is_empty() {
                 let data_dir = state
                     .ctx
                     .config
                     .data_dir
                     .clone();
                 let url = input_url.clone();
-                let cache_source_id = crate::api::subtitles::subtitle_cache_source_id(
-                    &effective_stream,
-                    source.size,
-                );
                 tokio::spawn(
                     crate::api::subtitles::pre_extract_all_subtitles_to_cache(
                         data_dir,
                         url,
                         id,
-                        cache_source_id,
-                        text_sub_streams,
+                        text_sub_indices,
                     ),
                 );
             }
@@ -428,6 +414,11 @@ async fn items_playbackinfo_inner(
                 .device
                 .access_token,
             sub_langs,
+            Some(
+                session
+                    .user
+                    .id,
+            ),
         )
         .await;
     }
@@ -510,7 +501,7 @@ async fn items_playbackinfo_inner(
 /// The `Range` header is forwarded to the upstream server. If no `Range` is provided,
 /// the full video is sent.
 ///
-#[get("/items/{id}/file")]
+#[get("/items/{id}/file", "/items/{id}/download")]
 pub async fn items_file(
     headers: headers::HeaderMap,
     State(state): State<AppState>,
@@ -518,53 +509,7 @@ pub async fn items_file(
     Query(mut q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
     q.static_ = Some(true);
-    // Match Jellyfin's GetFile behavior: range-enabled original bytes with the
-    // real media Content-Type and no Content-Disposition override. In
-    // particular, do not label audio as an attachment ending in `.mkv` —
-    // AVFoundation clients use that metadata when selecting a decoder.
-    videos_stream_inner(headers, state, id, q).await
-}
-
-fn extension_for_content_type(
-    content_type: Option<&http::HeaderValue>,
-) -> &'static str {
-    match content_type
-        .and_then(|value| {
-            value
-                .to_str()
-                .ok()
-        })
-        .and_then(|value| {
-            value
-                .split(';')
-                .next()
-        })
-        .map(str::trim)
-    {
-        Some("audio/flac") => "flac",
-        Some("audio/mpeg") => "mp3",
-        Some("audio/mp4") => "m4a",
-        Some("audio/aac") => "aac",
-        Some("audio/ogg") => "ogg",
-        Some("audio/opus") => "opus",
-        Some("audio/wav") | Some("audio/wave") | Some("audio/x-wav") => "wav",
-        Some("video/mp4") => "mp4",
-        Some("video/webm") => "webm",
-        Some("video/x-matroska") => "mkv",
-        Some("video/mp2t") => "ts",
-        _ => "bin",
-    }
-}
-
-#[get("/items/{id}/download")]
-pub async fn items_download(
-    headers: headers::HeaderMap,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Query(mut q): Query<api::VideoStreamQuery>,
-) -> Result<impl IntoResponse> {
-    q.static_ = Some(true);
-    let item = db::Media::get_by_id(
+    let filename = db::Media::get_by_id(
         &state
             .ctx
             .db,
@@ -572,39 +517,19 @@ pub async fn items_download(
     )
     .await
     .ok()
-    .flatten();
-    let explicit_filename = item
-        .as_ref()
-        .and_then(|media| {
-            media
-                .stream_info
-                .as_ref()
-        })
-        .and_then(|stream| {
-            stream
-                .filename
-                .clone()
-        });
-    let title = item
-        .map(|media| media.title)
-        .unwrap_or_else(|| "download".to_string());
-    let mut response = videos_stream_inner(headers, state, id, q)
-        .await?
-        .into_response();
-    let filename = explicit_filename.unwrap_or_else(|| {
-        format!(
-            "{}.{}",
-            title,
-            extension_for_content_type(
-                response
-                    .headers()
-                    .get(http::header::CONTENT_TYPE)
-            )
-        )
-    });
+    .flatten()
+    .map(|m| {
+        m.stream_info
+            .and_then(|si| si.filename)
+            .unwrap_or_else(|| format!("{}.mkv", m.title))
+    })
+    .unwrap_or_else(|| "download.mkv".to_string());
     let safe = filename
         .replace('"', "")
         .replace('\\', "");
+    let mut response = videos_stream_inner(headers, state, id, q)
+        .await?
+        .into_response();
     if let Ok(val) =
         http::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", safe))
     {
@@ -939,7 +864,6 @@ async fn videos_stream_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::extension_for_content_type;
     use http::{StatusCode, header::HeaderValue};
     use serde_json::json;
 
@@ -947,85 +871,6 @@ mod tests {
         AUTH_HEADER, auth_header_with_token, authenticated_server, insert_test_source,
         new_test_server,
     };
-
-    #[test]
-    fn download_extension_follows_response_media_type() {
-        assert_eq!(
-            extension_for_content_type(Some(&HeaderValue::from_static("audio/flac"))),
-            "flac"
-        );
-        assert_eq!(
-            extension_for_content_type(Some(&HeaderValue::from_static(
-                "audio/mp4; charset=binary"
-            ))),
-            "m4a"
-        );
-        assert_eq!(extension_for_content_type(None), "bin");
-    }
-
-    #[tokio::test]
-    async fn file_is_inline_codec_correct_while_download_is_attachment() {
-        let (server, guard, token) = authenticated_server().await;
-        let auth = auth_header_with_token(&token);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join("paramore.flac");
-        std::fs::write(&path, b"0123456789").unwrap();
-
-        let mut source = crate::db::Media {
-            title: "C'est Comme Ca".to_string(),
-            kind: crate::db::MediaKind::Stream,
-            stream_info: Some(crate::stream::StreamInfo {
-                descriptor: crate::stream::StreamDescriptor::Local(path),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        source
-            .save(
-                &guard
-                    .0
-                    .db,
-            )
-            .await
-            .unwrap();
-
-        let file = server
-            .get(&format!("/items/{}/file", source.id))
-            .add_header(
-                http::header::AUTHORIZATION,
-                HeaderValue::from_str(&auth).unwrap(),
-            )
-            .add_header(http::header::RANGE, HeaderValue::from_static("bytes=2-5"))
-            .await;
-        file.assert_status(StatusCode::PARTIAL_CONTENT);
-        file.assert_header(http::header::CONTENT_TYPE, "audio/flac");
-        assert!(
-            file.maybe_header(http::header::CONTENT_DISPOSITION)
-                .is_none()
-        );
-        assert_eq!(&file.as_bytes()[..], b"2345");
-
-        let download = server
-            .get(&format!("/items/{}/download", source.id))
-            .add_header(
-                http::header::AUTHORIZATION,
-                HeaderValue::from_str(&auth).unwrap(),
-            )
-            .add_header(http::header::RANGE, HeaderValue::from_static("bytes=0-1"))
-            .await;
-        download.assert_status(StatusCode::PARTIAL_CONTENT);
-        download.assert_header(http::header::CONTENT_TYPE, "audio/flac");
-        assert_eq!(
-            download
-                .header(http::header::CONTENT_DISPOSITION)
-                .to_str()
-                .unwrap(),
-            "attachment; filename=\"C'est Comme Ca.flac\""
-        );
-        assert_eq!(&download.as_bytes()[..], b"01");
-    }
 
     #[tokio::test]
     async fn test_playback_start() {
@@ -2805,33 +2650,6 @@ mod tests {
             "Client's explicit AudioStreamIndex must prevent language preference from selecting Dutch (index 1)"
         );
     }
-
-    #[tokio::test]
-    async fn playback_info_initializes_jellyfin_media_source_collections() {
-        let (server, guard, token) = authenticated_server().await;
-        let auth = auth_header_with_token(&token);
-        let media = insert_test_source(&guard.0).await;
-
-        let response = server
-            .post(&format!("/items/{}/playbackinfo", media.id))
-            .add_header(
-                http::header::AUTHORIZATION,
-                HeaderValue::from_str(&auth).unwrap(),
-            )
-            .json(&json!({}))
-            .await;
-        response.assert_status_ok();
-        let body: serde_json::Value = response.json();
-        let source = &body["MediaSources"][0];
-
-        assert!(source["MediaStreams"].is_array());
-        assert!(source["MediaAttachments"].is_array());
-        assert!(source["Formats"].is_array());
-        assert!(source["RequiredHttpHeaders"].is_object());
-        assert_eq!(source["SupportsTranscoding"], true);
-        assert_eq!(source["SupportsDirectStream"], true);
-        assert_eq!(source["SupportsDirectPlay"], true);
-    }
 }
 
 /// Returns additional parts for a multi-file video item.
@@ -2851,16 +2669,30 @@ pub async fn audio_universal(
     Path(id): Path<Uuid>,
     Query(q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
-    // `/Audio/{id}/universal` must serve AUDIO. The previous implementation
-    // redirected into the *video* HLS pipeline
-    // (`/videos/{id}/master.m3u8?VideoCodec=copy&AudioCodec=aac`), so a music
-    // client asking for a track received a video manifest for an audio-only item
-    // and playback failed or misbehaved. Redirect instead to the range-capable
-    // direct audio stream — the exact source `PlaybackInfo` advertises as
-    // `SupportsDirectPlay=true`. `/audio/{id}/stream` resolves the source itself
-    // (including refreshing addon-backed streams), so no extra fetch is needed
-    // here. Clients that genuinely cannot decode the source negotiate a transcode
-    // through `PlaybackInfo`'s `TranscodingUrl`, not through this redirect.
+    let mut media = db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &id,
+    )
+    .await?
+    .context_not_found("track not found")?;
+
+    state
+        .ctx
+        .addons
+        .refresh_streams(
+            &mut media,
+            &state.ctx,
+            Some(
+                session
+                    .user
+                    .id,
+            ),
+        )
+        .await
+        .inspect_err(|e| error!("refresh_streams failed: {e:#}"));
+
     let play_session_id = q
         .play_session_id
         .unwrap_or_else(|| {
@@ -2868,21 +2700,18 @@ pub async fn audio_universal(
                 .as_simple()
                 .to_string()
         });
-    let media_source_id = q
-        .media_source_id
-        .unwrap_or(id);
 
-    let stream_url = format!(
-        "/audio/{}/stream?static=true&MediaSourceId={}&PlaySessionId={}&api_key={}",
+    let transcoding_url = format!(
+        "/videos/{}/master.m3u8?PlaySessionId={}&MediaSourceId={}&VideoCodec=copy&AudioCodec=aac&ApiKey={}",
         id,
-        media_source_id,
         play_session_id,
+        id,
         session
             .device
             .access_token
     );
 
-    Ok(axum::response::Redirect::temporary(&stream_url).into_response())
+    Ok(axum::response::Redirect::temporary(&transcoding_url).into_response())
 }
 
 /// Bitrate test endpoint - returns a body of the requested size for bandwidth measurement.
