@@ -388,12 +388,11 @@ impl StreamService {
                 false,
             )
         } else if requested_id.is_some() {
-            // media_source_id == item_id (Android TV auto-play) or stream not found:
-            // return only the first stream; specific_requested stays false so
-            // source[0].id is overridden to item_id below (required for Android TV routing).
-            let mut v = all_streams;
-            v.truncate(1);
-            (v, false)
+            // media_source_id == item_id is an Android TV/Jellyfin auto-play pattern,
+            // but it is not a request for one specific version. Keep every source so
+            // clients can display the version picker; playbackinfo still rewrites the
+            // first source ID to item_id for auto-play compatibility.
+            (all_streams, true)
         } else {
             // No stream ID: return all versions for the selection UI,
             // probe only the first to avoid spawning N FFmpeg processes.
