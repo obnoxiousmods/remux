@@ -1346,6 +1346,11 @@ async fn run_ffmpeg(
     if pid > 0 {
         let _ = std::fs::write(output_dir.join(".pid"), pid.to_string());
     }
+    info!(
+        ffmpeg_pid = pid,
+        output_dir = %output_dir.display(),
+        "HLS ffmpeg process started"
+    );
     let stderr = child
         .stderr
         .take();
@@ -1609,7 +1614,13 @@ pub async fn start_transcode(
                         .send(TranscodeState::Error(err_msg));
                 }
                 None => {
-                    debug!(session_id = %s.id, "ffmpeg killed by session stop");
+                    debug!(
+                        session_id = %s.id,
+                        session_age_ms = s.created_at.elapsed().as_millis(),
+                        playlist_exists = s.variant_playlist_path().exists(),
+                        stderr = %stderr_out.trim(),
+                        "ffmpeg killed by session stop"
+                    );
                 }
             }
 

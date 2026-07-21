@@ -634,6 +634,7 @@ async fn variant_hls_video_inner(
         .await;
     let is_live = session_read.is_live;
     let playlist_path = session_read.variant_playlist_path();
+    let session_created_at = session_read.created_at;
     let psid = session_read
         .id
         .clone();
@@ -654,6 +655,7 @@ async fn variant_hls_video_inner(
         // poll EVENT playlists, so serving the header lets the decoder mount
         // one segment earlier without inventing boundaries ffmpeg will never
         // create.
+        let playlist_wait_started_at = std::time::Instant::now();
         let content = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if let Ok(text) = tokio::fs::read_to_string(&playlist_path).await {
@@ -672,12 +674,35 @@ async fn variant_hls_video_inner(
         // other strict HLS clients; a 503 lets the client's playlist loader
         // back off and retry until the transcode writes its header.
         if content.is_empty() {
+            let session_state = session
+                .read()
+                .await
+                .state
+                .clone();
+            warn!(
+                play_session_id = %play_session_id,
+                session_age_ms = session_created_at.elapsed().as_millis(),
+                playlist_wait_ms = playlist_wait_started_at.elapsed().as_millis(),
+                playlist_path = %playlist_path.display(),
+                ?session_state,
+                "HLS child playlist not ready before startup deadline"
+            );
             return Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header("Retry-After", "1")
+                .header("X-Remux-Hls-Startup-State", "playlist-not-ready")
                 .body(Body::empty())
                 .unwrap());
         }
+
+        info!(
+            play_session_id = %play_session_id,
+            session_age_ms = session_created_at.elapsed().as_millis(),
+            playlist_wait_ms = playlist_wait_started_at.elapsed().as_millis(),
+            playlist_bytes = content.len(),
+            has_first_segment = content.contains("#EXTINF:"),
+            "HLS child playlist ready"
+        );
 
         // For non-live VOD sessions: once ffmpeg finishes it appends
         // #EXT-X-ENDLIST and the playlist type stays as EVENT. Upgrade
