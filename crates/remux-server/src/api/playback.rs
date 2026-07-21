@@ -296,7 +296,8 @@ async fn items_playbackinfo_inner(
                         data_dir,
                         url,
                         id,
-                        text_sub_indices,
+                        id,
+                        text_sub_indices.into_iter().map(|i| (i, true)).collect(),
                     ),
                 );
             }

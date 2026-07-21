@@ -207,7 +207,7 @@ impl StreamService {
                 // of reading an empty or expired cached source indefinitely.
                 if requested_id.is_none() || requested_id == Some(item_id) {
                     ctx.addons
-                        .refresh_streams(&mut media, ctx)
+                        .refresh_streams(&mut media, ctx, None)
                         .await
                         .inspect_err(|error| {
                             tracing::error!(

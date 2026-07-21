@@ -79,7 +79,7 @@ fn eclipse_from_cfg(
         .to_string();
     let manifest_url = StremioManifestUrl::try_new(raw_url)
         .map_err(|e| anyhow!("Invalid manifest_url: {e}"))?;
-    let client = super::make_http_client(config);
+    let client = super::make_http_client();
     let addon = Arc::new(EclipseAddon {
         manifest_url,
         client,
