@@ -441,6 +441,7 @@ async fn create_hls_session(
                 .await
                 .source_audio_codec
                 .clone(),
+            source_frame_rate,
             hardware_acceleration_type: encoding_opts
                 .hardware_acceleration_type
                 .unwrap_or_default(),
@@ -1068,6 +1069,10 @@ async fn hls_segment_inner(
                             .await
                             .source_audio_codec
                             .clone(),
+                        source_frame_rate: session
+                            .read()
+                            .await
+                            .source_frame_rate,
                         hardware_acceleration_type: encoding_opts
                             .hardware_acceleration_type
                             .unwrap_or_default(),

@@ -473,6 +473,10 @@ pub struct TranscodeParams {
     /// Codec of the source audio stream (e.g. "aac", "ac3"), used to apply
     /// codec-specific bitstream filters such as `aac_adtstoasc` when copying.
     pub source_audio_codec: Option<String>,
+    /// Effective frame rate of the selected source video stream. NVENC needs an
+    /// explicit frame-based GOP in addition to timestamp-forced keyframes so
+    /// the HLS muxer can finalize segments while a remote VOD is still open.
+    pub source_frame_rate: Option<f32>,
     pub hardware_acceleration_type: HardwareAccelerationType,
     /// VAAPI render device path.
     pub vaapi_device: String,
@@ -525,6 +529,7 @@ impl Default for TranscodeParams {
             encoding_preset: None,
             source_video_codec: None,
             source_audio_codec: None,
+            source_frame_rate: None,
             hardware_acceleration_type: HardwareAccelerationType::None,
             vaapi_device: "/dev/dri/renderD128".to_string(),
             vaapi_driver: String::new(),
@@ -546,6 +551,27 @@ impl Default for TranscodeParams {
 /// Return the expected output video dimensions based on transcode params.
 fn output_dimensions(params: &TranscodeParams) -> (Option<u32>, Option<u32>) {
     (params.max_width, params.max_height)
+}
+
+/// Calculate an NVENC GOP matching the requested HLS segment duration.
+///
+/// Remote probes do not always provide a usable frame rate. Fall back to 30
+/// fps in that case; timestamp-based `-force_key_frames` remains the authority
+/// for the exact wall-clock boundary.
+fn nvenc_hls_gop_size(frame_rate: Option<f32>, segment_length: u32) -> u32 {
+    const FALLBACK_FRAME_RATE: f32 = 30.0;
+    const MAX_REASONABLE_FRAME_RATE: f32 = 240.0;
+
+    let frame_rate = frame_rate
+        .filter(|rate| {
+            rate.is_finite() && *rate >= 1.0 && *rate <= MAX_REASONABLE_FRAME_RATE
+        })
+        .unwrap_or(FALLBACK_FRAME_RATE);
+    let segment_length = segment_length.max(1);
+
+    (frame_rate * segment_length as f32)
+        .round()
+        .max(1.0) as u32
 }
 
 /// Return the ffmpeg input args that enable hardware-accelerated decoding.
@@ -1099,6 +1125,8 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             // between scale_cuda/tonemap_cuda and NVENC, and that filter cannot
             // cross the hardware-frame boundary. Non-CUDA hardware paths already
             // select their accepted surface format in their filter suffix.
+            let gop_size =
+                nvenc_hls_gop_size(params.source_frame_rate, params.segment_length);
             args.extend([
                 "-profile:v".into(),
                 "high".into(),
@@ -1120,6 +1148,16 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
                 params
                     .h264_crf
                     .to_string(),
+                // FFmpeg 8's h264_nvenc path does not reliably honour
+                // expression-only forced keyframes. Without an explicit GOP,
+                // a remote VOD can become one file-sized HLS segment that is
+                // not published until EOF.
+                "-g".into(),
+                gop_size.to_string(),
+                "-keyint_min".into(),
+                gop_size.to_string(),
+                "-forced-idr".into(),
+                "1".into(),
             ]);
             // Treat the client's bitrate as a ceiling, not a CBR target.
             if let Some(bitrate) = params.video_bitrate {
@@ -3083,6 +3121,7 @@ mod tests {
         let args = build_hls_args(&TranscodeParams {
             video_codec: "libx264".into(),
             hardware_acceleration_type: HardwareAccelerationType::Nvenc,
+            source_frame_rate: Some(23.976_025),
             ..default_hls(dir)
         });
 
@@ -3103,10 +3142,50 @@ mod tests {
         );
         assert_eq!(arg_after(&args, "-profile:v"), Some("high"));
         assert_eq!(arg_after(&args, "-preset"), Some("p1"));
+        assert_eq!(arg_after(&args, "-g"), Some("144"));
+        assert_eq!(arg_after(&args, "-keyint_min"), Some("144"));
+        assert_eq!(arg_after(&args, "-forced-idr"), Some("1"));
+        assert_eq!(
+            arg_after(&args, "-force_key_frames"),
+            Some("expr:gte(t,n_forced*6)")
+        );
         assert!(
-            !args.iter().any(|arg| arg == "-copyts"),
+            !args
+                .iter()
+                .any(|arg| arg == "-copyts"),
             "transcoded HLS must start on a fresh output timeline"
         );
+    }
+
+    #[test]
+    fn hls_nvenc_uses_safe_gop_when_remote_frame_rate_is_missing_or_invalid() {
+        for frame_rate in [None, Some(0.0), Some(f32::NAN), Some(241.0)] {
+            let args = build_hls_args(&TranscodeParams {
+                video_codec: "libx264".into(),
+                hardware_acceleration_type: HardwareAccelerationType::Nvenc,
+                source_frame_rate: frame_rate,
+                ..default_hls(PathBuf::from("/tmp/test_nvenc_fallback_gop"))
+            });
+
+            assert_eq!(arg_after(&args, "-g"), Some("180"));
+            assert_eq!(arg_after(&args, "-keyint_min"), Some("180"));
+            assert_eq!(arg_after(&args, "-forced-idr"), Some("1"));
+        }
+    }
+
+    #[test]
+    fn hls_non_nvenc_paths_do_not_receive_nvenc_only_gop_flags() {
+        for video_codec in ["copy", "libx264"] {
+            let args = build_hls_args(&TranscodeParams {
+                video_codec: video_codec.into(),
+                source_frame_rate: Some(60.0),
+                ..default_hls(PathBuf::from("/tmp/test_non_nvenc_gop"))
+            });
+
+            assert_eq!(arg_after(&args, "-g"), None);
+            assert_eq!(arg_after(&args, "-keyint_min"), None);
+            assert_eq!(arg_after(&args, "-forced-idr"), None);
+        }
     }
 
     #[test]
