@@ -1081,13 +1081,13 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         }
     } else if is_hw {
         if ffmpeg_video_codec == "h264_nvenc" {
-            // h264_nvenc is 8-bit only. Without an explicit output format a 10-bit
-            // source (HDR/HEVC) reaches the encoder unconverted and NVENC rejects
-            // it with "No capable devices found", which then looks like a hardware
-            // fault and downgrades the session to libx264.
+            // h264_nvenc is 8-bit only. The CUDA-native filter chain above owns
+            // conversion to an 8-bit surface. Do not also pass `-pix_fmt` here:
+            // for CUDA hardware frames FFmpeg inserts a software `auto_scale`
+            // between scale_cuda/tonemap_cuda and NVENC, and that filter cannot
+            // cross the hardware-frame boundary. Non-CUDA hardware paths already
+            // select their accepted surface format in their filter suffix.
             args.extend([
-                "-pix_fmt".into(),
-                "yuv420p".into(),
                 "-profile:v".into(),
                 "high".into(),
                 "-preset".into(),
@@ -3071,13 +3071,12 @@ mod tests {
             "NVDEC frames must remain on the GPU through format conversion"
         );
         assert_eq!(arg_after(&args, "-c:v"), Some("h264_nvenc"));
-        // h264_nvenc cannot encode 10-bit. Omitting the output format lets a
-        // 10-bit HDR source reach the encoder, which fails with "No capable
-        // devices found" and silently downgrades the session to libx264.
+        // CUDA filters own the 8-bit surface conversion. A separate output
+        // pixel-format request inserts an incompatible software auto_scale.
         assert_eq!(
             arg_after(&args, "-pix_fmt"),
-            Some("yuv420p"),
-            "NVENC must pin an 8-bit output format"
+            None,
+            "NVENC must consume the CUDA filter's hardware surface directly"
         );
         assert_eq!(arg_after(&args, "-profile:v"), Some("high"));
         assert_eq!(arg_after(&args, "-preset"), Some("p1"));
