@@ -662,6 +662,18 @@ async fn variant_hls_video_inner(
         .await
         .unwrap_or_default();
 
+        // FFmpeg has not published a playlist entry within the bounded wait.
+        // A 200 with an empty body is a terminal parser failure for Media3 and
+        // other strict HLS clients; a 503 lets the client's playlist loader
+        // back off and retry until the transcode writes its first segment.
+        if content.is_empty() {
+            return Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Retry-After", "1")
+                .body(Body::empty())
+                .unwrap());
+        }
+
         // For non-live VOD sessions: once ffmpeg finishes it appends
         // #EXT-X-ENDLIST and the playlist type stays as EVENT. Upgrade
         // EVENT→VOD so hls.js treats the stream as a completed VOD rather than
