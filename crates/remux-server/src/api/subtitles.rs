@@ -9,13 +9,65 @@ use http::{Response, StatusCode};
 use remux_macros::get;
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{LazyLock, Mutex, OnceLock},
 };
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::{AppState, IntoApiError, OptionExt, ResultExt, api, db, db::auth};
+use crate::{
+    AppState, IntoApiError, OptionExt, ResultExt, api, db, db::auth,
+    keyed_lock::KeyedLock,
+};
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SubtitleArtifactKind {
+    NormalizedText,
+    RawAss,
+    RawBinary,
+}
+
+type SubtitleArtifactKey = (Uuid, Uuid, i64, SubtitleArtifactKind);
+
+static SUBTITLE_ARTIFACT_LOCKS: KeyedLock<SubtitleArtifactKey> = KeyedLock::new();
+static SUBTITLE_EXTRACTION_CAPACITY: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(2));
+static SUBTITLE_RECENT_FAILURES: LazyLock<
+    Mutex<HashMap<SubtitleArtifactKey, std::time::Instant>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const SUBTITLE_FAILURE_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+fn subtitle_failure_is_cooling_down(key: &SubtitleArtifactKey) -> bool {
+    let mut failures = SUBTITLE_RECENT_FAILURES
+        .lock()
+        .unwrap();
+    failures.retain(|_, failed_at| failed_at.elapsed() < SUBTITLE_FAILURE_COOLDOWN);
+    failures.contains_key(key)
+}
+
+fn subtitle_error_is_transient(error: &anyhow::Error) -> bool {
+    let detail = error.to_string();
+    detail.contains("429 Too Many Requests")
+        || detail.contains("Server returned 429")
+        || detail.contains("timed out")
+}
+
+fn record_transient_subtitle_failure(key: SubtitleArtifactKey, error: &anyhow::Error) {
+    if subtitle_error_is_transient(error) {
+        SUBTITLE_RECENT_FAILURES
+            .lock()
+            .unwrap()
+            .insert(key, std::time::Instant::now());
+    }
+}
+
+fn clear_subtitle_failure(key: &SubtitleArtifactKey) {
+    SUBTITLE_RECENT_FAILURES
+        .lock()
+        .unwrap()
+        .remove(key);
+}
 
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into())
@@ -120,7 +172,8 @@ pub(crate) fn subtitle_extraction_plan(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_valid_ass_document, subtitle_cache_source_id, subtitle_extraction_plan,
+        is_valid_ass_document, subtitle_cache_source_id,
+        subtitle_extraction_error_response, subtitle_extraction_plan,
     };
     use crate::{db, stream};
     use uuid::Uuid;
@@ -182,6 +235,32 @@ mod tests {
             assert!(!subtitle_extraction_plan(3, codec).preserve_raw_ass);
         }
     }
+
+    #[test]
+    fn transient_extraction_failures_are_retryable() {
+        let response = subtitle_extraction_error_response(&anyhow::anyhow!(
+            "Error opening input files: Server returned 429 Too Many Requests"
+        ));
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("Retry-After")
+                .unwrap(),
+            "5"
+        );
+
+        let response = subtitle_extraction_error_response(&anyhow::anyhow!(
+            "unsupported subtitle codec"
+        ));
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response
+                .headers()
+                .get("Retry-After")
+                .is_none()
+        );
+    }
 }
 
 /// Extract an embedded subtitle stream to the SRT cache and return the cache path.
@@ -221,6 +300,10 @@ pub(crate) async fn extract_subtitle_to_cache(
         }
     }
 
+    let _capacity = SUBTITLE_EXTRACTION_CAPACITY
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("subtitle extraction capacity closed"))?;
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.kill_on_drop(true);
     cmd.args([
@@ -307,6 +390,10 @@ async fn extract_raw_ass_to_cache(
         "{item_id}_{cache_source_id}_{stream_index}_{}.tmp.ass",
         Uuid::new_v4()
     ));
+    let _capacity = SUBTITLE_EXTRACTION_CAPACITY
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("subtitle extraction capacity closed"))?;
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.kill_on_drop(true);
     cmd.args([
@@ -365,6 +452,113 @@ async fn extract_raw_ass_to_cache(
         anyhow::bail!("failed to publish ASS subtitle cache entry: {error}");
     }
     Ok(cache_path)
+}
+
+async fn extract_binary_subtitle_to_cache(
+    cache_dir: &std::path::Path,
+    input_url: &str,
+    map_spec: &str,
+    item_id: Uuid,
+    cache_source_id: Uuid,
+    stream_index: i64,
+    output_format: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    tokio::fs::create_dir_all(cache_dir)
+        .await
+        .map_err(|e| anyhow!("failed to create subtitle cache dir: {e}"))?;
+    let extension = match output_format {
+        "sup" | "pgssub" => "sup",
+        other => anyhow::bail!("unsupported binary subtitle format: {other}"),
+    };
+    let cache_path = cache_dir.join(format!(
+        "{item_id}_{cache_source_id}_{stream_index}.{extension}"
+    ));
+    if tokio::fs::metadata(&cache_path)
+        .await
+        .ok()
+        .is_some_and(|m| m.len() > 0)
+    {
+        return Ok(cache_path);
+    }
+    let temp_path = cache_dir.join(format!(
+        "{item_id}_{cache_source_id}_{stream_index}_{}.tmp.{extension}",
+        Uuid::new_v4()
+    ));
+    let _capacity = SUBTITLE_EXTRACTION_CAPACITY
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("subtitle extraction capacity closed"))?;
+    let mut cmd = tokio::process::Command::new(ffmpeg_bin());
+    cmd.kill_on_drop(true);
+    cmd.args([
+        "-y",
+        "-nostdin",
+        "-copyts",
+        "-i",
+        input_url,
+        "-map",
+        map_spec,
+        "-an",
+        "-vn",
+        "-c:s",
+        "copy",
+        "-f",
+        "sup",
+        temp_path
+            .to_str()
+            .ok_or_else(|| anyhow!("invalid binary subtitle cache path"))?,
+    ]);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+    let output =
+        tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
+            .await
+            .map_err(|_| anyhow!("binary subtitle extraction timed out"))?
+            .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
+    if !output
+        .status
+        .success()
+    {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        anyhow::bail!(
+            "binary subtitle extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if !tokio::fs::metadata(&temp_path)
+        .await
+        .ok()
+        .is_some_and(|m| m.len() > 0)
+    {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        anyhow::bail!("binary subtitle extraction produced empty output");
+    }
+    if let Err(error) = tokio::fs::rename(&temp_path, &cache_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        anyhow::bail!("failed to publish binary subtitle cache entry: {error}");
+    }
+    Ok(cache_path)
+}
+
+fn subtitle_extraction_error_response(error: &anyhow::Error) -> Response<Body> {
+    let transient = subtitle_error_is_transient(error);
+    let mut response = Response::builder().status(if transient {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    });
+    if transient {
+        response = response.header("Retry-After", "5");
+    }
+    response
+        .header("Cache-Control", "no-store")
+        .body(Body::from(if transient {
+            "subtitle source temporarily unavailable"
+        } else {
+            "subtitle extraction failed"
+        }))
+        .unwrap()
 }
 
 /// Pre-extract all embedded text subtitle streams for a media source in one FFmpeg pass.
@@ -459,6 +653,20 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
         .iter()
         .any(|(_, srt_output, _)| srt_output.is_some())
     {
+        let _capacity = match SUBTITLE_EXTRACTION_CAPACITY
+            .acquire()
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(%item_id, %cache_source_id, "subtitle extraction capacity closed");
+                batch_extraction_map()
+                    .lock()
+                    .unwrap()
+                    .remove(&extraction_key);
+                return;
+            }
+        };
         let mut cmd = tokio::process::Command::new(ffmpeg_bin());
         cmd.kill_on_drop(true);
         // -y: overwrite without prompting (hangs forever waiting for stdin otherwise)
@@ -789,6 +997,15 @@ pub async fn subtitles_stream(
     // ASS/SSA must bypass the SRT cache. Converting to SRT destroys styles,
     // drawings, transforms, and karaoke effects that client renderers need.
     if matches!(output_format.as_str(), "ass" | "ssa") {
+        let artifact_key = (
+            item_id,
+            cache_source_id,
+            stream_index,
+            SubtitleArtifactKind::RawAss,
+        );
+        let _artifact_guard = SUBTITLE_ARTIFACT_LOCKS
+            .lock(artifact_key)
+            .await;
         let cache_dir = state
             .ctx
             .config
@@ -829,7 +1046,12 @@ pub async fn subtitles_stream(
             debug!(%item_id, %media_source_id, stream_index, "raw ASS subtitle cache hit");
             bytes
         } else {
-            let published_path = extract_raw_ass_to_cache(
+            if subtitle_failure_is_cooling_down(&artifact_key) {
+                return Ok(subtitle_extraction_error_response(&anyhow!(
+                    "subtitle extraction timed out during retry cooldown"
+                )));
+            }
+            let published_path = match extract_raw_ass_to_cache(
                 &cache_dir,
                 &url,
                 &map_spec,
@@ -837,7 +1059,16 @@ pub async fn subtitles_stream(
                 cache_source_id,
                 stream_index,
             )
-            .await?;
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    record_transient_subtitle_failure(artifact_key, &error);
+                    error!(%item_id, stream_index, %map_spec, "ASS subtitle extraction failed: {error}");
+                    return Ok(subtitle_extraction_error_response(&error));
+                }
+            };
+            clear_subtitle_failure(&artifact_key);
             tokio::fs::read(&published_path)
                 .await
                 .map_err(|e| anyhow!("failed to read ASS subtitle: {e}"))?
@@ -854,47 +1085,66 @@ pub async fn subtitles_stream(
 
     // Binary formats (PGS/SUP): extract on-the-fly as raw bytes.
     if is_binary {
-        let mut cmd = tokio::process::Command::new(ffmpeg_bin());
-        cmd.kill_on_drop(true);
-        cmd.args([
-            "-copyts",
-            "-i",
-            &url,
-            "-map",
-            &map_spec,
-            "-an",
-            "-vn",
-            "-c:s",
-            "copy",
-            "-f",
-            output_format.as_str(),
-            "-",
-        ]);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-                .await
-                .map_err(|_| anyhow!("subtitle extraction timed out"))?
-                .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
-        if !output
-            .status
-            .success()
-        {
-            return Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("subtitle extraction failed"))
-                .unwrap());
+        let artifact_key = (
+            item_id,
+            cache_source_id,
+            stream_index,
+            SubtitleArtifactKind::RawBinary,
+        );
+        let _artifact_guard = SUBTITLE_ARTIFACT_LOCKS
+            .lock(artifact_key)
+            .await;
+        if subtitle_failure_is_cooling_down(&artifact_key) {
+            return Ok(subtitle_extraction_error_response(&anyhow!(
+                "subtitle extraction timed out during retry cooldown"
+            )));
         }
+        let cache_dir = state
+            .ctx
+            .config
+            .data_dir
+            .join("subtitle-cache");
+        let cache_path = match extract_binary_subtitle_to_cache(
+            &cache_dir,
+            &url,
+            &map_spec,
+            item_id,
+            cache_source_id,
+            stream_index,
+            &output_format,
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(error) => {
+                record_transient_subtitle_failure(artifact_key, &error);
+                error!(%item_id, stream_index, %map_spec, "binary subtitle extraction failed: {error}");
+                return Ok(subtitle_extraction_error_response(&error));
+            }
+        };
+        clear_subtitle_failure(&artifact_key);
+        let bytes = tokio::fs::read(cache_path)
+            .await
+            .map_err(|e| anyhow!("failed to read binary subtitle cache: {e}"))?;
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", content_type)
-            .body(Body::from(output.stdout))
+            .header("Cache-Control", "public, max-age=3600")
+            .body(Body::from(bytes))
             .unwrap());
     }
 
     // Text formats: serve from SRT cache (populated by pre_extract_all_subtitles_to_cache
     // at PlaybackInfo time). Falls back to on-demand extraction on cache miss.
+    let artifact_key = (
+        item_id,
+        cache_source_id,
+        stream_index,
+        SubtitleArtifactKind::NormalizedText,
+    );
+    let _artifact_guard = SUBTITLE_ARTIFACT_LOCKS
+        .lock(artifact_key)
+        .await;
     let cache_file = state
         .ctx
         .config
@@ -940,6 +1190,11 @@ pub async fn subtitles_stream(
             info!(%item_id, stream_index, %map_spec, "subtitle cache miss — extracting on-demand");
         }
     }
+    if !is_cached(&cache_file) && subtitle_failure_is_cooling_down(&artifact_key) {
+        return Ok(subtitle_extraction_error_response(&anyhow!(
+            "subtitle extraction timed out during retry cooldown"
+        )));
+    }
     let cache_path = match extract_subtitle_to_cache(
         &state
             .ctx
@@ -955,13 +1210,12 @@ pub async fn subtitles_stream(
     {
         Ok(p) => p,
         Err(e) => {
+            record_transient_subtitle_failure(artifact_key, &e);
             error!(%item_id, stream_index, %map_spec, "subtitle extraction failed: {e}");
-            return Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("subtitle extraction failed"))
-                .unwrap());
+            return Ok(subtitle_extraction_error_response(&e));
         }
     };
+    clear_subtitle_failure(&artifact_key);
 
     let cached = String::from_utf8_lossy(
         &tokio::fs::read(&cache_path)

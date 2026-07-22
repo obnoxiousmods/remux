@@ -69,7 +69,56 @@ pub(crate) struct KeyedLockGuard<K: Eq + Hash + Clone + Send + Sync + 'static> {
 
 impl<K: Eq + Hash + Clone + Send + Sync + 'static> Drop for KeyedLockGuard<K> {
     fn drop(&mut self) {
-        self.map
-            .remove(&self.key);
+        // The map and this owned guard are the final two strong references only
+        // when nobody is queued for the key. Removing an entry while waiters
+        // still hold the old mutex lets a new caller create a second mutex and
+        // breaks mutual exclusion.
+        let can_remove = self
+            .map
+            .get(&self.key)
+            .is_some_and(|mutex| Arc::strong_count(&mutex) == 2);
+        if can_remove {
+            self.map
+                .remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeyedLock;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::time::{Duration, sleep};
+
+    #[tokio::test]
+    async fn queued_and_late_callers_never_overlap_for_the_same_key() {
+        let lock = Arc::new(KeyedLock::<u8>::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for delay_ms in [0, 1, 2, 8, 9, 10] {
+            let lock = Arc::clone(&lock);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.push(tokio::spawn(async move {
+                sleep(Duration::from_millis(delay_ms)).await;
+                let _guard = lock
+                    .lock(7)
+                    .await;
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for task in tasks {
+            task.await
+                .unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 }
