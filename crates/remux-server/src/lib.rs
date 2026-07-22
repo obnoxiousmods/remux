@@ -317,13 +317,7 @@ pub async fn init_app(
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers([
-            ACCEPT,
-            AUTHORIZATION,
-            CONTENT_TYPE,
-            RANGE,
-            HeaderName::from_static("x-emby-token"),
-        ])
+        .allow_headers(Any)
         .expose_headers(Any);
 
     let base = Router::new()
