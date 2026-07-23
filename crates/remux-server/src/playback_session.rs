@@ -874,21 +874,28 @@ impl PlaybackSessionManager {
                     })
                     .collect();
                 for (id, ts) in startup_candidates {
-                    let stuck = {
+                    let (stuck, expired_prewarm) = {
                         let s = ts
                             .read()
                             .await;
-                        s.created_at
-                            .elapsed()
-                            > startup_grace
-                            && matches!(
-                                s.state,
-                                TranscodeState::Starting | TranscodeState::Running
-                            )
-                            && !transcode_has_output(&s.output_dir)
+                        let age = s.created_at.elapsed();
+                        (
+                            age > startup_grace
+                                && matches!(
+                                    s.state,
+                                    TranscodeState::Starting | TranscodeState::Running
+                                )
+                                && !transcode_has_output(&s.output_dir),
+                            s.prewarm.load(std::sync::atomic::Ordering::Relaxed)
+                                && age > std::time::Duration::from_secs(90),
+                        )
                     };
-                    if stuck {
-                        info!("Reaping stuck startup transcode: {}", id);
+                    if stuck || expired_prewarm {
+                        if expired_prewarm {
+                            info!("Reaping unclaimed prewarm transcode: {}", id);
+                        } else {
+                            info!("Reaping stuck startup transcode: {}", id);
+                        }
                         self.stop_transcode(&id)
                             .await;
                     }

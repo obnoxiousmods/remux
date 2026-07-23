@@ -3874,6 +3874,9 @@ pub struct HlsVideoQuery {
     pub subtitle_method: Option<SubtitleDeliveryMethod>,
     pub max_streaming_bitrate: Option<i64>,
     pub transcode_reasons: Option<String>,
+    /// Starts a bounded speculative transcode that pauses after a small
+    /// startup buffer. A normal request with the same PlaySessionId resumes it.
+    pub prewarm: Option<bool>,
     /// Cumulative runtime ticks up to the start of this segment.
     #[serde(alias = "runtimeTicks")]
     pub runtime_ticks: Option<i64>,

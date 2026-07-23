@@ -321,8 +321,18 @@ fn nvenc_preset(preset: EncodingPreset) -> &'static str {
 
 /// Max seconds to buffer ahead of the current playback position.
 const MAX_BUFFER_SECS: u32 = 86_400; // was 300
+/// A speculative Item Details warmup must never download an entire episode.
+const PREWARM_BUFFER_SECS: u32 = 12;
 /// Seconds behind the playback position before a segment is eligible for deletion.
 const SEGMENT_KEEP_SECS: u32 = 30;
+
+fn buffer_limit_secs(prewarm: bool) -> u32 {
+    if prewarm {
+        PREWARM_BUFFER_SECS
+    } else {
+        MAX_BUFFER_SECS
+    }
+}
 
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into())
@@ -342,6 +352,7 @@ fn spawn_buffer_monitor(
     output_dir: PathBuf,
     segment_length: u32,
     playback_offset_secs: Arc<AtomicU32>,
+    prewarm: Arc<AtomicBool>,
     ffmpeg_pid: Arc<AtomicU32>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     play_session_id: String,
@@ -364,15 +375,23 @@ fn spawn_buffer_monitor(
             let playback_secs = playback_offset_secs.load(Ordering::Relaxed);
 
             let ahead = buffered_secs.saturating_sub(playback_secs);
+            let max_buffer_secs =
+                buffer_limit_secs(prewarm.load(Ordering::Relaxed));
 
-            if pid != 0 && !paused && ahead >= MAX_BUFFER_SECS {
-                debug!(play_session_id, pid, ahead, "Buffer full — pausing ffmpeg");
+            if pid != 0 && !paused && ahead >= max_buffer_secs {
+                debug!(
+                    play_session_id,
+                    pid,
+                    ahead,
+                    prewarm = prewarm.load(Ordering::Relaxed),
+                    "Buffer full — pausing ffmpeg"
+                );
                 #[cfg(unix)]
                 send_signal(pid, libc::SIGSTOP);
                 paused = true;
             } else if pid != 0
                 && paused
-                && ahead < MAX_BUFFER_SECS.saturating_sub(segment_length * 2)
+                && ahead < max_buffer_secs.saturating_sub(segment_length * 2)
             {
                 debug!(
                     play_session_id,
@@ -1504,6 +1523,8 @@ pub async fn start_transcode(
                     s.segment_length,
                     s.playback_offset_secs
                         .clone(),
+                    s.prewarm
+                        .clone(),
                     ffmpeg_pid.clone(),
                     monitor_stop_rx,
                     s.id.clone(),
@@ -2421,6 +2442,12 @@ mod tests {
             .map(|w| w[1].as_str())
     }
 
+    #[test]
+    fn speculative_prewarm_has_a_bounded_buffer() {
+        assert_eq!(buffer_limit_secs(true), 12);
+        assert_eq!(buffer_limit_secs(false), MAX_BUFFER_SECS);
+    }
+
     // ── select_hw_accel tests ─────────────────────────────────────────────────
 
     fn no_devices(_: &str) -> bool {
@@ -3008,6 +3035,7 @@ mod tests {
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 30,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
+            prewarm: Arc::new(AtomicBool::new(false)),
             runtime_ticks: 120i64
                 .to_ticks(TickUnit::Seconds)
                 .unwrap(),

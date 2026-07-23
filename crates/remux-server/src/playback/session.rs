@@ -1,7 +1,10 @@
 use remux_sdks::remux::TranscodeReasons;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicU32},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32},
+    },
     time::Instant,
 };
 use tokio::sync::{Notify, watch};
@@ -115,6 +118,9 @@ pub struct TranscodeSession {
     pub start_time_secs: u32,
     /// Playback offset in seconds relative to start_time_secs, updated from progress reports.
     pub playback_offset_secs: Arc<AtomicU32>,
+    /// True while this is a speculative Item Details prewarm. The buffer
+    /// monitor uses a small ceiling until the real player claims the session.
+    pub prewarm: Arc<AtomicBool>,
     /// Total runtime of the media in Jellyfin ticks (100-ns units).
     pub runtime_ticks: i64,
     /// Whether runtime_ticks came from probing the selected media source.
@@ -158,6 +164,7 @@ impl TranscodeSession {
         transcode_reasons: TranscodeReasons,
         runtime_ticks: i64,
         runtime_is_probed: bool,
+        prewarm: bool,
         is_live: bool,
         source_video_codec: Option<String>,
         source_audio_codec: Option<String>,
@@ -191,6 +198,7 @@ impl TranscodeSession {
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
+            prewarm: Arc::new(AtomicBool::new(prewarm)),
             runtime_ticks,
             runtime_is_probed,
             is_live,

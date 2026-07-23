@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
 use axum::{
     body::Body,
@@ -108,22 +108,33 @@ async fn create_hls_session(
         .start_time_ticks
         .is_some_and(|t| t > 0);
     if is_seeking {
-        if state
+        if let Some(existing) = state
             .ctx
             .sessions
             .get_transcode(&play_session_id)
-            .is_some()
         {
-            debug!(
-                play_session_id = %play_session_id,
-                start_time_ticks = ?q.start_time_ticks,
-                "seek detected — stopping old transcode session and restarting"
-            );
-            state
-                .ctx
-                .sessions
-                .stop_transcode(&play_session_id)
-                .await;
+            let requested_start_secs = q
+                .start_time_ticks
+                .unwrap_or(0)
+                .max(0) as u64
+                / 10_000_000;
+            let can_claim_prewarm = {
+                let current = existing.read().await;
+                current.prewarm.load(Ordering::Relaxed)
+                    && current.start_time_secs as u64 == requested_start_secs
+            };
+            if !can_claim_prewarm {
+                debug!(
+                    play_session_id = %play_session_id,
+                    start_time_ticks = ?q.start_time_ticks,
+                    "seek detected — stopping old transcode session and restarting"
+                );
+                state
+                    .ctx
+                    .sessions
+                    .stop_transcode(&play_session_id)
+                    .await;
+            }
         }
     }
     let session = if let Some(existing) = state
@@ -131,6 +142,11 @@ async fn create_hls_session(
         .sessions
         .get_transcode(&play_session_id)
     {
+        existing
+            .read()
+            .await
+            .prewarm
+            .store(q.prewarm.unwrap_or(false), Ordering::Relaxed);
         existing
     } else {
         // Fetch media info to get the stream URL
@@ -394,6 +410,7 @@ async fn create_hls_session(
                 .unwrap_or_default(),
             runtime_ticks,
             runtime_is_probed,
+            q.prewarm.unwrap_or(false),
             is_live,
             source_video_codec,
             source_audio_codec,
