@@ -2598,19 +2598,30 @@ impl AddonService {
         // produce an exact version match. This lets the item-level chapter
         // fallback fill only the missing chapter fields instead of replacing
         // previously cached streams/codecs with a chapter-only payload.
-        let existing_probes: std::collections::HashMap<
-            Uuid,
-            api::MediaSourceInfo,
-        > = sqlx::query_as::<
-            _,
-            (Uuid, Option<sqlx::types::Json<api::MediaSourceInfo>>),
-        >("SELECT id, probe_data FROM media WHERE kind = 'stream' AND parent_id = ?")
+        let existing_probe_rows = sqlx::query_as::<_, (Uuid, Option<String>)>(
+            "SELECT id, probe_data FROM media WHERE kind = 'stream' AND parent_id = ?",
+        )
         .bind(media.id)
         .fetch_all(&ctx.db)
-        .await?
-        .into_iter()
-        .filter_map(|(id, probe)| probe.map(|probe| (id, probe.0)))
-        .collect();
+        .await?;
+        let mut existing_probes = std::collections::HashMap::new();
+        for (id, raw_probe) in existing_probe_rows {
+            let Some(raw_probe) = raw_probe else {
+                continue;
+            };
+            match serde_json::from_str::<api::MediaSourceInfo>(&raw_probe) {
+                Ok(probe) => {
+                    existing_probes.insert(id, probe);
+                }
+                Err(error) => {
+                    warn!(
+                        %id,
+                        %error,
+                        "ignoring malformed existing stream probe data during refresh"
+                    );
+                }
+            }
+        }
         for source in &mut sources {
             if source.probe_data.is_none() {
                 source.probe_data = existing_probes
