@@ -6577,6 +6577,7 @@ impl From<sdks::stremio::Stream> for Media {
 
         let stream_info = Some(StreamInfo {
             descriptor,
+            valid_until: None,
             filename: source
                 .filename
                 .clone(),

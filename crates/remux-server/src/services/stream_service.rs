@@ -80,6 +80,18 @@ impl StreamService {
             return Ok(());
         }
 
+        let scoped_descriptor_is_reusable = self
+            .requested_id
+            .filter(|requested| *requested != self.item_id)
+            .is_some_and(|requested| {
+                requested == media.id
+                    && media
+                        .stream_info
+                        .as_ref()
+                        .is_some_and(|info| {
+                            info.is_valid_for(std::time::Duration::from_secs(120))
+                        })
+            });
         let mut root = resolve_stream_root(
             &media,
             self.item_id,
@@ -89,11 +101,19 @@ impl StreamService {
         )
         .await;
 
-        self.ctx
-            .addons
-            .refresh_streams(&mut root, &self.ctx, self.user_id)
-            .await
-            .inspect_err(|e| tracing::error!("refresh_streams failed: {e:#}"));
+        if scoped_descriptor_is_reusable {
+            debug!(
+                item_id = %self.item_id,
+                source_id = %media.id,
+                "reusing valid scoped stream descriptor without addon refresh"
+            );
+        } else {
+            self.ctx
+                .addons
+                .refresh_streams(&mut root, &self.ctx, self.user_id)
+                .await
+                .inspect_err(|e| tracing::error!("refresh_streams failed: {e:#}"));
+        }
 
         let db_streams = root
             .streams(

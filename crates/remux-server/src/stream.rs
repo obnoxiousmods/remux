@@ -160,6 +160,13 @@ impl StreamDescriptor {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StreamInfo {
     pub descriptor: StreamDescriptor,
+    /// Latest time this descriptor is expected to remain usable.
+    ///
+    /// Addons should populate this when they mint or receive a signed URL.
+    /// Older persisted descriptors may omit it; for common HTTP signatures we
+    /// also derive it from the URL query without exposing the query itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
     /// Filename from the provider (e.g. "Movie.2021.1080p.BluRay.mkv").
     /// Used for resolution matching during probe fallback.
     pub filename: Option<String>,
@@ -218,6 +225,56 @@ impl StreamInfo {
                 .name
                 .as_deref())?;
         crate::db::min_screen_size(&hunch::hunch(src)).map(|s| s.to_owned())
+    }
+
+    /// Fill an absent explicit expiry from common absolute UNIX timestamp
+    /// query parameters used by signed media URLs.
+    pub fn infer_valid_until(&mut self) {
+        if self.valid_until.is_some() {
+            return;
+        }
+        let Some(raw_url) = self.descriptor.as_http_url() else {
+            return;
+        };
+        let Ok(url) = url::Url::parse(raw_url) else {
+            return;
+        };
+        self.valid_until = url
+            .query_pairs()
+            .find_map(|(key, value)| {
+                let key = key.to_ascii_lowercase();
+                if !matches!(
+                    key.as_str(),
+                    "expires" | "expire" | "expiry" | "exp"
+                ) {
+                    return None;
+                }
+                let raw = value.parse::<i64>().ok()?;
+                // A few providers serialize epoch milliseconds.
+                let seconds = if raw > 100_000_000_000 {
+                    raw / 1_000
+                } else {
+                    raw
+                };
+                chrono::DateTime::from_timestamp(seconds, 0)
+            });
+    }
+
+    /// Whether a scoped PlaybackInfo request can safely reuse this persisted
+    /// descriptor without synchronously contacting every stream addon.
+    pub fn is_valid_for(&self, duration: Duration) -> bool {
+        match self.descriptor {
+            StreamDescriptor::Local(_)
+            | StreamDescriptor::Rtsp { .. }
+            | StreamDescriptor::Torrent { .. }
+            | StreamDescriptor::Opendal { .. } => true,
+            StreamDescriptor::Http { .. } => self.valid_until.is_some_and(|expiry| {
+                expiry
+                    .signed_duration_since(chrono::Utc::now())
+                    .to_std()
+                    .is_ok_and(|remaining| remaining >= duration)
+            }),
+        }
     }
 }
 
@@ -869,7 +926,8 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        numbered_segment_url, parse_range, segmented_ranges, tidal_segment_zero_url,
+        StreamInfo, numbered_segment_url, parse_range, segmented_ranges,
+        tidal_segment_zero_url,
     };
     use axum::{
         Router,
@@ -908,6 +966,31 @@ mod tests {
         let segment = numbered_segment_url(&base, 42);
         assert_eq!(segment.path(), "/path/42.mp4");
         assert_eq!(segment.query(), base.query());
+    }
+
+    #[test]
+    fn infers_absolute_signed_url_expiry() {
+        let expires = chrono::Utc::now().timestamp() + 300;
+        let mut info = StreamInfo {
+            descriptor: super::StreamDescriptor::http(format!(
+                "https://example.invalid/video?Expires={expires}"
+            )),
+            ..Default::default()
+        };
+        info.infer_valid_until();
+        assert!(info.is_valid_for(std::time::Duration::from_secs(120)));
+        assert!(!info.is_valid_for(std::time::Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn http_descriptor_without_known_expiry_is_not_reusable() {
+        let info = StreamInfo {
+            descriptor: super::StreamDescriptor::http(
+                "https://example.invalid/video?token=opaque",
+            ),
+            ..Default::default()
+        };
+        assert!(!info.is_valid_for(std::time::Duration::from_secs(1)));
     }
 
     #[test]

@@ -2504,7 +2504,25 @@ impl AddonService {
             } else {
                 (None, None)
             };
-            remuxdb::fetch_probe(
+            let cache_key = format!(
+                "remuxdb:probe:{imdb_id}:{}:{}",
+                season.map_or_else(|| "-".to_string(), |value| value.to_string()),
+                episode.map_or_else(|| "-".to_string(), |value| value.to_string()),
+            );
+            if let Some(cached) = ctx
+                .store
+                .get::<Vec<remuxdb::MediaInfo>>(&cache_key)
+            {
+                debug!(
+                    imdb_id,
+                    season,
+                    episode,
+                    versions = cached.len(),
+                    "remuxdb: item probe cache hit"
+                );
+                return Some(cached);
+            }
+            let fetched = remuxdb::fetch_probe(
                 &url,
                 cfg.remuxdb_token
                     .as_deref(),
@@ -2513,11 +2531,24 @@ impl AddonService {
                 season,
                 episode,
             )
-            .await
+            .await;
+            if let Some(versions) = fetched.as_ref() {
+                ctx.store.save(
+                    cache_key,
+                    versions.clone(),
+                    std::time::Duration::from_secs(24 * 60 * 60),
+                );
+            }
+            fetched
         };
         let (raw, probe_versions) =
             tokio::join!(self.get_streams(media, ctx, user_id), probe_versions_fut);
-        let raw = raw?;
+        let mut raw = raw?;
+        for source in raw.iter_mut() {
+            if let Some(info) = source.stream_info.as_mut() {
+                info.infer_valid_until();
+            }
+        }
         debug!(raw_count = raw.len(), "raw streams fetched");
 
         // Dedup by descriptor content; order preserves addon priority (DB load order).
