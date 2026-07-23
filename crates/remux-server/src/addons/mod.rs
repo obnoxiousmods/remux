@@ -2186,11 +2186,20 @@ impl AddonService {
 
 fn strip_video_ext(name: &str) -> &str {
     if let Some((stem, ext)) = name.rsplit_once('.') {
-        if opendal::VIDEO_EXTENSIONS.contains(&ext) {
+        if opendal::VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
             return stem;
         }
     }
     name
+}
+
+fn normalized_release_name(name: &str) -> String {
+    let basename = name
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(name)
+        .trim();
+    strip_video_ext(basename).to_ascii_lowercase()
 }
 
 fn match_probe_version<'a>(
@@ -2215,73 +2224,157 @@ fn match_probe_version<'a>(
             si.torrent_file_idx,
         ),
     };
-    if let Some(hash) = hash {
-        if let Some(v) = versions
+    if let Some(hash) = hash.map(str::trim) {
+        let hash_matches: Vec<&remuxdb::MediaInfo> = versions
             .iter()
-            .find(|v| {
-                v.sources
+            .filter(|version| {
+                version
+                    .sources
                     .iter()
-                    .any(|s| {
-                        s.torrent_info_hash
+                    .any(|source| {
+                        source
+                            .torrent_info_hash
                             .as_deref()
-                            == Some(hash)
-                            && s.torrent_file_idx == hash_file_idx
+                            .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(hash))
                     })
             })
-        {
-            return Some(v);
+            .collect();
+
+        // Prefer the exact file within a multi-file torrent. Some addons omit
+        // the file index while RemuxDB has it (or vice versa), so a unique hash
+        // remains safe and substantially more useful than falling through to a
+        // live ffprobe.
+        if let Some(file_idx) = hash_file_idx {
+            let exact_matches: Vec<&remuxdb::MediaInfo> = hash_matches
+                .iter()
+                .copied()
+                .filter(|version| {
+                    version
+                        .sources
+                        .iter()
+                        .any(|source| {
+                            source
+                                .torrent_info_hash
+                                .as_deref()
+                                .is_some_and(|candidate| {
+                                    candidate.trim().eq_ignore_ascii_case(hash)
+                                })
+                                && source.torrent_file_idx == Some(file_idx)
+                        })
+                })
+                .collect();
+            if exact_matches.len() == 1 {
+                return exact_matches.first().copied();
+            }
+        }
+        if hash_matches.len() == 1 {
+            return hash_matches.first().copied();
+        }
+        if let Some(filename) = si.filename.as_deref() {
+            let normalized = normalized_release_name(filename);
+            let named_matches: Vec<&remuxdb::MediaInfo> = hash_matches
+                .iter()
+                .copied()
+                .filter(|version| {
+                    version
+                        .sources
+                        .iter()
+                        .filter(|source| {
+                            source
+                                .torrent_info_hash
+                                .as_deref()
+                                .is_some_and(|candidate| {
+                                    candidate.trim().eq_ignore_ascii_case(hash)
+                                })
+                        })
+                        .filter_map(|source| source.filename.as_deref())
+                        .map(normalized_release_name)
+                        .any(|candidate| candidate == normalized)
+                })
+                .collect();
+            if named_matches.len() == 1 {
+                return named_matches.first().copied();
+            }
+        }
+        if let Some(size) = si.size {
+            let sized_matches: Vec<&remuxdb::MediaInfo> = hash_matches
+                .into_iter()
+                .filter(|version| version.size == Some(size))
+                .collect();
+            if sized_matches.len() == 1 {
+                return sized_matches.first().copied();
+            }
         }
     }
 
     // Usenet: match by indexer_guid (+ indexer name when available) against version sources
     if let Some(ref guid) = si.usenet_guid {
-        if let Some(v) = versions
+        let matches: Vec<&remuxdb::MediaInfo> = versions
             .iter()
-            .find(|v| {
-                v.sources
+            .filter(|version| {
+                version
+                    .sources
                     .iter()
-                    .any(|s| {
-                        s.indexer_guid
+                    .any(|source| {
+                        source
+                            .indexer_guid
                             .as_deref()
                             == Some(guid.as_str())
                             && (si
                                 .usenet_indexer
                                 .is_none()
-                                || s.indexer == si.usenet_indexer)
+                                || source
+                                    .indexer
+                                    .as_deref()
+                                    .zip(si.usenet_indexer.as_deref())
+                                    .is_some_and(|(left, right)| {
+                                        left.eq_ignore_ascii_case(right)
+                                    }))
                     })
             })
-        {
-            return Some(v);
+            .collect();
+        if matches.len() == 1 {
+            return matches.first().copied();
         }
     }
 
-    // HTTP: match by exact file size
+    // HTTP: exact size is useful only when it identifies one probe version.
+    // Picking the first of multiple equal-sized versions can attach a sibling
+    // release's codecs and streams to the active source.
     if let Some(size) = si.size {
-        if let Some(v) = versions
+        let matches: Vec<&remuxdb::MediaInfo> = versions
             .iter()
-            .find(|v| v.size == Some(size))
-        {
-            return Some(v);
+            .filter(|version| version.size == Some(size))
+            .collect();
+        if matches.len() == 1 {
+            return matches.first().copied();
         }
     }
 
-    // Fallback: match by filename (with and without video extension) against version sources
+    // Fallback: match release basenames case-insensitively, ignoring a known
+    // video extension and any path prefix supplied by the addon.
     let filename = si
         .filename
         .as_deref()?;
-    let stem = strip_video_ext(filename);
-    versions
+    let normalized = normalized_release_name(filename);
+    let matches: Vec<&remuxdb::MediaInfo> = versions
         .iter()
-        .find(|v| {
-            v.sources
+        .filter(|version| {
+            version
+                .sources
                 .iter()
-                .any(|s| {
-                    s.filename
+                .any(|source| {
+                    source
+                        .filename
                         .as_deref()
-                        .map(|sf| sf == filename || strip_video_ext(sf) == stem)
+                        .map(normalized_release_name)
+                        .map(|candidate| candidate == normalized)
                         .unwrap_or(false)
                 })
         })
+        .collect();
+    (matches.len() == 1)
+        .then(|| matches[0])
 }
 
 impl AddonService {
@@ -2441,6 +2534,10 @@ impl AddonService {
             })
             .collect();
 
+        let probe_version_count = probe_versions
+            .as_ref()
+            .map_or(0, Vec::len);
+        let mut probe_matches = 0usize;
         if let Some(ref versions) = probe_versions {
             for source in &mut sources {
                 if source
@@ -2451,12 +2548,20 @@ impl AddonService {
                 }
                 if let Some(version) = match_probe_version(versions, source) {
                     source.probe_data = Some(version.into());
+                    probe_matches += 1;
                     debug!(id = %source.id, "remuxdb: probe data applied from version");
                 }
             }
         }
-
         db::Media::upsert(&ctx.db, &sources).await?;
+        if probe_version_count > 0 {
+            info!(
+                probe_versions = probe_version_count,
+                probe_matches,
+                stream_count = sources.len(),
+                "remuxdb: persisted probe data merged into refreshed streams"
+            );
+        }
 
         // delete stale items
         sqlx::query(
