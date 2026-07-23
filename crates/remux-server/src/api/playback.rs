@@ -76,6 +76,7 @@ async fn items_playbackinfo_inner(
     id: Uuid,
     q: api::PlaybackInfoQuery,
 ) -> Result<impl IntoResponse> {
+    let playback_info_started = std::time::Instant::now();
     let media_source_id = q.media_source_id;
 
     trace!(?id, ?q, "items_playbackinfo");
@@ -504,6 +505,65 @@ async fn items_playbackinfo_inner(
         play_session_id: Some(play_session_id),
         ..Default::default()
     };
+
+    if state.ctx.config.telemetry_enabled {
+        let db = state.ctx.db.clone();
+        let playback_key = info.play_session_id.clone().unwrap_or_default();
+        let source_id = info
+            .media_sources
+            .first()
+            .map(|source| source.id.to_string());
+        let source_name = info
+            .media_sources
+            .first()
+            .and_then(|source| source.name.clone());
+        let delivery_class = info.media_sources.first().map(|source| {
+            if source.supports_direct_play {
+                "direct-play"
+            } else if source.supports_direct_stream {
+                "direct-stream"
+            } else {
+                "transcode"
+            }
+            .to_string()
+        });
+        let source_count = info.media_sources.len();
+        let elapsed_ms = playback_info_started.elapsed().as_secs_f64() * 1_000.0;
+        let user_id = session.user.id.to_string();
+        let device_id = session.device.id.clone();
+        let device_name = session.device.name.clone();
+        let client_name = session.device.app_name.clone();
+        let client_version = session.device.app_version.clone();
+        let item_id = id.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "INSERT INTO telemetry_playback_events \
+                 (playback_key, event, elapsed_ms, item_id, source_id, source_name, delivery_class, user_id, device_id, device_name, client_name, client_version, details_json) \
+                 VALUES (?, 'server-playback-info-ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(playback_key)
+            .bind(elapsed_ms)
+            .bind(item_id)
+            .bind(source_id)
+            .bind(source_name)
+            .bind(delivery_class)
+            .bind(user_id)
+            .bind(device_id)
+            .bind(device_name)
+            .bind(client_name)
+            .bind(client_version)
+            .bind(
+                serde_json::json!({
+                    "scoped": media_source_id.is_some_and(|source_id| source_id != id),
+                    "sourceCount": source_count,
+                    "source": "server"
+                })
+                .to_string(),
+            )
+            .execute(&db)
+            .await;
+        });
+    }
 
     trace!(?info, "items_playbackinfo_result");
     Ok(Json(info))

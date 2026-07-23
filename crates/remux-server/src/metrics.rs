@@ -676,7 +676,9 @@ fn server_playback_event(
             "server-playback-info-error"
         })
     } else if route.contains(".m3u8") || route.contains("/hls/") {
-        Some(if status < 400 {
+        Some(if status == 503 {
+            "server-manifest-pending"
+        } else if status < 400 {
             "server-manifest-ready"
         } else {
             "server-manifest-error"
@@ -899,6 +901,10 @@ mod tests {
         assert_eq!(
             server_playback_event("GET", "/videos/{id}/master.m3u8", 500),
             Some("server-manifest-error")
+        );
+        assert_eq!(
+            server_playback_event("GET", "/videos/{id}/main.m3u8", 503),
+            Some("server-manifest-pending")
         );
         assert_eq!(
             server_playback_event("GET", "/videos/{id}/{segment_file}", 200),

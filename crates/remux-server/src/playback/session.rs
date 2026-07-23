@@ -101,6 +101,10 @@ pub struct TranscodeSession {
     pub state: TranscodeState,
     /// Broadcasts state transitions so waiters can react immediately.
     pub state_tx: Arc<watch::Sender<TranscodeState>>,
+    /// Monotonic output-directory change counter. Playlist and fragment
+    /// handlers subscribe once and wake as soon as ffmpeg writes data instead
+    /// of each request polling the filesystem every 250-500 ms.
+    pub output_tx: Arc<watch::Sender<u64>>,
     pub created_at: Instant,
     pub video_codec: String,
     pub audio_codec: String,
@@ -177,6 +181,7 @@ impl TranscodeSession {
     ) -> Arc<tokio::sync::RwLock<Self>> {
         let _ = std::fs::create_dir_all(&output_dir);
         let (state_tx, _) = watch::channel(TranscodeState::Starting);
+        let (output_tx, _) = watch::channel(0);
         Arc::new(tokio::sync::RwLock::new(Self {
             id: play_session_id,
             item_id,
@@ -185,6 +190,7 @@ impl TranscodeSession {
             input_url,
             state: TranscodeState::Starting,
             state_tx: Arc::new(state_tx),
+            output_tx: Arc::new(output_tx),
             created_at: Instant::now(),
             video_codec,
             audio_codec,

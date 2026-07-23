@@ -420,7 +420,9 @@ fn playback_label(event: &str) -> String {
         "server-playback-info-ready" | "server-playback-info-error" => {
             "Playback info".to_string()
         }
-        "server-manifest-ready" | "server-manifest-error" => "HLS manifest".to_string(),
+        "server-manifest-ready"
+        | "server-manifest-pending"
+        | "server-manifest-error" => "HLS manifest".to_string(),
         "server-stream-ready" | "server-stream-error" => "Direct stream".to_string(),
         other => other
             .trim_start_matches("server-")
@@ -440,7 +442,7 @@ async fn playback_readiness(
          FROM telemetry_playback_events p \
          LEFT JOIN users u ON replace(lower(p.user_id), '-', '') = lower(hex(u.id)) \
          WHERE p.event IN ('server-playback-info-ready', 'server-playback-info-error', \
-         'server-manifest-ready', 'server-manifest-error', 'server-stream-ready', 'server-stream-error') \
+         'server-manifest-ready', 'server-manifest-pending', 'server-manifest-error', 'server-stream-ready', 'server-stream-error') \
          AND p.details_json LIKE '%\"source\":\"server\"%' AND p.created_at >= ",
     );
     let range_end = Utc::now() - chrono::Duration::hours(offset_hours);

@@ -2,12 +2,14 @@ use anyhow::{Result, anyhow};
 #[cfg(unix)]
 use libc;
 use std::{
+    collections::HashMap,
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -319,19 +321,157 @@ fn nvenc_preset(preset: EncodingPreset) -> &'static str {
     }
 }
 
-/// Max seconds to buffer ahead of the current playback position.
-const MAX_BUFFER_SECS: u32 = 86_400; // was 300
+/// An active viewer is guaranteed this much encoded media ahead.
+const GUARANTEED_BUFFER_SECS: u32 = 180;
+/// During otherwise idle capacity one session may race toward completion.
+const IDLE_FILL_BUFFER_SECS: u32 = 86_400;
 /// A speculative Item Details warmup must never download an entire episode.
 const PREWARM_BUFFER_SECS: u32 = 12;
+/// Protect remote sources and the encoder from a thundering herd of cold starts.
+const STARTUP_PRIORITY_SLOTS: usize = 2;
+/// Rotate the idle completion slot so one long episode cannot monopolize it.
+const IDLE_FILL_QUANTUM_SECS: u64 = 60;
 /// Seconds behind the playback position before a segment is eligible for deletion.
 const SEGMENT_KEEP_SECS: u32 = 30;
 
-fn buffer_limit_secs(prewarm: bool) -> u32 {
-    if prewarm {
-        PREWARM_BUFFER_SECS
-    } else {
-        MAX_BUFFER_SECS
+#[derive(Debug, Clone)]
+struct BufferDemand {
+    ahead_secs: u32,
+    prewarm: bool,
+    first_seen: Instant,
+    last_seen: Instant,
+    last_fill_turn: u64,
+}
+
+#[derive(Debug, Default)]
+struct AdaptiveBufferState {
+    sessions: HashMap<String, BufferDemand>,
+    filler: Option<(String, Instant)>,
+    fill_turn: u64,
+}
+
+impl AdaptiveBufferState {
+    fn target_for(
+        &mut self,
+        session_id: &str,
+        ahead_secs: u32,
+        prewarm: bool,
+        segment_length: u32,
+        now: Instant,
+    ) -> u32 {
+        self.sessions
+            .retain(|_, demand| now.saturating_duration_since(demand.last_seen) < Duration::from_secs(5));
+        let demand = self
+            .sessions
+            .entry(session_id.to_string())
+            .or_insert(BufferDemand {
+                ahead_secs,
+                prewarm,
+                first_seen: now,
+                last_seen: now,
+                last_fill_turn: 0,
+            });
+        demand.ahead_secs = ahead_secs;
+        demand.prewarm = prewarm;
+        demand.last_seen = now;
+
+        if prewarm {
+            return PREWARM_BUFFER_SECS;
+        }
+
+        let mut startups = self
+            .sessions
+            .iter()
+            .filter(|(_, candidate)| {
+                !candidate.prewarm && candidate.ahead_secs < GUARANTEED_BUFFER_SECS
+            })
+            .map(|(id, candidate)| (id.clone(), candidate.first_seen))
+            .collect::<Vec<_>>();
+        startups.sort_by_key(|(_, first_seen)| *first_seen);
+        if !startups.is_empty() {
+            self.filler = None;
+            if startups
+                .iter()
+                .take(STARTUP_PRIORITY_SLOTS)
+                .any(|(id, _)| id == session_id)
+            {
+                return GUARANTEED_BUFFER_SECS;
+            }
+            // Non-priority sessions may still produce one complete segment so
+            // their manifest becomes playable while they await a startup slot.
+            return ahead_secs.max(segment_length);
+        }
+
+        let filler_expired = self.filler.as_ref().is_none_or(|(id, started)| {
+            !self.sessions.contains_key(id)
+                || now.saturating_duration_since(*started)
+                    >= Duration::from_secs(IDLE_FILL_QUANTUM_SECS)
+        });
+        if filler_expired {
+            self.fill_turn = self.fill_turn.saturating_add(1);
+            let next = self
+                .sessions
+                .iter()
+                .filter(|(_, candidate)| !candidate.prewarm)
+                .min_by_key(|(_, candidate)| candidate.last_fill_turn)
+                .map(|(id, _)| id.clone());
+            self.filler = next.map(|id| {
+                if let Some(candidate) = self.sessions.get_mut(&id) {
+                    candidate.last_fill_turn = self.fill_turn;
+                }
+                (id, now)
+            });
+        }
+
+        if self
+            .filler
+            .as_ref()
+            .is_some_and(|(id, _)| id == session_id)
+        {
+            IDLE_FILL_BUFFER_SECS
+        } else {
+            GUARANTEED_BUFFER_SECS
+        }
     }
+
+    fn remove(&mut self, session_id: &str) {
+        self.sessions.remove(session_id);
+        if self
+            .filler
+            .as_ref()
+            .is_some_and(|(id, _)| id == session_id)
+        {
+            self.filler = None;
+        }
+    }
+}
+
+static ADAPTIVE_BUFFER_STATE: LazyLock<Mutex<AdaptiveBufferState>> =
+    LazyLock::new(|| Mutex::new(AdaptiveBufferState::default()));
+
+fn adaptive_buffer_limit_secs(
+    session_id: &str,
+    ahead_secs: u32,
+    prewarm: bool,
+    segment_length: u32,
+) -> u32 {
+    ADAPTIVE_BUFFER_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .target_for(
+            session_id,
+            ahead_secs,
+            prewarm,
+            segment_length,
+            Instant::now(),
+        )
+}
+
+fn remove_adaptive_buffer_session(session_id: &str) {
+    ADAPTIVE_BUFFER_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id);
 }
 
 fn ffmpeg_bin() -> String {
@@ -375,15 +515,20 @@ fn spawn_buffer_monitor(
             let playback_secs = playback_offset_secs.load(Ordering::Relaxed);
 
             let ahead = buffered_secs.saturating_sub(playback_secs);
-            let max_buffer_secs =
-                buffer_limit_secs(prewarm.load(Ordering::Relaxed));
+            let is_prewarm = prewarm.load(Ordering::Relaxed);
+            let max_buffer_secs = adaptive_buffer_limit_secs(
+                &play_session_id,
+                ahead,
+                is_prewarm,
+                segment_length,
+            );
 
             if pid != 0 && !paused && ahead >= max_buffer_secs {
                 debug!(
                     play_session_id,
                     pid,
                     ahead,
-                    prewarm = prewarm.load(Ordering::Relaxed),
+                    prewarm = is_prewarm,
                     "Buffer full — pausing ffmpeg"
                 );
                 #[cfg(unix)]
@@ -418,6 +563,7 @@ fn spawn_buffer_monitor(
                 send_signal(pid, libc::SIGCONT);
             }
         }
+        remove_adaptive_buffer_session(&play_session_id);
     });
 }
 
@@ -1387,6 +1533,7 @@ async fn run_ffmpeg(
     monitor_stop_tx: tokio::sync::oneshot::Sender<()>,
     ffmpeg_pid_out: Arc<AtomicU32>,
     output_dir: std::path::PathBuf,
+    output_tx: Arc<tokio::sync::watch::Sender<u64>>,
 ) -> (
     Option<std::result::Result<std::process::ExitStatus, std::io::Error>>,
     String,
@@ -1419,6 +1566,21 @@ async fn run_ffmpeg(
         output_dir = %output_dir.display(),
         "HLS ffmpeg process started"
     );
+    let notifier_dir = output_dir.clone();
+    let output_notifier = tokio::spawn(async move {
+        let mut version = *output_tx.borrow();
+        let mut previous_signature = hls_output_signature(&notifier_dir);
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let signature = hls_output_signature(&notifier_dir);
+            if signature == previous_signature {
+                continue;
+            }
+            previous_signature = signature;
+            version = version.wrapping_add(1);
+            let _ = output_tx.send(version);
+        }
+    });
     let stderr = child
         .stderr
         .take();
@@ -1459,10 +1621,24 @@ async fn run_ffmpeg(
     };
 
     let _ = monitor_stop_tx.send(());
+    output_notifier.abort();
     let stderr_out = stderr_rx
         .await
         .unwrap_or_default();
     (result, stderr_out)
+}
+
+fn hls_output_signature(output_dir: &std::path::Path) -> (u64, u64) {
+    std::fs::read_dir(output_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.metadata().ok())
+                .fold((0_u64, 0_u64), |(count, bytes), metadata| {
+                    (count + 1, bytes.saturating_add(metadata.len()))
+                })
+        })
+        .unwrap_or_default()
 }
 
 /// Start an HLS transcode job by spawning ffmpeg.
@@ -1519,7 +1695,7 @@ pub async fn start_transcode(
                 tokio::sync::oneshot::channel::<()>();
 
             let ffmpeg_pid = Arc::new(AtomicU32::new(0));
-            let output_dir = {
+            let (output_dir, output_tx) = {
                 let mut s = session_clone
                     .write()
                     .await;
@@ -1540,8 +1716,12 @@ pub async fn start_transcode(
                     monitor_stop_rx,
                     s.id.clone(),
                 );
-                s.output_dir
-                    .clone()
+                (
+                    s.output_dir
+                        .clone(),
+                    s.output_tx
+                        .clone(),
+                )
             };
 
             let env_overrides = ffmpeg_env_overrides(
@@ -1555,6 +1735,7 @@ pub async fn start_transcode(
                 monitor_stop_tx,
                 ffmpeg_pid,
                 output_dir,
+                output_tx,
             )
             .await;
 
@@ -2471,8 +2652,66 @@ mod tests {
 
     #[test]
     fn speculative_prewarm_has_a_bounded_buffer() {
-        assert_eq!(buffer_limit_secs(true), 12);
-        assert_eq!(buffer_limit_secs(false), MAX_BUFFER_SECS);
+        let now = Instant::now();
+        let mut state = AdaptiveBufferState::default();
+        assert_eq!(state.target_for("warm", 0, true, 6, now), 12);
+    }
+
+    #[test]
+    fn adaptive_buffer_prioritizes_two_cold_starts() {
+        let now = Instant::now();
+        let mut state = AdaptiveBufferState::default();
+        assert_eq!(state.target_for("first", 0, false, 6, now), 180);
+        assert_eq!(
+            state.target_for(
+                "second",
+                0,
+                false,
+                6,
+                now + Duration::from_millis(1)
+            ),
+            180
+        );
+        assert_eq!(
+            state.target_for(
+                "third",
+                0,
+                false,
+                6,
+                now + Duration::from_millis(2)
+            ),
+            6
+        );
+    }
+
+    #[test]
+    fn new_startup_preempts_idle_completion_fill() {
+        let now = Instant::now();
+        let mut state = AdaptiveBufferState::default();
+        assert_eq!(
+            state.target_for("ready", GUARANTEED_BUFFER_SECS, false, 6, now),
+            IDLE_FILL_BUFFER_SECS
+        );
+        assert_eq!(
+            state.target_for(
+                "cold",
+                0,
+                false,
+                6,
+                now + Duration::from_millis(1)
+            ),
+            GUARANTEED_BUFFER_SECS
+        );
+        assert_eq!(
+            state.target_for(
+                "ready",
+                GUARANTEED_BUFFER_SECS,
+                false,
+                6,
+                now + Duration::from_millis(2)
+            ),
+            GUARANTEED_BUFFER_SECS
+        );
     }
 
     // ── select_hw_accel tests ─────────────────────────────────────────────────
@@ -3067,6 +3306,7 @@ mod tests {
             input_url: "http://example.invalid/video".into(),
             state: TranscodeState::Running,
             state_tx: Arc::new(tokio::sync::watch::channel(TranscodeState::Running).0),
+            output_tx: Arc::new(tokio::sync::watch::channel(0).0),
             created_at: std::time::Instant::now(),
             video_codec: "copy".into(),
             audio_codec: "aac".into(),

@@ -28,6 +28,63 @@ static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
     crate::keyed_lock::KeyedLock::new();
 
 const PLAYBACK_START_TICKS_DATA_ID: &str = "com.remux.playback-start-ticks";
+const PREWARM_LEASE_SECS: u64 = 90;
+
+async fn wait_for_transcode_path(
+    session: &Arc<tokio::sync::RwLock<TranscodeSession>>,
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> bool {
+    let output_tx = session
+        .read()
+        .await
+        .output_tx
+        .clone();
+    let mut output_rx = output_tx.subscribe();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero()
+            || tokio::time::timeout(remaining, output_rx.changed())
+                .await
+                .is_err()
+        {
+            return path.exists();
+        }
+    }
+}
+
+async fn wait_for_variant_playlist(
+    session: &Arc<tokio::sync::RwLock<TranscodeSession>>,
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> String {
+    let output_tx = session
+        .read()
+        .await
+        .output_tx
+        .clone();
+    let mut output_rx = output_tx.subscribe();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(text) = tokio::fs::read_to_string(path).await {
+            if text.contains("#EXT-X-TARGETDURATION") {
+                return text;
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero()
+            || tokio::time::timeout(remaining, output_rx.changed())
+                .await
+                .is_err()
+        {
+            return String::new();
+        }
+    }
+}
 
 fn add_playback_start_acknowledgement(
     playlist: String,
@@ -619,6 +676,14 @@ pub async fn master_hls_video(
                 .max(0)
                 .to_string(),
         )
+        .header(
+            "X-Remux-Prewarm-Lease-Seconds",
+            if q.prewarm.unwrap_or(false) {
+                PREWARM_LEASE_SECS.to_string()
+            } else {
+                "0".to_string()
+            },
+        )
         .body(Body::from(master_playlist))
         .unwrap())
 }
@@ -728,18 +793,12 @@ async fn variant_hls_video_inner(
         // one segment earlier without inventing boundaries ffmpeg will never
         // create.
         let playlist_wait_started_at = std::time::Instant::now();
-        let content = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                if let Ok(text) = tokio::fs::read_to_string(&playlist_path).await {
-                    if text.contains("#EXT-X-TARGETDURATION") {
-                        return text;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        })
-        .await
-        .unwrap_or_default();
+        let content = wait_for_variant_playlist(
+            &session,
+            &playlist_path,
+            std::time::Duration::from_secs(15),
+        )
+        .await;
 
         // FFmpeg has not opened a playlist within the bounded wait.
         // A 200 with an empty body is a terminal parser failure for Media3 and
@@ -981,12 +1040,13 @@ async fn hls_segment_inner(
                 .hls_file_path(&play_session_id, "init.mp4"),
         };
         // Wait briefly for ffmpeg to write the init segment.
-        if session.is_some() {
-            let mut attempts = 0;
-            while !init_path.exists() && attempts < 40 {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                attempts += 1;
-            }
+        if let Some(active) = session.as_ref() {
+            wait_for_transcode_path(
+                active,
+                &init_path,
+                std::time::Duration::from_secs(10),
+            )
+            .await;
         }
         if !init_path.exists() {
             return Ok(match &session {
@@ -1313,12 +1373,13 @@ async fn hls_segment_inner(
     // Stay below the client's fragment timeout. If the transcode is alive but
     // late, return a retryable 503 instead of a terminal-looking 404.
     // If there's no live session (e.g. after server restart), only serve from disk.
-    if session.is_some() {
-        let mut attempts = 0;
-        while !segment_path.exists() && attempts < 24 {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            attempts += 1;
-        }
+    if let Some(active) = session.as_ref() {
+        wait_for_transcode_path(
+            active,
+            &segment_path,
+            std::time::Duration::from_secs(12),
+        )
+        .await;
     }
 
     if !segment_path.exists() {
