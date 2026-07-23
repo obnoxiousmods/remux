@@ -18,7 +18,7 @@ use crate::{
 };
 use remux_sdks::remux::{EncodingPreset, HardwareAccelerationType, VideoRangeType};
 
-use super::session::{TranscodeSession, TranscodeState};
+use super::session::{HlsSegmentFile, TranscodeSession, TranscodeState};
 
 pub async fn detect_hardware_acceleration() -> HardwareAccelerationType {
     let detected = probe_hw_accel().await;
@@ -435,11 +435,7 @@ fn count_segments(dir: &PathBuf) -> u32 {
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .ends_with(".ts")
-                })
+                .filter(|e| HlsSegmentFile::parse(&e.file_name().to_string_lossy()).is_some())
                 .count() as u32
         })
         .unwrap_or(0)
@@ -886,20 +882,14 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         ));
     }
 
-    // Input seek (fast, before -i) — not applicable to live streams
+    // Input seek (fast, before -i) — not applicable to live streams.
+    // Without -noaccurate_seek, ffmpeg decodes from the nearest keyframe
+    // up to the exact target time (only a few seconds), giving correct
+    // subtitle sync at the cost of ~1-3s additional startup latency.
     if !params.is_live {
         if let Some(ticks) = params.start_time_ticks {
             let secs = ticks as f64 / 10_000_000.0;
             args.extend(["-ss".into(), format!("{:.6}", secs)]);
-            // Remote media can have a sparse or expensive seek index. During
-            // a transcode FFmpeg's default accurate seek decodes and discards
-            // every frame between the preceding keyframe and the requested
-            // time, delaying the first HLS segment for tens of seconds. Start
-            // from that keyframe instead; the playlist sequence still carries
-            // the requested resume position.
-            if ffmpeg_video_codec != "copy" {
-                args.push("-noaccurate_seek".into());
-            }
         }
     }
 
@@ -3208,7 +3198,7 @@ mod tests {
     }
 
     #[test]
-    fn hls_resumed_transcode_uses_fast_keyframe_seek() {
+    fn hls_resumed_transcode_uses_accurate_seek() {
         let dir = PathBuf::from("/tmp/test_resumed_transcode_seek");
         let args = build_hls_args(&TranscodeParams {
             video_codec: "libx264".into(),
@@ -3216,7 +3206,7 @@ mod tests {
             ..default_hls(dir)
         });
 
-        assert!(args.iter().any(|arg| arg == "-noaccurate_seek"));
+        assert!(!args.iter().any(|arg| arg == "-noaccurate_seek"));
         assert!(!args.iter().any(|arg| arg == "-copyts"));
         assert_eq!(
             arg_after(&args, "-force_key_frames"),

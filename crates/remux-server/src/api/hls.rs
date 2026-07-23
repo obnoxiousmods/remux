@@ -18,7 +18,7 @@ use crate::{
     common::{TickUnit, ToRunTimeTicks},
     db,
     db::auth,
-    playback::session::{TranscodeSession, TranscodeState},
+    playback::session::{HlsSegmentFile, HlsSegmentFormat, TranscodeSession, TranscodeState},
 };
 
 /// Serializes the lookup-or-create-transcode sequence per play_session_id so
@@ -215,6 +215,17 @@ async fn create_hls_session(
                     )
             })
             .context_not_found("media source has no URL")?;
+
+        // Kill any earlier startup transcode this device left running for the
+        // same channel before we spawn a new ffmpeg. IPTV proxies allow one
+        // reader per channel; a stale ffmpeg holding that connection would 503
+        // this one and neither could produce segments (the per-PlaySessionId
+        // create-lock doesn't cover a client that rotates PlaySessionIds).
+        state
+            .ctx
+            .sessions
+            .reap_competing_startups(&auth.device.id, &input_url, &play_session_id)
+            .await;
 
         let output_dir =
             std::path::PathBuf::from("transcode_sessions").join(&play_session_id);
@@ -643,11 +654,17 @@ async fn variant_hls_video_inner(
         .play_session_id
         .context_not_found("PlaySessionId is required")?;
 
-    let session = state
+    let Some(session) = state
         .ctx
         .sessions
         .get_transcode(&play_session_id)
-        .context_not_found("transcode session not found")?;
+    else {
+        return Ok(hls_state_response(
+            StatusCode::GONE,
+            "session-gone",
+            None,
+        ));
+    };
 
     // Keep the session alive.
     state
@@ -713,12 +730,18 @@ async fn variant_hls_video_inner(
                 ?session_state,
                 "HLS child playlist not ready before startup deadline"
             );
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Retry-After", "1")
-                .header("X-Remux-Hls-Startup-State", "playlist-not-ready")
-                .body(Body::empty())
-                .unwrap());
+            return Ok(if matches!(
+                session_state,
+                TranscodeState::Complete | TranscodeState::Error(_)
+            ) {
+                hls_state_response(StatusCode::GONE, "transcode-ended", None)
+            } else {
+                hls_state_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "playlist-not-ready",
+                    Some("1"),
+                )
+            });
         }
 
         info!(
@@ -773,7 +796,9 @@ async fn variant_hls_video_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::add_playback_start_acknowledgement;
+    use http::StatusCode;
+
+    use super::{add_playback_start_acknowledgement, hls_state_response};
 
     #[test]
     fn master_playlist_acknowledges_applied_start_ticks() {
@@ -802,18 +827,34 @@ mod tests {
         assert_eq!(super::resolve_live_audio_codec(true, "aac"), "aac");
         assert_eq!(super::resolve_live_audio_codec(true, "ac3"), "ac3");
     }
+
+    #[test]
+    fn hls_state_response_exposes_retry_and_terminal_semantics() {
+        let retry = hls_state_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "segment-not-ready",
+            Some("1"),
+        );
+        assert_eq!(retry.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry.headers()["Retry-After"], "1");
+        assert_eq!(retry.headers()["X-Remux-Hls-State"], "segment-not-ready");
+
+        let gone = hls_state_response(StatusCode::GONE, "session-gone", None);
+        assert_eq!(gone.status(), StatusCode::GONE);
+        assert_eq!(gone.headers()["X-Remux-Hls-State"], "session-gone");
+        assert!(!gone.headers().contains_key("Retry-After"));
+    }
 }
 
 /// Serves individual HLS segment files.
-/// Captures the full segment filename (e.g. "segment_00001.ts") and strips the extension.
+/// The full filename is retained so fMP4 remains fMP4 during disk recovery.
 #[get("/videos/{id}/main/{segment_file}")]
 pub async fn hls_segment(
     State(state): State<AppState>,
     Path((id, segment_file)): Path<(Uuid, String)>,
     Query(q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
-    let segment_id = strip_segment_extension(&segment_file);
-    hls_segment_inner(state, segment_id, q).await
+    hls_segment_inner(state, segment_file, q).await
 }
 
 /// Segment route at the same level as main.m3u8 — browsers resolve bare
@@ -824,8 +865,7 @@ pub async fn hls_segment_flat(
     Path((id, segment_file)): Path<(Uuid, String)>,
     Query(q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
-    let segment_id = strip_segment_extension(&segment_file);
-    hls_segment_inner(state, segment_id, q).await
+    hls_segment_inner(state, segment_file, q).await
 }
 
 /// Jellyfin-compatible HLS segment route: /Videos/{id}/hls1/{playlistId}/{segmentFile}
@@ -835,15 +875,24 @@ pub async fn hls1_segment(
     Path((id, _playlist_id, segment_file)): Path<(Uuid, String, String)>,
     Query(q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
-    let segment_id = strip_segment_extension(&segment_file);
-    hls_segment_inner(state, segment_id, q).await
+    hls_segment_inner(state, segment_file, q).await
 }
 
-fn strip_segment_extension(filename: &str) -> String {
-    filename
-        .rsplit_once('.')
-        .map(|(name, _ext)| name.to_string())
-        .unwrap_or_else(|| filename.to_string())
+fn hls_state_response(
+    status: StatusCode,
+    state: &'static str,
+    retry_after: Option<&'static str>,
+) -> Response<Body> {
+    let mut response = Response::builder()
+        .status(status)
+        .header("Cache-Control", "no-store")
+        .header("X-Remux-Hls-State", state);
+    if let Some(retry_after) = retry_after {
+        response = response.header("Retry-After", retry_after);
+    }
+    response
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// Find the highest segment index currently on disk in `dir`.
@@ -872,7 +921,7 @@ fn get_current_transcoding_index(dir: &std::path::Path) -> Option<u32> {
 
 async fn hls_segment_inner(
     state: AppState,
-    segment_id: String,
+    segment_file: String,
     q: api::HlsVideoQuery,
 ) -> Result<impl IntoResponse> {
     let play_session_id = q
@@ -880,7 +929,7 @@ async fn hls_segment_inner(
         .context_not_found("PlaySessionId is required")?;
 
     trace!(
-        segment_id = %segment_id,
+        segment_file = %segment_file,
         play_session_id = %play_session_id,
         runtime_ticks = ?q.runtime_ticks,
         "HLS segment request"
@@ -891,9 +940,7 @@ async fn hls_segment_inner(
         .sessions
         .get_transcode(&play_session_id);
 
-    // The fMP4 init segment is served at "init.mp4" — strip_segment_extension
-    // reduces that to "init", so we detect it here and serve it directly.
-    if segment_id == "init" {
+    if segment_file == "init.mp4" {
         let init_path = match &session {
             Some(s) => s
                 .read()
@@ -902,8 +949,7 @@ async fn hls_segment_inner(
             None => state
                 .ctx
                 .sessions
-                .segment_path(&play_session_id, "init.mp4")
-                .with_extension("mp4"),
+                .hls_file_path(&play_session_id, "init.mp4"),
         };
         // Wait briefly for ffmpeg to write the init segment.
         if session.is_some() {
@@ -914,7 +960,25 @@ async fn hls_segment_inner(
             }
         }
         if !init_path.exists() {
-            None::<()>.context_not_found("fMP4 init segment not ready")?;
+            return Ok(match &session {
+                Some(session)
+                    if matches!(
+                        session
+                            .read()
+                            .await
+                            .state,
+                        TranscodeState::Complete | TranscodeState::Error(_)
+                    ) =>
+                {
+                    hls_state_response(StatusCode::GONE, "transcode-ended", None)
+                }
+                Some(_) => hls_state_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "init-segment-not-ready",
+                    Some("1"),
+                ),
+                None => hls_state_response(StatusCode::GONE, "session-gone", None),
+            });
         }
         state
             .ctx
@@ -930,49 +994,62 @@ async fn hls_segment_inner(
             .unwrap());
     }
 
+    let Some(segment) = HlsSegmentFile::parse(&segment_file) else {
+        return Ok(hls_state_response(
+            StatusCode::NOT_FOUND,
+            "unknown-segment",
+            None,
+        ));
+    };
+
     // Derive the segment path — either from the live session or from the base
     // dir directly (handles server restart where session is gone but files remain).
     let segment_path = match &session {
-        Some(s) => s
-            .read()
-            .await
-            .segment_path(&segment_id),
+        Some(s) => {
+            let s = s
+                .read()
+                .await;
+            let expected_format = if s.use_fmp4() {
+                HlsSegmentFormat::FragmentedMp4
+            } else {
+                HlsSegmentFormat::MpegTs
+            };
+            if segment.format() != expected_format {
+                return Ok(hls_state_response(
+                    StatusCode::NOT_FOUND,
+                    "segment-format-mismatch",
+                    None,
+                ));
+            }
+            segment.path_in(&s.output_dir)
+        }
         None => state
             .ctx
             .sessions
-            .segment_path(&play_session_id, &segment_id),
+            .hls_file_path(&play_session_id, segment.filename()),
     };
 
-    // Parse the requested segment index from the filename.
-    let requested_idx: Option<u32> = segment_id
-        .rsplit('_')
-        .next()
-        .and_then(|n| {
-            n.parse::<u32>()
-                .ok()
-        });
+    let requested_idx = segment.index();
 
     if let Some(ref session) = session {
         // Update playback position for the buffer monitor.
-        if let Some(idx) = requested_idx {
-            use std::sync::atomic::Ordering;
-            let s = session
-                .read()
-                .await;
-            let prev = s
-                .last_segment_index
-                .load(Ordering::Relaxed);
-            if idx > prev {
-                s.last_segment_index
-                    .store(idx, Ordering::Relaxed);
-            }
+        use std::sync::atomic::Ordering;
+        let s = session
+            .read()
+            .await;
+        let prev = s
+            .last_segment_index
+            .load(Ordering::Relaxed);
+        if requested_idx > prev {
+            s.last_segment_index
+                .store(requested_idx, Ordering::Relaxed);
         }
     }
 
     // If the segment doesn't exist and we have a live session, check whether
     // FFmpeg needs to be restarted at a different position (like Jellyfin does).
     if !segment_path.exists() {
-        if let (Some(session), Some(requested_idx)) = (&session, requested_idx) {
+        if let Some(session) = &session {
             let s = session
                 .read()
                 .await;
@@ -1196,11 +1273,12 @@ async fn hls_segment_inner(
         }
     }
 
-    // Wait up to 60s for ffmpeg to produce the segment.
+    // Stay below the client's fragment timeout. If the transcode is alive but
+    // late, return a retryable 503 instead of a terminal-looking 404.
     // If there's no live session (e.g. after server restart), only serve from disk.
     if session.is_some() {
         let mut attempts = 0;
-        while !segment_path.exists() && attempts < 120 {
+        while !segment_path.exists() && attempts < 24 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             attempts += 1;
         }
@@ -1208,15 +1286,28 @@ async fn hls_segment_inner(
 
     if !segment_path.exists() {
         if session.is_none() {
-            None::<()>.context_not_found(&format!(
-                "transcode session {} gone and segment {} not on disk",
-                play_session_id, segment_id
-            ))?;
+            return Ok(hls_state_response(StatusCode::GONE, "session-gone", None));
         }
-        None::<()>.context_not_found(&format!(
-            "segment {} not ready after timeout",
-            segment_id
-        ))?;
+        if let Some(session) = &session {
+            if matches!(
+                session
+                    .read()
+                    .await
+                    .state,
+                TranscodeState::Complete | TranscodeState::Error(_)
+            ) {
+                return Ok(hls_state_response(
+                    StatusCode::GONE,
+                    "transcode-ended",
+                    None,
+                ));
+            }
+        }
+        return Ok(hls_state_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "segment-not-ready",
+            Some("1"),
+        ));
     }
 
     // Keep the session alive — the segment request counts as activity.
@@ -1230,19 +1321,9 @@ async fn hls_segment_inner(
     let body = Body::from_stream(stream);
 
     // fMP4 segments (.m4s) use video/mp4; MPEG-TS segments use video/mp2t.
-    let content_type = if segment_path
-        .extension()
-        .and_then(|e| e.to_str())
-        == Some("m4s")
-    {
-        "video/mp4"
-    } else {
-        "video/mp2t"
-    };
-
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header("Content-Type", content_type)
+        .header("Content-Type", segment.format().content_type())
         .header("Cache-Control", "public, max-age=86400")
         .body(body)
         .unwrap())

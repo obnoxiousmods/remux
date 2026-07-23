@@ -1,6 +1,6 @@
 use remux_sdks::remux::TranscodeReasons;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicU32},
     time::Instant,
 };
@@ -13,6 +13,80 @@ pub enum TranscodeState {
     Running,
     Complete,
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HlsSegmentFormat {
+    MpegTs,
+    FragmentedMp4,
+}
+
+impl HlsSegmentFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::MpegTs => "ts",
+            Self::FragmentedMp4 => "m4s",
+        }
+    }
+
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::MpegTs => "video/mp2t",
+            Self::FragmentedMp4 => "video/mp4",
+        }
+    }
+}
+
+/// A validated HLS media segment filename. Keeping the extension with the
+/// request prevents fMP4 sessions from silently falling back to MPEG-TS paths
+/// when the in-memory transcode session is no longer available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HlsSegmentFile {
+    filename: String,
+    stem: String,
+    index: u32,
+    format: HlsSegmentFormat,
+}
+
+impl HlsSegmentFile {
+    pub fn parse(filename: &str) -> Option<Self> {
+        let (stem, extension) = filename.rsplit_once('.')?;
+        let format = match extension {
+            "ts" => HlsSegmentFormat::MpegTs,
+            "m4s" => HlsSegmentFormat::FragmentedMp4,
+            _ => return None,
+        };
+        let index = stem
+            .strip_prefix("segment_")?
+            .parse::<u32>()
+            .ok()?;
+        Some(Self {
+            filename: filename.to_string(),
+            stem: stem.to_string(),
+            index,
+            format,
+        })
+    }
+
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    pub fn stem(&self) -> &str {
+        &self.stem
+    }
+
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    pub fn format(&self) -> HlsSegmentFormat {
+        self.format
+    }
+
+    pub fn path_in(&self, directory: &Path) -> PathBuf {
+        directory.join(&self.filename)
+    }
 }
 
 pub struct TranscodeSession {
@@ -153,7 +227,11 @@ impl TranscodeSession {
     }
 
     pub fn segment_path(&self, segment_id: &str) -> PathBuf {
-        let ext = if self.use_fmp4() { "m4s" } else { "ts" };
+        let ext = if self.use_fmp4() {
+            HlsSegmentFormat::FragmentedMp4.extension()
+        } else {
+            HlsSegmentFormat::MpegTs.extension()
+        };
         self.output_dir
             .join(format!("{}.{}", segment_id, ext))
     }
@@ -176,5 +254,27 @@ impl TranscodeSession {
             self.media_source_id
                 .as_simple(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HlsSegmentFile, HlsSegmentFormat};
+
+    #[test]
+    fn parses_only_supported_hls_media_segments() {
+        let ts = HlsSegmentFile::parse("segment_00025.ts").unwrap();
+        assert_eq!(ts.index(), 25);
+        assert_eq!(ts.stem(), "segment_00025");
+        assert_eq!(ts.format(), HlsSegmentFormat::MpegTs);
+
+        let fmp4 = HlsSegmentFile::parse("segment_00025.m4s").unwrap();
+        assert_eq!(fmp4.index(), 25);
+        assert_eq!(fmp4.format(), HlsSegmentFormat::FragmentedMp4);
+
+        assert!(HlsSegmentFile::parse("init.mp4").is_none());
+        assert!(HlsSegmentFile::parse("../segment_00025.m4s").is_none());
+        assert!(HlsSegmentFile::parse("segment_bad.m4s").is_none());
+        assert!(HlsSegmentFile::parse("segment_00025.mp4").is_none());
     }
 }

@@ -5,7 +5,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::{common, db, db::auth, playback::session::TranscodeSession};
+use crate::{
+    common, db, db::auth,
+    playback::session::{HlsSegmentFile, TranscodeSession, TranscodeState},
+};
 use remux_sdks::remux::{PlayMethod, PlaybackInfo, QueueItem};
 
 #[derive(Clone)]
@@ -709,6 +712,55 @@ impl PlaybackSessionManager {
         }
     }
 
+    /// Kill startup transcodes (no segments produced yet) that this device
+    /// already has running for the SAME upstream URL as a newly-created session.
+    ///
+    /// IPTV proxies commonly allow a single reader per channel and 503 the rest.
+    /// When a client's startup fails and it rotates `PlaySessionId` (a fresh
+    /// per-session create-lock key), each retry spawns another ffmpeg against the
+    /// same channel; they starve each other so none can produce segments and the
+    /// channel self-DoSes. Reaping the device's earlier same-channel startups
+    /// before the new ffmpeg connects keeps exactly one reader per channel.
+    /// `keep` is the new session and is never reaped.
+    pub async fn reap_competing_startups(&self, device_id: &str, input_url: &str, keep: &str) {
+        let candidates: Vec<(String, Arc<tokio::sync::RwLock<TranscodeSession>>)> = self
+            .sessions
+            .iter()
+            .filter(|e| e.key() != keep && e.value().device_id == device_id)
+            .filter_map(|e| {
+                e.value()
+                    .transcode
+                    .clone()
+                    .map(|ts| (e.key().clone(), ts))
+            })
+            .collect();
+        let mut victims = Vec::new();
+        for (psid, ts) in candidates {
+            let competing = {
+                let s = ts
+                    .read()
+                    .await;
+                s.input_url == input_url
+                    && matches!(
+                        s.state,
+                        TranscodeState::Starting | TranscodeState::Running
+                    )
+                    && !transcode_has_output(&s.output_dir)
+            };
+            if competing {
+                victims.push(psid);
+            }
+        }
+        for psid in victims {
+            info!(
+                play_session_id = %psid,
+                "reaping competing startup transcode for the same upstream channel"
+            );
+            self.stop_transcode(&psid)
+                .await;
+        }
+    }
+
     /// Stop the transcode (if any) and remove the playback session entirely.
     /// Returns the removed session so callers can read final position/item data.
     pub async fn stop(&self, id: &str) -> Option<PlaybackSession> {
@@ -724,8 +776,8 @@ impl PlaybackSessionManager {
         Some(session)
     }
 
-    /// Path where a given HLS segment lives on disk (used for disk-based recovery).
-    pub fn segment_path(&self, play_session_id: &str, segment_id: &str) -> PathBuf {
+    /// Path where a validated HLS file lives on disk (used for disk-based recovery).
+    pub fn hls_file_path(&self, play_session_id: &str, filename: &str) -> PathBuf {
         let session_dir = self
             .base_dir
             .join(play_session_id);
@@ -748,11 +800,11 @@ impl PlaybackSessionManager {
                 }
             }
             if let Some((dir, _)) = latest_dir {
-                return dir.join(format!("{}.ts", segment_id));
+                return dir.join(filename);
             }
         }
 
-        session_dir.join(format!("{}.ts", segment_id))
+        session_dir.join(filename)
     }
 
     pub fn base_dir(&self) -> &std::path::Path {
@@ -801,9 +853,95 @@ impl PlaybackSessionManager {
                     self.stop(&id)
                         .await;
                 }
+
+                // Reap transcodes stuck in startup: running past a short grace
+                // with no segments produced (abandoned, or an upstream that only
+                // allows one reader and 503'd this one). Left alone they hold the
+                // upstream connection until the idle cutoff and block fresh
+                // attempts on the same channel.
+                let startup_grace = std::time::Duration::from_secs(45);
+                let startup_candidates: Vec<(
+                    String,
+                    Arc<tokio::sync::RwLock<TranscodeSession>>,
+                )> = self
+                    .sessions
+                    .iter()
+                    .filter_map(|e| {
+                        e.value()
+                            .transcode
+                            .clone()
+                            .map(|ts| (e.key().clone(), ts))
+                    })
+                    .collect();
+                for (id, ts) in startup_candidates {
+                    let stuck = {
+                        let s = ts
+                            .read()
+                            .await;
+                        s.created_at
+                            .elapsed()
+                            > startup_grace
+                            && matches!(
+                                s.state,
+                                TranscodeState::Starting | TranscodeState::Running
+                            )
+                            && !transcode_has_output(&s.output_dir)
+                    };
+                    if stuck {
+                        info!("Reaping stuck startup transcode: {}", id);
+                        self.stop_transcode(&id)
+                            .await;
+                    }
+                }
             }
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transcode_has_output;
+
+    #[test]
+    fn transcode_has_output_requires_a_segment() {
+        let dir = std::env::temp_dir().join(format!("remux-has-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Missing directory -> no output.
+        assert!(!transcode_has_output(&dir));
+
+        std::fs::create_dir_all(&dir).unwrap();
+        // Empty directory -> stuck startup, no output.
+        assert!(!transcode_has_output(&dir));
+
+        // Playlist header alone doesn't count — readiness is a written segment.
+        std::fs::write(dir.join("main.m3u8"), b"#EXTM3U\n").unwrap();
+        assert!(!transcode_has_output(&dir));
+
+        // Either HLS media container means ffmpeg produced output.
+        std::fs::write(dir.join("segment_00000.ts"), b"\x47").unwrap();
+        assert!(transcode_has_output(&dir));
+        std::fs::remove_file(dir.join("segment_00000.ts")).unwrap();
+        std::fs::write(dir.join("segment_00000.m4s"), b"\0\0\0\x18styp").unwrap();
+        assert!(transcode_has_output(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// True once ffmpeg has written at least one HLS segment for this session.
+/// Distinguishes a producing transcode from a stuck/abandoned startup (whose
+/// output directory stays empty because the upstream never delivered data).
+fn transcode_has_output(output_dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(output_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if HlsSegmentFile::parse(&entry.file_name().to_string_lossy()).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Kill an ffmpeg process and wait for it to exit before returning.

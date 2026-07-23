@@ -289,12 +289,14 @@ pub async fn init_app(
         warn!(err = ?e, "intro sync failed at startup");
     }
 
-    // Kill idle sessions after 30 minutes of no activity.
-    // 30 min matches a "stepped away" scenario; pings keep active sessions alive indefinitely.
+    // Reap sessions idle for 15 minutes (a "stepped away" scenario; pings keep
+    // active sessions alive indefinitely). The same task also reaps transcodes
+    // stuck in startup with no output, so a short interval keeps those from
+    // holding an upstream connection for long.
     ctx.sessions
         .clone()
         .spawn_cleanup_task(
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(20),
             std::time::Duration::from_secs(60 * 15),
         );
 
