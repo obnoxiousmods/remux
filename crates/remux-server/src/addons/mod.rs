@@ -2609,6 +2609,9 @@ impl AddonService {
             let Some(raw_probe) = raw_probe else {
                 continue;
             };
+            if raw_probe.trim().eq_ignore_ascii_case("null") {
+                continue;
+            }
             match serde_json::from_str::<api::MediaSourceInfo>(&raw_probe) {
                 Ok(probe) => {
                     existing_probes.insert(id, probe);
