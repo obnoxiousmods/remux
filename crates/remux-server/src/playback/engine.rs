@@ -492,6 +492,10 @@ pub struct TranscodeParams {
     /// Codec of the source audio stream (e.g. "aac", "ac3"), used to apply
     /// codec-specific bitstream filters such as `aac_adtstoasc` when copying.
     pub source_audio_codec: Option<String>,
+    /// The selected VOD source already has persisted ProbeDB/ffprobe stream
+    /// metadata. Start with a smaller ffmpeg analysis window; any non-encoder
+    /// startup failure retries once with the conservative full budget.
+    pub trusted_probe_data: bool,
     /// Effective frame rate of the selected source video stream. NVENC needs an
     /// explicit frame-based GOP in addition to timestamp-forced keyframes so
     /// the HLS muxer can finalize segments while a remote VOD is still open.
@@ -552,6 +556,7 @@ impl Default for TranscodeParams {
             encoding_preset: None,
             source_video_codec: None,
             source_audio_codec: None,
+            trusted_probe_data: false,
             source_frame_rate: None,
             hardware_acceleration_type: HardwareAccelerationType::None,
             vaapi_device: "/dev/dri/renderD128".to_string(),
@@ -863,13 +868,18 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             .map(VideoCodec::is_hevc)
             .unwrap_or(false);
 
+    let (analyze_duration, probe_size) = if params.trusted_probe_data {
+        ("250000", "262144")
+    } else {
+        ("1000000", "1000000")
+    };
     let mut args: Vec<String> = vec![
         "-v".into(),
         "error".into(),
         "-analyzeduration".into(),
-        "1000000".into(),
+        analyze_duration.into(),
         "-probesize".into(),
-        "1000000".into(),
+        probe_size.into(),
         "-reconnect".into(),
         "1".into(),
         "-reconnect_at_eof".into(),
@@ -1480,6 +1490,7 @@ pub async fn start_transcode(
         let mut params = params;
         let mut sw_fallback = false;
         let mut hw_intact_retry = false;
+        let mut full_probe_retry = false;
         let mut live_restarts = 0u32;
         const MAX_LIVE_RESTARTS: u32 = 10;
 
@@ -1570,6 +1581,22 @@ pub async fn start_transcode(
                 let _ = std::fs::create_dir_all(&params.output_dir);
                 params.hardware_acceleration_type = HardwareAccelerationType::None;
                 sw_fallback = true;
+                continue;
+            }
+
+            if ffmpeg_failed
+                && params.trusted_probe_data
+                && !full_probe_retry
+                && count_segments(&params.output_dir) == 0
+            {
+                warn!(
+                    stderr = stderr_out.trim(),
+                    "Fast probe-budget startup failed — retrying with full analysis"
+                );
+                let _ = std::fs::remove_dir_all(&params.output_dir);
+                let _ = std::fs::create_dir_all(&params.output_dir);
+                params.trusted_probe_data = false;
+                full_probe_retry = true;
                 continue;
             }
 
@@ -2994,6 +3021,24 @@ mod tests {
         let args = build_hls_args(&default_hls(dir));
         assert_eq!(arg_after(&args, "-start_number"), Some("0"));
         assert!(!args_contains(&args, "-ss"));
+    }
+
+    #[test]
+    fn trusted_probe_uses_reduced_ffmpeg_analysis_budget() {
+        let dir = PathBuf::from("/tmp/test_trusted_probe");
+        let trusted = build_hls_args(&TranscodeParams {
+            trusted_probe_data: true,
+            ..default_hls(dir.clone())
+        });
+        let conservative = build_hls_args(&default_hls(dir));
+
+        assert_eq!(arg_after(&trusted, "-analyzeduration"), Some("250000"));
+        assert_eq!(arg_after(&trusted, "-probesize"), Some("262144"));
+        assert_eq!(
+            arg_after(&conservative, "-analyzeduration"),
+            Some("1000000")
+        );
+        assert_eq!(arg_after(&conservative, "-probesize"), Some("1000000"));
     }
 
     #[test]
