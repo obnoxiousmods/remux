@@ -100,6 +100,27 @@ fn add_playback_start_acknowledgement(
     playlist.replacen("#EXTM3U\n", &format!("#EXTM3U\n{acknowledgement}"), 1)
 }
 
+fn add_playback_generation_to_master(
+    playlist: String,
+    start_time_ticks: Option<i64>,
+) -> String {
+    let Some(ticks) = start_time_ticks.filter(|ticks| *ticks > 0) else {
+        return playlist;
+    };
+    playlist
+        .lines()
+        .map(|line| {
+            if line.starts_with('#') || !line.contains(".m3u8") {
+                return line.to_string();
+            }
+            let separator = if line.contains('?') { '&' } else { '?' };
+            format!("{line}{separator}StartTimeTicks={ticks}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
 /// Shared session setup: look up or create the transcode session for an HLS
 /// request. Returns the session handle and the resolved play_session_id.
 async fn create_hls_session(
@@ -662,7 +683,10 @@ pub async fn master_hls_video(
         .read()
         .await;
     let master_playlist = add_playback_start_acknowledgement(
-        crate::playback::engine::generate_master_playlist(&session_read),
+        add_playback_generation_to_master(
+            crate::playback::engine::generate_master_playlist(&session_read),
+            q.start_time_ticks,
+        ),
         q.start_time_ticks,
     );
     Ok(Response::builder()
@@ -847,6 +871,17 @@ async fn variant_hls_video_inner(
         // a live feed; leave live streams untouched.
         let is_complete = !is_live && content.contains("#EXT-X-ENDLIST");
 
+        // Include the acknowledged source offset in every media URL. A managed
+        // seek can intentionally reuse its PlaySessionId, but the bytes behind
+        // segment_00000 are then a different generation. Segment responses are
+        // cacheable for completed playback, so reusing the old URL would let
+        // hls.js or the browser replay the previous generation after a seek.
+        let generation_suffix = q
+            .start_time_ticks
+            .filter(|ticks| *ticks > 0)
+            .map(|ticks| format!("&StartTimeTicks={ticks}"))
+            .unwrap_or_default();
+
         // Inject ?PlaySessionId=... into segment/map lines so hls_segment_inner can find the session.
         let content = content
             .lines()
@@ -854,7 +889,10 @@ async fn variant_hls_video_inner(
                 if !line.starts_with('#')
                     && (line.ends_with(".ts") || line.ends_with(".m4s"))
                 {
-                    format!("{}?PlaySessionId={}", line, psid)
+                    format!(
+                        "{}?PlaySessionId={}{}",
+                        line, psid, generation_suffix
+                    )
                 } else if line.starts_with("#EXT-X-MAP:")
                     && !line.contains("PlaySessionId")
                 {
@@ -862,7 +900,10 @@ async fn variant_hls_video_inner(
                     // e.g. #EXT-X-MAP:URI="init.mp4" → #EXT-X-MAP:URI="init.mp4?PlaySessionId=…"
                     line.replace(
                         "\"init.mp4\"",
-                        &format!("\"init.mp4?PlaySessionId={}\"", psid),
+                        &format!(
+                            "\"init.mp4?PlaySessionId={}{}\"",
+                            psid, generation_suffix
+                        ),
                     )
                 } else if is_complete && line == "#EXT-X-PLAYLIST-TYPE:EVENT" {
                     "#EXT-X-PLAYLIST-TYPE:VOD".to_string()
@@ -886,7 +927,10 @@ async fn variant_hls_video_inner(
 mod tests {
     use http::StatusCode;
 
-    use super::{add_playback_start_acknowledgement, hls_state_response};
+    use super::{
+        add_playback_generation_to_master, add_playback_start_acknowledgement,
+        hls_state_response,
+    };
 
     #[test]
     fn master_playlist_acknowledges_applied_start_ticks() {
@@ -904,6 +948,29 @@ mod tests {
         let playlist = "#EXTM3U\n#EXT-X-VERSION:3\n".to_string();
         assert_eq!(
             add_playback_start_acknowledgement(playlist.clone(), Some(0)),
+            playlist
+        );
+    }
+
+    #[test]
+    fn master_playlist_versions_child_uri_for_offset_generation() {
+        let playlist = add_playback_generation_to_master(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmain.m3u8?PlaySessionId=session\n"
+                .to_string(),
+            Some(3_200_000_000),
+        );
+        assert!(playlist.contains(
+            "main.m3u8?PlaySessionId=session&StartTimeTicks=3200000000"
+        ));
+    }
+
+    #[test]
+    fn master_playlist_keeps_initial_child_uri_stable() {
+        let playlist =
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmain.m3u8?PlaySessionId=session\n"
+                .to_string();
+        assert_eq!(
+            add_playback_generation_to_master(playlist.clone(), None),
             playlist
         );
     }
