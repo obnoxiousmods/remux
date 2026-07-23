@@ -597,6 +597,11 @@ pub struct EncodingOptions {
     /// unaffected by this setting.
     #[default(Some(true))]
     pub enable_video_transcoding: Option<bool>,
+    /// Apply loudness normalization (`loudnorm=I=-14:TP=-1:LRA=11`) to the
+    /// audio stream when transcoding. Has no effect when audio_codec is "copy".
+    /// Defaults to true.
+    #[default(Some(true))]
+    pub normalize_audio_loudness: Option<bool>,
     /// Controls how embedded subtitle streams unsupported by the client are handled.
     /// Burn: encode into video (default). Extract: serve via Stream.js/VTT endpoint.
     /// Strip: remove from media source so the client never sees them.
@@ -4991,7 +4996,6 @@ impl Endpoint for GetItemCounts {
 #[dto]
 pub struct MetricsStatus {
     pub daily_days: i64,
-    pub daily_window: i64,
     pub last_updated_days_ago: Option<i64>,
     pub item_count: i64,
 }

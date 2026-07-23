@@ -32,8 +32,11 @@ use libc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::{AppContext, api, common::ProgressReporter, db, sdks};
+use crate::{
+    AppContext, api, common::ProgressReporter, db, sdks, stream::StreamDescriptor,
+};
 pub use addon::{Addon, CatalogState, set_user_addon_override, user_addon_override};
+use remux_sdks::remuxdb;
 
 pub use remux_sdks::remux::AddonPresetRef;
 use remux_sdks::remux::{LyricDto, MediaSegments, RemoteLyricInfoDto};
@@ -341,10 +344,11 @@ pub(crate) async fn bulk_insert_snapshots(
 pub(crate) fn merge_media(target: &mut db::Media, source: &db::Media, replace: bool) {
     use remux_utils::merge_option;
 
-    if (replace
-        || target
-            .title
-            .is_empty())
+    if !target.is_field_locked(&db::MetadataField::Name)
+        && (replace
+            || target
+                .title
+                .is_empty())
         && !source
             .title
             .is_empty()
@@ -354,21 +358,29 @@ pub(crate) fn merge_media(target: &mut db::Media, source: &db::Media, replace: b
             .clone();
     }
 
-    merge_option(&mut target.description, &source.description, replace);
+    if !target.is_field_locked(&db::MetadataField::Overview) {
+        merge_option(&mut target.description, &source.description, replace);
+    }
     merge_option(&mut target.released_at, &source.released_at, replace);
-    merge_option(&mut target.runtime, &source.runtime, replace);
+    if !target.is_field_locked(&db::MetadataField::Runtime) {
+        merge_option(&mut target.runtime, &source.runtime, replace);
+    }
     merge_option(
         &mut target.rating_audience,
         &source.rating_audience,
         replace,
     );
-    merge_option(&mut target.certification, &source.certification, replace);
-    merge_option(
-        &mut target.certification_age,
-        &source.certification_age,
-        replace,
-    );
-    merge_option(&mut target.country, &source.country, replace);
+    if !target.is_field_locked(&db::MetadataField::OfficialRating) {
+        merge_option(&mut target.certification, &source.certification, replace);
+        merge_option(
+            &mut target.certification_age,
+            &source.certification_age,
+            replace,
+        );
+    }
+    if !target.is_field_locked(&db::MetadataField::ProductionLocations) {
+        merge_option(&mut target.country, &source.country, replace);
+    }
     merge_option(
         &mut target.original_language,
         &source.original_language,
@@ -478,6 +490,7 @@ fn apply_meta(media: &mut db::Media, mut patch: db::Media, replace: bool) {
     if !patch
         .tags
         .is_empty()
+        && !media.is_field_locked(&db::MetadataField::Tags)
     {
         media
             .tags
@@ -504,10 +517,21 @@ fn apply_meta(media: &mut db::Media, mut patch: db::Media, replace: bool) {
         {
             let pending: Vec<(db::MediaRelation, db::Media)> = relations
                 .into_iter()
+                .filter(|(_, right_media)| match right_media.kind {
+                    db::MediaKind::Person => {
+                        !media.is_field_locked(&db::MetadataField::Cast)
+                    }
+                    db::MediaKind::Genre | db::MediaKind::MusicGenre => {
+                        !media.is_field_locked(&db::MetadataField::Genres)
+                    }
+                    _ => true,
+                })
                 .collect();
-            match &mut media.relations {
-                Some(existing) => existing.extend(pending),
-                None => media.relations = Some(pending),
+            if !pending.is_empty() {
+                match &mut media.relations {
+                    Some(existing) => existing.extend(pending),
+                    None => media.relations = Some(pending),
+                }
             }
         }
     }
@@ -2158,7 +2182,109 @@ impl AddonService {
             }
         }
     }
+}
 
+fn strip_video_ext(name: &str) -> &str {
+    if let Some((stem, ext)) = name.rsplit_once('.') {
+        if opendal::VIDEO_EXTENSIONS.contains(&ext) {
+            return stem;
+        }
+    }
+    name
+}
+
+fn match_probe_version<'a>(
+    versions: &'a [remuxdb::MediaInfo],
+    stream: &db::Media,
+) -> Option<&'a remuxdb::MediaInfo> {
+    let si = stream
+        .stream_info
+        .as_ref()?;
+
+    // Torrent: match by info_hash + file_idx. Covers both raw Torrent descriptors and
+    // debrid Http streams where the hash comes from AIOStreams streamData.
+    let (hash, hash_file_idx) = match si.descriptor {
+        StreamDescriptor::Torrent {
+            ref info_hash,
+            file_idx,
+            ..
+        } => (Some(info_hash.as_str()), file_idx.map(|i| i as i32)),
+        _ => (
+            si.torrent_info_hash
+                .as_deref(),
+            si.torrent_file_idx,
+        ),
+    };
+    if let Some(hash) = hash {
+        if let Some(v) = versions
+            .iter()
+            .find(|v| {
+                v.sources
+                    .iter()
+                    .any(|s| {
+                        s.torrent_info_hash
+                            .as_deref()
+                            == Some(hash)
+                            && s.torrent_file_idx == hash_file_idx
+                    })
+            })
+        {
+            return Some(v);
+        }
+    }
+
+    // Usenet: match by indexer_guid (+ indexer name when available) against version sources
+    if let Some(ref guid) = si.usenet_guid {
+        if let Some(v) = versions
+            .iter()
+            .find(|v| {
+                v.sources
+                    .iter()
+                    .any(|s| {
+                        s.indexer_guid
+                            .as_deref()
+                            == Some(guid.as_str())
+                            && (si
+                                .usenet_indexer
+                                .is_none()
+                                || s.indexer == si.usenet_indexer)
+                    })
+            })
+        {
+            return Some(v);
+        }
+    }
+
+    // HTTP: match by exact file size
+    if let Some(size) = si.size {
+        if let Some(v) = versions
+            .iter()
+            .find(|v| v.size == Some(size))
+        {
+            return Some(v);
+        }
+    }
+
+    // Fallback: match by filename (with and without video extension) against version sources
+    let filename = si
+        .filename
+        .as_deref()?;
+    let stem = strip_video_ext(filename);
+    versions
+        .iter()
+        .find(|v| {
+            v.sources
+                .iter()
+                .any(|s| {
+                    s.filename
+                        .as_deref()
+                        .map(|sf| sf == filename || strip_video_ext(sf) == stem)
+                        .unwrap_or(false)
+                })
+        })
+}
+
+impl AddonService {
     #[tracing::instrument(skip_all, fields(title = %media.title, kind = %media.kind))]
     pub async fn refresh_streams(
         &self,
@@ -2200,9 +2326,65 @@ impl AddonService {
         }
 
         let instant = Instant::now();
-        let raw = self
-            .get_streams(media, ctx, user_id)
-            .await?;
+        let probe_versions_fut = async {
+            let Some(url) = ctx
+                .config
+                .remuxdb_url
+                .clone()
+            else {
+                return None;
+            };
+            let imdb_id = if media.kind == db::MediaKind::Episode {
+                media
+                    .external_ids
+                    .series_imdb
+                    .as_deref()
+                    .or(media
+                        .external_ids
+                        .imdb
+                        .as_deref())
+            } else {
+                media
+                    .external_ids
+                    .imdb
+                    .as_deref()
+            };
+            let Some(imdb_id) = imdb_id else {
+                return None;
+            };
+            let cfg = db::Settings::get_config_or_default(&ctx.db).await;
+            if !cfg
+                .remuxdb_enabled
+                .unwrap_or(true)
+            {
+                return None;
+            }
+            let (season, episode) = if media.kind == db::MediaKind::Episode {
+                (
+                    media
+                        .parent_idx
+                        .map(|v| v as i32),
+                    media
+                        .idx
+                        .map(|v| v as i32),
+                )
+            } else {
+                (None, None)
+            };
+            remuxdb::fetch_probe(
+                &url,
+                cfg.remuxdb_token
+                    .as_deref(),
+                Some(crate::common::server_id().as_str()),
+                imdb_id,
+                season,
+                episode,
+            )
+            .await
+        };
+        let (raw, probe_versions) =
+            tokio::join!(self.get_streams(media, ctx, user_id), probe_versions_fut);
+        let raw = raw?;
         debug!(raw_count = raw.len(), "raw streams fetched");
 
         // Dedup by descriptor content; order preserves addon priority (DB load order).
@@ -2241,7 +2423,7 @@ impl AddonService {
             .execute(&ctx.db)
             .await?;
         media.streams_refreshed_at = Some(now);
-        let sources: Vec<db::Media> = deduped
+        let mut sources: Vec<db::Media> = deduped
             .into_iter()
             .enumerate()
             .map(|(idx, mut s)| {
@@ -2258,6 +2440,22 @@ impl AddonService {
                 s
             })
             .collect();
+
+        if let Some(ref versions) = probe_versions {
+            for source in &mut sources {
+                if source
+                    .probe_data
+                    .is_some()
+                {
+                    continue;
+                }
+                if let Some(version) = match_probe_version(versions, source) {
+                    source.probe_data = Some(version.into());
+                    debug!(id = %source.id, "remuxdb: probe data applied from version");
+                }
+            }
+        }
+
         db::Media::upsert(&ctx.db, &sources).await?;
 
         // delete stale items
@@ -2762,5 +2960,66 @@ mod tests {
         };
         apply_title_format(&mut media);
         assert_eq!(media.title, "S3E4 - Tumbleton");
+    }
+
+    #[test]
+    fn merge_media_respects_locked_name() {
+        let mut target = db::Media {
+            title: "User Title".to_string(),
+            locked_fields: vec![db::MetadataField::Name],
+            ..Default::default()
+        };
+        let source = db::Media {
+            title: "Provider Title".to_string(),
+            ..Default::default()
+        };
+        merge_media(&mut target, &source, true);
+        assert_eq!(
+            target.title, "User Title",
+            "locked Name must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn merge_media_respects_is_locked() {
+        let mut target = db::Media {
+            title: "User Title".to_string(),
+            description: Some("User Overview".to_string()),
+            is_locked: true,
+            ..Default::default()
+        };
+        let source = db::Media {
+            title: "Provider Title".to_string(),
+            description: Some("Provider Overview".to_string()),
+            ..Default::default()
+        };
+        merge_media(&mut target, &source, true);
+        assert_eq!(target.title, "User Title");
+        assert_eq!(
+            target
+                .description
+                .as_deref(),
+            Some("User Overview")
+        );
+    }
+
+    #[test]
+    fn merge_media_unlocked_fields_still_update() {
+        let mut target = db::Media {
+            locked_fields: vec![db::MetadataField::Name],
+            ..Default::default()
+        };
+        let source = db::Media {
+            description: Some("Provider Overview".to_string()),
+            ..Default::default()
+        };
+        merge_media(&mut target, &source, true);
+        assert_eq!(
+            target
+                .description
+                .as_deref(),
+            Some("Provider Overview"),
+            "unlocked Overview must still be updated"
+        );
     }
 }

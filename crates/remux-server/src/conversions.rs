@@ -3,6 +3,9 @@ use crate::{
     api, common,
     common::{ToRunTimeTicks, get_uuid},
     db,
+    playback::probe::{
+        StreamMeta, display_title_audio, display_title_subtitle, display_title_video,
+    },
     sdks::stremio,
     stream::StreamDescriptor,
 };
@@ -239,25 +242,71 @@ impl From<db::Media> for api::MediaSourceInfo {
             .runtime
             .and_then(|r| r.to_ticks(common::TickUnit::Seconds));
         let run_time_ticks = probe_ticks.or(meta_ticks);
-        let (media_streams, default_audio_stream_index, default_subtitle_stream_index) =
-            source
-                .probe_data
-                .map(|p| {
-                    (
-                        p.media_streams,
-                        p.default_audio_stream_index,
-                        p.default_subtitle_stream_index,
-                    )
-                })
-                .unwrap_or_default();
-        // Never emit an empty MediaStreams array. Some clients (e.g. Finamp's
-        // download size estimate) call `.first` on MediaStreams without guarding
-        // for empty and throw `Bad state: No element`, white-screening the
-        // download dialog — whereas a null/absent array is handled safely. When a
-        // track has not been probed yet, synthesize a minimal audio stream from
-        // the container so the array always carries at least one element.
-        let media_streams = if is_track && media_streams.is_empty() {
-            vec![api::MediaStream {
+        let (
+            mut media_streams,
+            default_audio_stream_index,
+            default_subtitle_stream_index,
+        ) = source
+            .probe_data
+            .map(|p| {
+                (
+                    p.media_streams,
+                    p.default_audio_stream_index,
+                    p.default_subtitle_stream_index,
+                )
+            })
+            .unwrap_or_default();
+
+        // Derive display_title for any stream that doesn't have one yet.
+        // This covers streams loaded from RemuxDB probe data where only raw
+        // track facts are stored; FFprobe-sourced streams may already have it.
+        for stream in &mut media_streams {
+            if stream
+                .display_title
+                .is_some()
+            {
+                continue;
+            }
+            let meta = StreamMeta {
+                language: stream
+                    .language
+                    .as_deref(),
+                codec: stream
+                    .codec
+                    .as_deref(),
+                profile: stream
+                    .profile
+                    .as_deref(),
+                channels: stream.channels,
+                channel_layout: stream
+                    .channel_layout
+                    .as_deref(),
+                width: stream.width,
+                height: stream.height,
+                video_range: None,
+                is_default: stream
+                    .is_default
+                    .unwrap_or(false),
+                is_forced: stream.is_forced,
+                is_external: stream.is_external,
+                is_hearing_impaired: stream.is_hearing_impaired,
+                title: stream
+                    .title
+                    .as_deref(),
+            };
+            stream.display_title = match stream.type_ {
+                Some(api::MediaStreamType::Video) => display_title_video(&meta),
+                Some(api::MediaStreamType::Audio) => display_title_audio(&meta),
+                Some(api::MediaStreamType::Subtitle) => display_title_subtitle(&meta),
+                _ => None,
+            };
+        }
+
+        // Never emit an empty MediaStreams array for tracks. Some clients
+        // inspect the first stream before direct playback or download and
+        // reject an otherwise playable, not-yet-probed source.
+        if is_track && media_streams.is_empty() {
+            media_streams = vec![api::MediaStream {
                 type_: Some(api::MediaStreamType::Audio),
                 index: 0,
                 codec: Some(container.clone()),
@@ -265,10 +314,8 @@ impl From<db::Media> for api::MediaSourceInfo {
                 is_default: Some(true),
                 display_title: Some("Audio".to_string()),
                 ..Default::default()
-            }]
-        } else {
-            media_streams
-        };
+            }];
+        }
         api::MediaSourceInfo {
             id: client_id,
             e_tag: client_id,
