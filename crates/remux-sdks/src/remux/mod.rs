@@ -599,8 +599,9 @@ pub struct EncodingOptions {
     pub enable_video_transcoding: Option<bool>,
     /// Apply loudness normalization (`loudnorm=I=-14:TP=-1:LRA=11`) to the
     /// audio stream when transcoding. Has no effect when audio_codec is "copy".
-    /// Defaults to true.
-    #[default(Some(true))]
+    /// Disabled by default because the filter buffers several seconds of audio
+    /// before producing output and therefore delays the first HLS segment.
+    #[default(Some(false))]
     pub normalize_audio_loudness: Option<bool>,
     /// Controls how embedded subtitle streams unsupported by the client are handled.
     /// Burn: encode into video (default). Extract: serve via Stream.js/VTT endpoint.
@@ -1612,6 +1613,12 @@ mod tests {
                 .unwrap_or_default(),
             EmbeddedSubtitleHandling::Burn
         );
+    }
+
+    #[test]
+    fn encoding_options_loudness_normalization_defaults_off() {
+        let opts = EncodingOptions::default();
+        assert_eq!(opts.normalize_audio_loudness, Some(false));
     }
 
     #[test]
