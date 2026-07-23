@@ -1,0 +1,34 @@
+# Loopback-only MediaMTX configuration for the Remux LL-HLS prototype.
+#
+# FFmpeg publishes one RTSP stream per PlaySessionId. MediaMTX turns that
+# stream into Apple LL-HLS (CMAF parts), while Remux remains responsible for
+# authentication, session ownership, source stickiness, seeking, and cleanup.
+logLevel: info
+
+api: true
+apiAddress: 127.0.0.1:19997
+metrics: false
+pprof: false
+playback: false
+
+rtsp: true
+rtspTransports: [tcp]
+rtspAddress: 127.0.0.1:18554
+rtmp: false
+
+hls: true
+hlsAddress: 127.0.0.1:18888
+hlsAllowOrigins: ["*"]
+hlsAlwaysRemux: true
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsMuxerCloseAfter: 10s
+
+webrtc: false
+srt: false
+moq: false
+
+paths:
+  all_others:

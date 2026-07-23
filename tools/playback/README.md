@@ -68,3 +68,29 @@ local copy wins. Result: `car time` went **97/133 → 125/133**, all healed trac
 decode-verified, zero regressions. The 8 residual failures have no local copy (gone
 upstream) or point at a since-deleted file (stale index). See
 `MUSIC-CLIENT-COMPAT-AUDIT.md` and `crates/remux-server/src/addons/opendal.rs`.
+
+## Apple LL-HLS prototype
+
+`mediamtx-llhls-prototype.yml` is a loopback-only packager configuration for
+testing true Apple LL-HLS without changing the production HLS routes. FFmpeg
+publishes H.264/AAC over RTSP and MediaMTX emits one-second CMAF segments split
+into 200 ms parts.
+
+The intended production boundary is:
+
+- Remux owns authentication, `PlaySessionId`, source selection, seek offsets,
+  source stickiness, publisher lifetime, and recovery.
+- FFmpeg publishes one RTSP path per `PlaySessionId`.
+- MediaMTX only packages that publisher into Apple LL-HLS.
+- Remux proxies and rewrites the playlists and CMAF assets; MediaMTX remains
+  unreachable outside loopback.
+
+Do not enable this path for VOD until Remux exposes the full episode timeline
+and translates an out-of-window seek into an accurate same-source FFmpeg
+restart. MediaMTX's native playlist is a sliding live window, so serving it
+directly would regress long-seek behavior even though startup is faster.
+
+The initial 1280x720 H.264/AAC synthetic cold-start proof on this host produced
+the master playlist at 614 ms, listed the first 200 ms part at 630 ms, and
+successfully fetched it at 639 ms. These numbers isolate local encode and
+packaging overhead; remote source open time still has to be measured separately.
