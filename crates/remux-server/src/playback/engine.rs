@@ -450,6 +450,10 @@ pub struct TranscodeParams {
     pub audio_codec: String, // "aac", "copy"
     pub segment_length: u32, // seconds (default 6)
     pub start_time_ticks: Option<i64>,
+    /// Sequence number assigned to the first output segment. A new playback
+    /// generation always starts at zero even when its source seek is non-zero;
+    /// segment-driven recovery may preserve the requested local sequence.
+    pub hls_start_number: u32,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
     pub video_bitrate: Option<u32>,
@@ -515,6 +519,7 @@ impl Default for TranscodeParams {
             audio_codec: "aac".to_string(),
             segment_length: 6,
             start_time_ticks: None,
+            hls_start_number: 0,
             max_width: None,
             max_height: None,
             video_bitrate: None,
@@ -1277,13 +1282,6 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         .output_dir
         .join(format!("segment_%05d.{}", seg_ext));
 
-    let start_number = params
-        .start_time_ticks
-        .map(|t| {
-            (t as f64 / 10_000_000.0 / params.segment_length as f64).floor() as u32
-        })
-        .unwrap_or(0);
-
     args.extend([
         "-f".into(),
         "hls".into(),
@@ -1292,7 +1290,9 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             .segment_length
             .to_string(),
         "-start_number".into(),
-        start_number.to_string(),
+        params
+            .hls_start_number
+            .to_string(),
         "-hls_segment_filename".into(),
         segment
             .to_string_lossy()
@@ -2956,8 +2956,9 @@ mod tests {
         assert!(ss_pos < i_pos, "-ss must come before -i");
         assert_eq!(args[ss_pos + 1], "30.000000");
 
-        // start_number = floor(30 / 6) = 5
-        assert_eq!(arg_after(&args, "-start_number"), Some("5"));
+        // Source time and HLS sequence time are intentionally independent.
+        // The player maps this fresh local-zero stream back onto item time.
+        assert_eq!(arg_after(&args, "-start_number"), Some("0"));
     }
 
     #[test]
@@ -2966,6 +2967,22 @@ mod tests {
         let args = build_hls_args(&default_hls(dir));
         assert_eq!(arg_after(&args, "-start_number"), Some("0"));
         assert!(!args_contains(&args, "-ss"));
+    }
+
+    #[test]
+    fn hls_recovery_can_preserve_requested_local_sequence() {
+        let dir = PathBuf::from("/tmp/test_recovery_sequence");
+        let ticks: i64 = 132i64
+            .to_ticks(TickUnit::Seconds)
+            .unwrap();
+        let args = build_hls_args(&TranscodeParams {
+            start_time_ticks: Some(ticks),
+            hls_start_number: 22,
+            ..default_hls(dir)
+        });
+
+        assert_eq!(arg_after(&args, "-ss"), Some("132.000000"));
+        assert_eq!(arg_after(&args, "-start_number"), Some("22"));
     }
 
     #[test]

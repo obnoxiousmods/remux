@@ -424,6 +424,7 @@ async fn create_hls_session(
             audio_codec: audio_codec.clone(),
             segment_length,
             start_time_ticks: q.start_time_ticks,
+            hls_start_number: 0,
             max_width: q
                 .max_width
                 .map(|v| v as u32),
@@ -693,8 +694,10 @@ async fn variant_hls_video_inner(
         // For live streams, serve the ffmpeg-written EVENT playlist directly.
         // For fMP4 VOD, also use ffmpeg's playlist because fMP4 segments snap to
         // keyframe boundaries so actual durations differ from our target.
-        // For resumed TS-HLS sessions, ffmpeg's playlist carries the correct
-        // non-zero MEDIA-SEQUENCE and segment filenames after -start_number.
+        // For resumed TS-HLS sessions, ffmpeg's playlist carries the fresh
+        // local-zero timeline expected by clients that acknowledged
+        // StartTimeTicks. Segment-driven recovery can still preserve a
+        // requested local MEDIA-SEQUENCE.
         // Poll until ffmpeg has opened the playlist and written its header:
         // the muxer emits #EXT-X-TARGETDURATION at open, while the first
         // #EXTINF only appears when the first full segment closes. Clients
@@ -1113,6 +1116,7 @@ async fn hls_segment_inner(
                     let audio_stream_index = s.audio_stream_index;
                     let subtitle_stream_index = s.subtitle_stream_index;
                     let burn_subtitle = s.burn_subtitle;
+                    let session_start_secs = s.start_time_secs;
                     drop(s);
 
                     // Kill running FFmpeg and clean up stale segments (params
@@ -1144,7 +1148,8 @@ async fn hls_segment_inner(
                     let start_time_ticks = q
                         .runtime_ticks
                         .unwrap_or_else(|| {
-                            (requested_idx as i64 * segment_length as i64)
+                            (session_start_secs as i64
+                                + requested_idx as i64 * segment_length as i64)
                                 .to_ticks(TickUnit::Seconds)
                                 .unwrap_or(0)
                         });
@@ -1163,6 +1168,7 @@ async fn hls_segment_inner(
                         audio_codec: audio_codec.clone(),
                         segment_length,
                         start_time_ticks: Some(start_time_ticks),
+                        hls_start_number: requested_idx,
                         max_width: q
                             .max_width
                             .map(|v| v as u32),
@@ -1257,10 +1263,7 @@ async fn hls_segment_inner(
                             .send(TranscodeState::Starting);
                         s.start_time_secs = (start_time_ticks / 10_000_000) as u32;
                         s.playback_offset_secs
-                            .store(
-                                s.start_time_secs,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
                     }
 
                     let session_clone = session.clone();
