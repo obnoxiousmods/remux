@@ -2377,6 +2377,46 @@ fn match_probe_version<'a>(
         .then(|| matches[0])
 }
 
+fn inherit_missing_item_chapters(sources: &mut [db::Media]) -> usize {
+    let donor = sources
+        .iter()
+        .filter_map(|source| source.probe_data.as_ref())
+        .filter(|probe| !probe.virtual_chapters && !probe.chapters.is_empty())
+        .max_by_key(|probe| probe.chapters.len())
+        .map(|probe| {
+            (
+                probe.chapters.clone(),
+                probe.segments.clone(),
+                probe
+                    .chapter_source_content_hash
+                    .clone()
+                    .or_else(|| probe.content_hash.clone()),
+            )
+        });
+    let Some((chapters, segments, donor_content_hash)) = donor else {
+        return 0;
+    };
+
+    let mut inherited = 0usize;
+    for source in sources {
+        let probe = source
+            .probe_data
+            .get_or_insert_with(Default::default);
+        if !probe.chapters.is_empty() {
+            continue;
+        }
+        probe.chapters = chapters.clone();
+        probe.virtual_chapters = false;
+        probe.chapters_inherited = true;
+        probe.chapter_source_content_hash = donor_content_hash.clone();
+        if probe.segments.is_none() {
+            probe.segments = segments.clone();
+        }
+        inherited += 1;
+    }
+    inherited
+}
+
 impl AddonService {
     #[tracing::instrument(skip_all, fields(title = %media.title, kind = %media.kind))]
     pub async fn refresh_streams(
@@ -2553,11 +2593,39 @@ impl AddonService {
                 }
             }
         }
+
+        // Preserve a source's existing full local probe when RemuxDB did not
+        // produce an exact version match. This lets the item-level chapter
+        // fallback fill only the missing chapter fields instead of replacing
+        // previously cached streams/codecs with a chapter-only payload.
+        let existing_probes: std::collections::HashMap<
+            Uuid,
+            api::MediaSourceInfo,
+        > = sqlx::query_as::<
+            _,
+            (Uuid, Option<sqlx::types::Json<api::MediaSourceInfo>>),
+        >("SELECT id, probe_data FROM media WHERE kind = 'stream' AND parent_id = ?")
+        .bind(media.id)
+        .fetch_all(&ctx.db)
+        .await?
+        .into_iter()
+        .filter_map(|(id, probe)| probe.map(|probe| (id, probe.0)))
+        .collect();
+        for source in &mut sources {
+            if source.probe_data.is_none() {
+                source.probe_data = existing_probes
+                    .get(&source.id)
+                    .cloned();
+            }
+        }
+
+        let inherited_chapters = inherit_missing_item_chapters(&mut sources);
         db::Media::upsert(&ctx.db, &sources).await?;
         if probe_version_count > 0 {
             info!(
                 probe_versions = probe_version_count,
                 probe_matches,
+                inherited_chapters,
                 stream_count = sources.len(),
                 "remuxdb: persisted probe data merged into refreshed streams"
             );

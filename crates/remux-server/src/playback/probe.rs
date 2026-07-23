@@ -397,6 +397,32 @@ fn chapters_to_segments(chapters: &[FfprobeChapter]) -> MediaSegments {
     segs
 }
 
+fn chapters_to_media_info(chapters: &[FfprobeChapter]) -> Vec<api::MediaChapterInfo> {
+    chapters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chapter)| {
+            let start_position_ticks = chapter
+                .start_time
+                .to_ticks(TickUnit::Seconds)?;
+            let end_position_ticks = chapter
+                .end_time
+                .to_ticks(TickUnit::Seconds)
+                .filter(|end| *end > start_position_ticks);
+            Some(api::MediaChapterInfo {
+                id: i32::try_from(index).ok(),
+                title: chapter
+                    .tags
+                    .get("title")
+                    .or_else(|| chapter.tags.get("TITLE"))
+                    .cloned(),
+                start_position_ticks,
+                end_position_ticks,
+            })
+        })
+        .collect()
+}
+
 /// Probe a media URL with ffprobe and return a Jellyfin `MediaSourceInfo`
 /// alongside any chapter-derived `MediaSegments`.
 pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
@@ -814,6 +840,7 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
         .map(|s| s.index);
 
     let segments = chapters_to_segments(&probe.chapters);
+    let chapters = chapters_to_media_info(&probe.chapters);
 
     Ok((
         api::MediaSourceInfo {
@@ -826,6 +853,7 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
             run_time_ticks,
             bitrate: overall_bitrate,
             size: overall_size,
+            chapters,
             default_audio_stream_index,
             default_subtitle_stream_index,
             ..Default::default()
@@ -1035,6 +1063,21 @@ where
 
         match probe_result {
             Ok(Ok(Ok((mut probed, segments)))) => {
+                if probed.chapters.is_empty()
+                    && let Some(cached) = stream2
+                        .probe_data
+                        .as_ref()
+                    && !cached.chapters.is_empty()
+                {
+                    probed.chapters = cached.chapters.clone();
+                    probed.virtual_chapters = false;
+                    probed.chapters_inherited = cached.chapters_inherited;
+                    probed.chapter_source_content_hash =
+                        cached.chapter_source_content_hash.clone();
+                    if probed.segments.is_none() {
+                        probed.segments = cached.segments.clone();
+                    }
+                }
                 // Reject *video* streams whose probed duration is suspiciously
                 // short relative to the known metadata runtime (or absolutely
                 // < 3 min when unknown) — these are typically error/copyright-

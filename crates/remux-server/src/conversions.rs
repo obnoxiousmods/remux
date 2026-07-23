@@ -246,6 +246,12 @@ impl From<db::Media> for api::MediaSourceInfo {
             mut media_streams,
             default_audio_stream_index,
             default_subtitle_stream_index,
+            chapters,
+            virtual_chapters,
+            chapters_inherited,
+            chapter_source_content_hash,
+            content_hash,
+            segments,
         ) = source
             .probe_data
             .map(|p| {
@@ -253,6 +259,12 @@ impl From<db::Media> for api::MediaSourceInfo {
                     p.media_streams,
                     p.default_audio_stream_index,
                     p.default_subtitle_stream_index,
+                    p.chapters,
+                    p.virtual_chapters,
+                    p.chapters_inherited,
+                    p.chapter_source_content_hash,
+                    p.content_hash,
+                    p.segments,
                 )
             })
             .unwrap_or_default();
@@ -337,6 +349,12 @@ impl From<db::Media> for api::MediaSourceInfo {
             required_http_headers: HashMap::new(),
             run_time_ticks,
             media_streams,
+            chapters,
+            virtual_chapters,
+            chapters_inherited,
+            chapter_source_content_hash,
+            content_hash,
+            segments,
             default_audio_stream_index,
             default_subtitle_stream_index,
             ..Default::default()

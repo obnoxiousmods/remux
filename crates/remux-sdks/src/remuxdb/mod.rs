@@ -1,7 +1,8 @@
 use crate::{
     ClientError, Endpoint, RestClient,
     remux::{
-        MediaSourceInfo, MediaStream, MediaStreamType, VideoRange, VideoRangeType,
+        MediaChapterInfo, MediaSegmentType, MediaSegments, MediaSourceInfo, MediaStream,
+        MediaStreamType, Segment, VideoRange, VideoRangeType,
     },
 };
 use http::{HeaderMap, HeaderValue};
@@ -615,8 +616,96 @@ impl From<&TrackDetail> for MediaStream {
     }
 }
 
+fn seconds_to_ticks(seconds: f64) -> Option<i64> {
+    (seconds.is_finite() && seconds >= 0.0)
+        .then(|| (seconds * 10_000_000.0).round() as i64)
+}
+
+fn chapter_segment_type(title: &str) -> Option<MediaSegmentType> {
+    let normalized = title.to_ascii_lowercase();
+    if normalized.contains("intro") {
+        Some(MediaSegmentType::Intro)
+    } else if normalized.contains("recap") {
+        Some(MediaSegmentType::Recap)
+    } else if normalized.contains("credits") || normalized.contains("outro") {
+        Some(MediaSegmentType::Outro)
+    } else if normalized.contains("preview") {
+        Some(MediaSegmentType::Preview)
+    } else if normalized.contains("commercial")
+        || normalized.contains(" ad ")
+        || normalized == "ad"
+    {
+        Some(MediaSegmentType::Commercial)
+    } else {
+        None
+    }
+}
+
+fn chapter_info(version: &MediaInfo) -> Vec<MediaChapterInfo> {
+    version
+        .chapters
+        .iter()
+        .filter_map(|chapter| {
+            let start_position_ticks = seconds_to_ticks(chapter.start_time?)?;
+            let end_position_ticks = chapter
+                .end_time
+                .and_then(seconds_to_ticks)
+                .filter(|end| *end > start_position_ticks);
+            Some(MediaChapterInfo {
+                id: chapter.id,
+                title: chapter.title.clone(),
+                start_position_ticks,
+                end_position_ticks,
+            })
+        })
+        .collect()
+}
+
+fn chapter_segments(chapters: &[MediaChapterInfo]) -> MediaSegments {
+    let mut segments = MediaSegments::default();
+    for chapter in chapters {
+        let Some(kind) = chapter
+            .title
+            .as_deref()
+            .and_then(chapter_segment_type)
+        else {
+            continue;
+        };
+        let Some(end_ticks) = chapter.end_position_ticks else {
+            continue;
+        };
+        let segment = Segment {
+            start_ticks: chapter.start_position_ticks,
+            end_ticks,
+        };
+        match kind {
+            MediaSegmentType::Intro if segments.intro.is_none() => {
+                segments.intro = Some(segment)
+            }
+            MediaSegmentType::Outro if segments.outro.is_none() => {
+                segments.outro = Some(segment)
+            }
+            MediaSegmentType::Recap if segments.recap.is_none() => {
+                segments.recap = Some(segment)
+            }
+            MediaSegmentType::Preview if segments.preview.is_none() => {
+                segments.preview = Some(segment)
+            }
+            MediaSegmentType::Commercial if segments.commercial.is_none() => {
+                segments.commercial = Some(segment)
+            }
+            _ => {}
+        }
+    }
+    segments
+}
+
 impl From<&MediaInfo> for MediaSourceInfo {
     fn from(version: &MediaInfo) -> Self {
+        let chapters = chapter_info(version);
+        let segments = (!version.virtual_chapters)
+            .then(|| chapter_segments(&chapters))
+            .filter(|segments| !segments.is_empty());
         MediaSourceInfo {
             container: version
                 .container
@@ -631,6 +720,12 @@ impl From<&MediaInfo> for MediaSourceInfo {
                 .iter()
                 .map(MediaStream::from)
                 .collect(),
+            chapters,
+            virtual_chapters: version.virtual_chapters,
+            chapters_inherited: false,
+            chapter_source_content_hash: version.content_hash.clone(),
+            content_hash: version.content_hash.clone(),
+            segments,
             ..Default::default()
         }
     }

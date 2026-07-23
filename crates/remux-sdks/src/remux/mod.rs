@@ -2070,6 +2070,19 @@ pub struct TranscodingInfo {
     pub transcode_reasons: TranscodeReasons,
 }
 
+/// Source-bound chapter metadata produced by ffprobe or imported from RemuxDB.
+///
+/// These timestamps belong to the exact matched release. Consumers must not
+/// reuse them for a sibling source unless its content identity also matches.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaChapterInfo {
+    pub id: Option<i32>,
+    pub title: Option<String>,
+    pub start_position_ticks: i64,
+    pub end_position_ticks: Option<i64>,
+}
+
 #[dto]
 pub struct MediaSourceInfo {
     pub analyze_duration_ms: Option<i64>,
@@ -2103,6 +2116,14 @@ pub struct MediaSourceInfo {
     pub media_attachments: Vec<serde_json::Value>,
     #[default(vec![])]
     pub media_streams: Vec<MediaStream>,
+    #[default(vec![])]
+    pub chapters: Vec<MediaChapterInfo>,
+    #[default(false)]
+    pub virtual_chapters: bool,
+    #[default(false)]
+    pub chapters_inherited: bool,
+    pub chapter_source_content_hash: Option<String>,
+    pub content_hash: Option<String>,
     pub name: Option<String>,
     pub open_token: Option<String>,
     pub path: Option<String>,
