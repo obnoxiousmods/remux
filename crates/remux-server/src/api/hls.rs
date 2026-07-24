@@ -200,6 +200,21 @@ fn first_segment_path(dir: &std::path::Path, use_fmp4: bool) -> Option<std::path
     best.map(|(_, path)| path)
 }
 
+/// Parse ffprobe's csv packet output for the first pts_time value. The
+/// `csv=p=0` writer terminates the row with a comma (`1.483000,`), which a
+/// bare f64 parse rejects.
+fn parse_ffprobe_pts_time(stdout: &str) -> Option<f64> {
+    stdout
+        .lines()
+        .find_map(|line| {
+            line
+                .trim()
+                .trim_end_matches(',')
+                .parse::<f64>()
+                .ok()
+        })
+}
+
 /// Read the first video packet's pts_time from a segment file. Bounded and
 /// local-only: `-read_intervals %+#1` stops after the first packet.
 async fn probe_first_video_pts_secs(path: &std::path::Path) -> Option<f64> {
@@ -233,14 +248,7 @@ async fn probe_first_video_pts_secs(path: &std::path::Path) -> Option<f64> {
     {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| {
-            line
-                .trim()
-                .parse::<f64>()
-                .ok()
-        })
+    parse_ffprobe_pts_time(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Shared session setup: look up or create the transcode session for an HLS
@@ -1287,6 +1295,14 @@ mod tests {
         // Implausible magnitudes are demuxer noise and clamp to zero.
         assert_eq!(super::pts_offset_secs(121.0), 0.0);
         assert_eq!(super::pts_offset_secs(-121.0), 0.0);
+    }
+
+    #[test]
+    fn ffprobe_pts_time_parses_csv_trailing_comma() {
+        assert_eq!(super::parse_ffprobe_pts_time("1.483000,\n"), Some(1.483));
+        assert_eq!(super::parse_ffprobe_pts_time("95443.7,\n"), Some(95443.7));
+        assert_eq!(super::parse_ffprobe_pts_time(""), None);
+        assert_eq!(super::parse_ffprobe_pts_time("N/A\n"), None);
     }
 
     #[test]
