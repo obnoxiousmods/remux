@@ -122,19 +122,31 @@ fn add_playback_generation_to_master(
 }
 
 /// A session may be claimed — left running rather than restarted — only when
-/// the request's seek matches the transcode it is already running, to the
-/// exact tick. Truncating to whole seconds could bind the acknowledgement to
-/// ticks ffmpeg never used. This must hold for every repeated master request,
-/// prewarm or not: playlist retries during the readiness window re-send the
-/// same StartTimeTicks and have to be idempotent, while a different value is
-/// a genuine seek and forces a restart.
+/// the request matches the transcode it is already running. The seek must
+/// match to the exact tick: truncating to whole seconds could bind the
+/// acknowledgement to ticks ffmpeg never used. An explicitly different audio
+/// stream index must also never claim: the running ffmpeg has the previous
+/// track mapped, while the client believes its own selection is playing
+/// (a prewarm started with the server's default index and claimed by a player
+/// with a preference index played the default track behind an English UI).
+/// None means "no opinion" and never blocks a claim. This must hold for every
+/// repeated master request, prewarm or not: playlist retries during the
+/// readiness window re-send the same parameters and have to be idempotent,
+/// while a different value is a genuine change and forces a restart.
 fn can_claim_hls_session(
     session_requested_ticks: i64,
+    session_audio_index: Option<i32>,
     request_ticks: Option<i64>,
+    request_audio_index: Option<i32>,
 ) -> bool {
-    session_requested_ticks == request_ticks
+    let ticks_match = session_requested_ticks == request_ticks
         .unwrap_or(0)
-        .max(0)
+        .max(0);
+    let audio_matches = match (session_audio_index, request_audio_index) {
+        (Some(running), Some(requested)) => running == requested,
+        _ => true,
+    };
+    ticks_match && audio_matches
 }
 
 /// Ticks to acknowledge as the playback start: the measured keyframe-aligned
@@ -321,19 +333,23 @@ async fn create_hls_session(
             .sessions
             .get_transcode(&play_session_id)
         {
-            // A repeated master request carrying the same StartTimeTicks is a
-            // playlist retry, not a seek: claiming must be idempotent, or
-            // every retry during the readiness window kills and restarts the
-            // transcode and the first segment never materialises. Anything
-            // but an exact tick match is a genuine seek — stop the session
-            // and restart from the requested position. Truncated seconds
-            // could acknowledge ticks ffmpeg never used (baked-in subtitle
-            // desync).
+            // A repeated master request carrying the same StartTimeTicks and
+            // audio track is a playlist retry, not a seek: claiming must be
+            // idempotent, or every retry during the readiness window kills
+            // and restarts the transcode and the first segment never
+            // materialises. A different tick value is a genuine seek, and a
+            // different explicit audio index is a genuine track change —
+            // both stop the session and restart from the request. Truncated
+            // seconds could acknowledge ticks ffmpeg never used (baked-in
+            // subtitle desync).
             let can_claim = {
                 let current = existing.read().await;
                 can_claim_hls_session(
                     current.requested_start_ticks,
+                    current.audio_stream_index,
                     q.start_time_ticks,
+                    q.audio_stream_index
+                        .filter(|&v| v >= 0),
                 )
             };
             if !can_claim {
@@ -1251,15 +1267,22 @@ mod tests {
     fn session_claim_requires_exact_tick_match() {
         // Exact match: claim allowed, prewarm or not — playlist retries are
         // idempotent and must never restart the transcode.
-        assert!(super::can_claim_hls_session(1_000_000_000, Some(1_000_000_000)));
+        assert!(super::can_claim_hls_session(1_000_000_000, Some(2), Some(1_000_000_000), Some(2)));
         // A sub-second difference must NOT claim — ffmpeg was started with
         // different ticks than the acknowledgement would report; this is a
         // genuine seek and restarts the session.
-        assert!(!super::can_claim_hls_session(1_000_000_000, Some(1_000_000_001)));
-        assert!(!super::can_claim_hls_session(1_000_400_000, Some(1_000_900_000)));
+        assert!(!super::can_claim_hls_session(1_000_000_000, Some(2), Some(1_000_000_001), Some(2)));
+        assert!(!super::can_claim_hls_session(1_000_400_000, None, Some(1_000_900_000), None));
         // No seek in the request: claim only matches a from-start session.
-        assert!(super::can_claim_hls_session(0, None));
-        assert!(!super::can_claim_hls_session(1_000_000_000, None));
+        assert!(super::can_claim_hls_session(0, None, None, None));
+        assert!(!super::can_claim_hls_session(1_000_000_000, None, None, None));
+        // A different explicit audio index is a genuine track change, never a
+        // claim: the running ffmpeg keeps the old track mapped otherwise.
+        assert!(!super::can_claim_hls_session(1_000_000_000, Some(1), Some(1_000_000_000), Some(2)));
+        assert!(super::can_claim_hls_session(1_000_000_000, Some(2), Some(1_000_000_000), Some(2)));
+        // No opinion on either side never blocks a claim.
+        assert!(super::can_claim_hls_session(1_000_000_000, None, Some(1_000_000_000), Some(2)));
+        assert!(super::can_claim_hls_session(1_000_000_000, Some(1), Some(1_000_000_000), None));
     }
 
     #[test]
