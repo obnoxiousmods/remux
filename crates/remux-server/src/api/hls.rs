@@ -121,6 +121,201 @@ fn add_playback_generation_to_master(
         + "\n"
 }
 
+/// A prewarm session may only be claimed by a request whose seek matches the
+/// transcode it is already running, to the exact tick. Truncating to whole
+/// seconds could bind the acknowledgement to ticks ffmpeg never used.
+fn can_claim_prewarm_session(
+    prewarm: bool,
+    session_requested_ticks: i64,
+    request_ticks: Option<i64>,
+) -> bool {
+    prewarm && session_requested_ticks == request_ticks
+        .unwrap_or(0)
+        .max(0)
+}
+
+/// Ticks to acknowledge as the playback start: the measured keyframe-aligned
+/// start once known, otherwise the exact ticks ffmpeg was started with.
+fn acknowledged_start_ticks(
+    requested_start_ticks: i64,
+    actual_start_ticks: Option<i64>,
+) -> Option<i64> {
+    actual_start_ticks.or((requested_start_ticks > 0).then_some(requested_start_ticks))
+}
+
+fn ffprobe_bin() -> String {
+    std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".into())
+}
+
+/// MPEG-TS timestamps wrap modulo 2^33 ticks of a 90 kHz clock. A copy+seek
+/// session's pre-target keyframe packets carry negative PTS (we pass
+/// `-avoid_negative_ts disabled`), which mpegts stores wrapped near the top of
+/// the range, so ffprobe reports them as a huge positive time.
+const MPEGTS_WRAP_SECS: f64 = 8_589_934_592.0 / 90_000.0; // 2^33 / 90000
+
+/// Convert the first video packet's pts_time of a copy+seek session's first
+/// segment into a signed offset from the requested start. The seek lands on
+/// the nearest keyframe at or before the requested time, so the true offset
+/// is <= 0; a positive reading can only be demuxer noise and clamps to zero
+/// (actual == requested).
+fn pts_offset_secs(pts_time: f64) -> f64 {
+    let unwrapped = if pts_time > MPEGTS_WRAP_SECS / 2.0 {
+        pts_time - MPEGTS_WRAP_SECS
+    } else {
+        pts_time
+    };
+    unwrapped.min(0.0)
+}
+
+enum ActualStart {
+    /// First video PTS measured; actual start in ticks.
+    Measured(i64),
+    /// Segment exists but its first video PTS could not be read.
+    Unknown,
+    /// No segment materialised before the deadline.
+    NotReady,
+}
+
+/// Lowest-index segment file currently on disk — the first file ffmpeg
+/// produced for this generation (segment-driven restarts bump -start_number,
+/// so it is not necessarily segment_00000).
+fn first_segment_path(dir: &std::path::Path, use_fmp4: bool) -> Option<std::path::PathBuf> {
+    let ext = if use_fmp4 { "m4s" } else { "ts" };
+    let mut best: Option<(u32, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+    {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(idx) = name
+            .strip_prefix("segment_")
+            .and_then(|n| n.strip_suffix(&format!(".{ext}")))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map_or(true, |(best_idx, _)| idx < *best_idx)
+        {
+            best = Some((idx, entry.path()));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Wait until ffmpeg has created its first segment file, waking on the
+/// session's output-change broadcast instead of polling.
+async fn wait_for_first_segment(
+    session: &Arc<tokio::sync::RwLock<TranscodeSession>>,
+    timeout: std::time::Duration,
+) -> Option<std::path::PathBuf> {
+    let output_tx = session
+        .read()
+        .await
+        .output_tx
+        .clone();
+    let mut output_rx = output_tx.subscribe();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (dir, use_fmp4) = {
+            let s = session
+                .read()
+                .await;
+            (s.output_dir.clone(), s.use_fmp4())
+        };
+        if let Some(path) = first_segment_path(&dir, use_fmp4) {
+            return Some(path);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero()
+            || tokio::time::timeout(remaining, output_rx.changed())
+                .await
+                .is_err()
+        {
+            let s = session
+                .read()
+                .await;
+            return first_segment_path(&s.output_dir, s.use_fmp4());
+        }
+    }
+}
+
+/// Read the first video packet's pts_time from a segment file. Bounded and
+/// local-only: `-read_intervals %+#1` stops after the first packet.
+async fn probe_first_video_pts_secs(path: &std::path::Path) -> Option<f64> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(ffprobe_bin())
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts_time",
+                "-read_intervals",
+                "%+#1",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output
+        .status
+        .success()
+    {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            line
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
+}
+
+/// Measure the keyframe-aligned actual start of a copy+seek session from its
+/// first produced segment. With `-c:v copy` ffmpeg's input seek lands on the
+/// nearest keyframe at or before the requested time and output timestamps are
+/// shifted by the requested offset, so the first video packet's PTS is
+/// (actual_start - requested_start), i.e. <= 0.
+async fn measure_actual_start_ticks(
+    session: &Arc<tokio::sync::RwLock<TranscodeSession>>,
+) -> ActualStart {
+    let requested_ticks = session
+        .read()
+        .await
+        .requested_start_ticks;
+    let Some(first_segment) =
+        wait_for_first_segment(session, std::time::Duration::from_secs(15)).await
+    else {
+        return ActualStart::NotReady;
+    };
+    // The segment file appears while ffmpeg is still writing it; retry briefly
+    // until ffprobe can read the first video packet.
+    for attempt in 0..5 {
+        if let Some(pts_time) = probe_first_video_pts_secs(&first_segment).await {
+            let offset_ticks = (pts_offset_secs(pts_time) * 10_000_000.0).round() as i64;
+            return ActualStart::Measured(requested_ticks + offset_ticks);
+        }
+        if attempt < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+    }
+    ActualStart::Unknown
+}
+
 /// Shared session setup: look up or create the transcode session for an HLS
 /// request. Returns the session handle and the resolved play_session_id.
 async fn create_hls_session(
@@ -191,15 +386,19 @@ async fn create_hls_session(
             .sessions
             .get_transcode(&play_session_id)
         {
-            let requested_start_secs = q
-                .start_time_ticks
-                .unwrap_or(0)
-                .max(0) as u64
-                / 10_000_000;
+            // A prewarm session may only be claimed for the exact seek it is
+            // already transcoding. Comparing truncated whole seconds could
+            // claim a session ffmpeg started up to ~1s away from the request,
+            // while the acknowledgement would report the new request's ticks —
+            // a baked-in subtitle desync. Anything but an exact tick match
+            // stops the session and restarts from the requested position.
             let can_claim_prewarm = {
                 let current = existing.read().await;
-                current.prewarm.load(Ordering::Relaxed)
-                    && current.start_time_secs as u64 == requested_start_secs
+                can_claim_prewarm_session(
+                    current.prewarm.load(Ordering::Relaxed),
+                    current.requested_start_ticks,
+                    q.start_time_ticks,
+                )
             };
             if !can_claim_prewarm {
                 debug!(
@@ -505,6 +704,17 @@ async fn create_hls_session(
             source_frame_rate,
         );
 
+        // Record the exact seek this ffmpeg process will perform before the
+        // session becomes visible to other requests — the prewarm claim check
+        // and the start acknowledgement read this value.
+        session
+            .write()
+            .await
+            .requested_start_ticks = q
+            .start_time_ticks
+            .unwrap_or(0)
+            .max(0);
+
         state
             .ctx
             .sessions
@@ -679,6 +889,76 @@ pub async fn master_hls_video(
 ) -> Result<impl IntoResponse> {
     debug!("master_hls_video: item_id={}, q={:?}", id, q);
     let (session, _) = create_hls_session(&state, &auth, id, &q).await?;
+
+    // For copy-video sessions started with StartTimeTicks, ffmpeg's input seek
+    // lands on the nearest keyframe at or before the requested time, so the
+    // stream actually starts up to one GOP earlier than requested. The
+    // acknowledgement below is what clients use to align subtitles to the
+    // decoder's zero-based clock, so it must name the actual start. Measure it
+    // from the first produced segment before serving the master playlist.
+    // Transcoded sessions are accurate-seeked (actual == requested) and
+    // from-start sessions have no offset, so neither pays for this wait.
+    let needs_measurement = {
+        let s = session
+            .read()
+            .await;
+        s.requested_start_ticks > 0
+            && s.video_codec == "copy"
+            && !s.is_live
+            && s.actual_start_ticks
+                .is_none()
+    };
+    if needs_measurement {
+        match measure_actual_start_ticks(&session).await {
+            ActualStart::Measured(ticks) => {
+                let mut s = session
+                    .write()
+                    .await;
+                s.actual_start_ticks = Some(ticks);
+                info!(
+                    play_session_id = %s.id,
+                    actual_start_ticks = ticks,
+                    "measured keyframe-aligned stream start"
+                );
+            }
+            // ffprobe could not read the segment — acknowledge the requested
+            // ticks (contract: actual start when known, else requested).
+            ActualStart::Unknown => {}
+            // No segment materialised in time. Mirror the variant endpoint:
+            // 503 + Retry-After lets the client back off until ffmpeg produces
+            // output; 410 if the transcode already ended.
+            ActualStart::NotReady => {
+                let session_state = session
+                    .read()
+                    .await
+                    .state
+                    .clone();
+                return Ok(if matches!(
+                    session_state,
+                    TranscodeState::Complete | TranscodeState::Error(_)
+                ) {
+                    hls_state_response(StatusCode::GONE, "transcode-ended", None)
+                } else {
+                    hls_state_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "first-segment-not-ready",
+                        Some("1"),
+                    )
+                });
+            }
+        }
+    }
+
+    // Acknowledge the session's stored start, not this request's ticks: for a
+    // claimed prewarm these are the exact ticks ffmpeg was started with, and
+    // once measured they are the keyframe-aligned actual start.
+    let acknowledged_ticks = {
+        let s = session
+            .read()
+            .await;
+        acknowledged_start_ticks(s.requested_start_ticks, s.actual_start_ticks)
+    };
+
     let session_read = session
         .read()
         .await;
@@ -687,7 +967,7 @@ pub async fn master_hls_video(
             crate::playback::engine::generate_master_playlist(&session_read),
             q.start_time_ticks,
         ),
-        q.start_time_ticks,
+        acknowledged_ticks,
     );
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -695,9 +975,8 @@ pub async fn master_hls_video(
         .header("Cache-Control", "no-cache, no-store")
         .header(
             "X-Remux-Playback-Start-Ticks",
-            q.start_time_ticks
+            acknowledged_ticks
                 .unwrap_or(0)
-                .max(0)
                 .to_string(),
         )
         .header(
@@ -998,6 +1277,72 @@ mod tests {
         assert_eq!(gone.status(), StatusCode::GONE);
         assert_eq!(gone.headers()["X-Remux-Hls-State"], "session-gone");
         assert!(!gone.headers().contains_key("Retry-After"));
+    }
+
+    #[test]
+    fn prewarm_claim_requires_exact_tick_match() {
+        // Exact match: claim allowed.
+        assert!(super::can_claim_prewarm_session(true, 1_000_000_000, Some(1_000_000_000)));
+        // A sub-second difference must NOT claim — ffmpeg was started with
+        // different ticks than the acknowledgement would report.
+        assert!(!super::can_claim_prewarm_session(true, 1_000_000_000, Some(1_000_000_001)));
+        assert!(!super::can_claim_prewarm_session(true, 1_000_400_000, Some(1_000_900_000)));
+        // Non-prewarm sessions are never claimable.
+        assert!(!super::can_claim_prewarm_session(false, 1_000_000_000, Some(1_000_000_000)));
+        // No seek in the request: claim only matches a from-start prewarm.
+        assert!(super::can_claim_prewarm_session(true, 0, None));
+        assert!(!super::can_claim_prewarm_session(true, 1_000_000_000, None));
+    }
+
+    #[test]
+    fn acknowledged_start_prefers_measured_actual() {
+        // From-start session: nothing to acknowledge.
+        assert_eq!(super::acknowledged_start_ticks(0, None), None);
+        // Unmeasured seek: fall back to the exact requested ticks.
+        assert_eq!(
+            super::acknowledged_start_ticks(1_000_000_000, None),
+            Some(1_000_000_000)
+        );
+        // Measured keyframe-aligned start wins over the requested ticks.
+        assert_eq!(
+            super::acknowledged_start_ticks(1_000_000_000, Some(985_000_000)),
+            Some(985_000_000)
+        );
+    }
+
+    #[test]
+    fn pts_offset_unwraps_negative_mpegts_timestamps() {
+        // Plain negative PTS (e.g. fMP4 or non-wrapped readers): used as-is.
+        assert_eq!(super::pts_offset_secs(-1.5), -1.5);
+        // A keyframe exactly at the requested time measures zero.
+        assert_eq!(super::pts_offset_secs(0.0), 0.0);
+        // Demuxer noise can only read positive; clamp to "actual == requested".
+        assert_eq!(super::pts_offset_secs(0.04), 0.0);
+        // TS-wrapped negative PTS: -1.5s stored modulo 2^33/90000.
+        let wrapped = super::MPEGTS_WRAP_SECS - 1.5;
+        let offset = super::pts_offset_secs(wrapped);
+        assert!((offset - -1.5).abs() < 1e-6, "offset: {offset}");
+        // Values in the lower half of the range are genuine positives.
+        assert_eq!(super::pts_offset_secs(120.0), 0.0);
+    }
+
+    #[test]
+    fn first_segment_picks_lowest_index_of_expected_format() {
+        let dir = std::env::temp_dir().join(format!(
+            "remux-hls-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["segment_00007.ts", "segment_00003.ts", "segment_00012.m4s"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        // TS session: lowest .ts wins; .m4s is a foreign format and ignored.
+        let found = super::first_segment_path(&dir, false).unwrap();
+        assert!(found.ends_with("segment_00003.ts"));
+        // fMP4 session sees only the .m4s file.
+        let found = super::first_segment_path(&dir, true).unwrap();
+        assert!(found.ends_with("segment_00012.m4s"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1417,6 +1762,10 @@ async fn hls_segment_inner(
                             .state_tx
                             .send(TranscodeState::Starting);
                         s.start_time_secs = (start_time_ticks / 10_000_000) as u32;
+                        s.requested_start_ticks = start_time_ticks;
+                        // The new generation performs a fresh input seek; any
+                        // previously measured keyframe-aligned start is stale.
+                        s.actual_start_ticks = None;
                         s.playback_offset_secs
                             .store(0, std::sync::atomic::Ordering::Relaxed);
                     }

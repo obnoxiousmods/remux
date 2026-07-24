@@ -1703,6 +1703,14 @@ pub async fn start_transcode(
                     .start_time_ticks
                     .map(|t| (t / 10_000_000) as u32)
                     .unwrap_or(0);
+                // The running ffmpeg process defines the seek: record the exact
+                // ticks it was started with and invalidate any start measured
+                // for a previous generation.
+                s.requested_start_ticks = params
+                    .start_time_ticks
+                    .unwrap_or(0)
+                    .max(0);
+                s.actual_start_ticks = None;
                 s.kill_tx = Some(kill_tx);
                 spawn_buffer_monitor(
                     s.output_dir
@@ -3319,6 +3327,8 @@ mod tests {
             wait_done: Arc::new(tokio::sync::Notify::new()),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 30,
+            requested_start_ticks: 300_000_000,
+            actual_start_ticks: None,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
             prewarm: Arc::new(AtomicBool::new(false)),
             runtime_ticks: 120i64
