@@ -905,14 +905,20 @@ pub(crate) async fn probe_stream(
         return Ok((api::MediaSourceInfo::from(stream.clone()), stream.clone()));
     }
     if let Some(cached) = &stream.probe_data {
+        // A probe carrying any playable stream is valid. Judging audio-only
+        // probes stale re-ran a full ffprobe on every music PlaybackInfo
+        // even though the cache had just been written.
         if cached
             .video_stream()
             .is_some()
+            || cached
+                .audio_stream()
+                .is_some()
         {
             debug!(id = %stream.id, "probe cache hit");
             return Ok((cached.clone(), stream.clone()));
         }
-        debug!(id = %stream.id, "probe cache stale (no video stream), re-probing");
+        debug!(id = %stream.id, "probe cache stale (no playable stream), re-probing");
     }
     probe_with_fallback(
         stream.clone(),
