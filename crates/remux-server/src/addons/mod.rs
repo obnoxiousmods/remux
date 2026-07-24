@@ -2202,7 +2202,130 @@ fn normalized_release_name(name: &str) -> String {
     strip_video_ext(basename).to_ascii_lowercase()
 }
 
-fn match_probe_version<'a>(
+/// IMDb id and season/episode lookup coordinates shared by the RemuxDB
+/// probe-cache key and the fetch helper. Episodes fall back to the series
+/// IMDb id, mirroring the refresh-time lookup.
+fn remuxdb_probe_lookup(media: &db::Media) -> Option<(&str, Option<i32>, Option<i32>)> {
+    let imdb_id = if media.kind == db::MediaKind::Episode {
+        media
+            .external_ids
+            .series_imdb
+            .as_deref()
+            .or(media
+                .external_ids
+                .imdb
+                .as_deref())
+    } else {
+        media
+            .external_ids
+            .imdb
+            .as_deref()
+    }?;
+    let (season, episode) = if media.kind == db::MediaKind::Episode {
+        (
+            media
+                .parent_idx
+                .map(|v| v as i32),
+            media
+                .idx
+                .map(|v| v as i32),
+        )
+    } else {
+        (None, None)
+    };
+    Some((imdb_id, season, episode))
+}
+
+/// Cache key for an item's RemuxDB probe versions — the same key
+/// refresh_streams uses, so read paths hit the same 24h cache entries.
+pub(crate) fn remuxdb_probe_cache_key(media: &db::Media) -> Option<String> {
+    let (imdb_id, season, episode) = remuxdb_probe_lookup(media)?;
+    Some(format!(
+        "remuxdb:probe:{imdb_id}:{}:{}",
+        season.map_or_else(|| "-".to_string(), |value| value.to_string()),
+        episode.map_or_else(|| "-".to_string(), |value| value.to_string()),
+    ))
+}
+
+/// Store-first fetch of an item's RemuxDB probe versions: synchronous cache
+/// hit when fresh, otherwise one cheap JSON fetch cached for 24h. Never runs
+/// a local ffprobe. This is exactly the lookup refresh_streams performs,
+/// factored out so read paths can hydrate probe data on demand.
+pub(crate) async fn fetch_probe_versions(
+    ctx: &AppContext,
+    media: &db::Media,
+) -> Option<Vec<remuxdb::MediaInfo>> {
+    let url = ctx
+        .config
+        .remuxdb_url
+        .clone()?;
+    let (imdb_id, season, episode) = remuxdb_probe_lookup(media)?;
+    let cfg = db::Settings::get_config_or_default(&ctx.db).await;
+    if !cfg
+        .remuxdb_enabled
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let cache_key = remuxdb_probe_cache_key(media)?;
+    if let Some(cached) = ctx
+        .store
+        .get::<Vec<remuxdb::MediaInfo>>(&cache_key)
+    {
+        debug!(
+            imdb_id,
+            season,
+            episode,
+            versions = cached.len(),
+            "remuxdb: item probe cache hit"
+        );
+        return Some(cached);
+    }
+    let fetched = remuxdb::fetch_probe(
+        &url,
+        cfg.remuxdb_token
+            .as_deref(),
+        Some(crate::common::server_id().as_str()),
+        imdb_id,
+        season,
+        episode,
+    )
+    .await;
+    if let Some(versions) = fetched.as_ref() {
+        ctx.store.save(
+            cache_key,
+            versions.clone(),
+            std::time::Duration::from_secs(24 * 60 * 60),
+        );
+    }
+    fetched
+}
+
+/// Attach matched RemuxDB probe versions to sources that have no probe data,
+/// returning how many were hydrated. Never overwrites an existing probe;
+/// match ambiguity stays a no-op by design (see match_probe_version).
+pub(crate) fn apply_probe_versions(
+    versions: &[remuxdb::MediaInfo],
+    sources: &mut [db::Media],
+) -> usize {
+    let mut applied = 0usize;
+    for source in sources.iter_mut() {
+        if source
+            .probe_data
+            .is_some()
+        {
+            continue;
+        }
+        if let Some(version) = match_probe_version(versions, source) {
+            source.probe_data = Some(version.into());
+            applied += 1;
+            debug!(id = %source.id, "remuxdb: probe data applied from version");
+        }
+    }
+    applied
+}
+
+pub(crate) fn match_probe_version<'a>(
     versions: &'a [remuxdb::MediaInfo],
     stream: &db::Media,
 ) -> Option<&'a remuxdb::MediaInfo> {
@@ -2459,88 +2582,7 @@ impl AddonService {
         }
 
         let instant = Instant::now();
-        let probe_versions_fut = async {
-            let Some(url) = ctx
-                .config
-                .remuxdb_url
-                .clone()
-            else {
-                return None;
-            };
-            let imdb_id = if media.kind == db::MediaKind::Episode {
-                media
-                    .external_ids
-                    .series_imdb
-                    .as_deref()
-                    .or(media
-                        .external_ids
-                        .imdb
-                        .as_deref())
-            } else {
-                media
-                    .external_ids
-                    .imdb
-                    .as_deref()
-            };
-            let Some(imdb_id) = imdb_id else {
-                return None;
-            };
-            let cfg = db::Settings::get_config_or_default(&ctx.db).await;
-            if !cfg
-                .remuxdb_enabled
-                .unwrap_or(true)
-            {
-                return None;
-            }
-            let (season, episode) = if media.kind == db::MediaKind::Episode {
-                (
-                    media
-                        .parent_idx
-                        .map(|v| v as i32),
-                    media
-                        .idx
-                        .map(|v| v as i32),
-                )
-            } else {
-                (None, None)
-            };
-            let cache_key = format!(
-                "remuxdb:probe:{imdb_id}:{}:{}",
-                season.map_or_else(|| "-".to_string(), |value| value.to_string()),
-                episode.map_or_else(|| "-".to_string(), |value| value.to_string()),
-            );
-            if let Some(cached) = ctx
-                .store
-                .get::<Vec<remuxdb::MediaInfo>>(&cache_key)
-            {
-                debug!(
-                    imdb_id,
-                    season,
-                    episode,
-                    versions = cached.len(),
-                    "remuxdb: item probe cache hit"
-                );
-                return Some(cached);
-            }
-            let fetched = remuxdb::fetch_probe(
-                &url,
-                cfg.remuxdb_token
-                    .as_deref(),
-                Some(crate::common::server_id().as_str()),
-                imdb_id,
-                season,
-                episode,
-            )
-            .await;
-            if let Some(versions) = fetched.as_ref() {
-                ctx.store.save(
-                    cache_key,
-                    versions.clone(),
-                    std::time::Duration::from_secs(24 * 60 * 60),
-                );
-            }
-            fetched
-        };
+        let probe_versions_fut = fetch_probe_versions(ctx, media);
         let (raw, probe_versions) =
             tokio::join!(self.get_streams(media, ctx, user_id), probe_versions_fut);
         let mut raw = raw?;
@@ -2608,22 +2650,10 @@ impl AddonService {
         let probe_version_count = probe_versions
             .as_ref()
             .map_or(0, Vec::len);
-        let mut probe_matches = 0usize;
-        if let Some(ref versions) = probe_versions {
-            for source in &mut sources {
-                if source
-                    .probe_data
-                    .is_some()
-                {
-                    continue;
-                }
-                if let Some(version) = match_probe_version(versions, source) {
-                    source.probe_data = Some(version.into());
-                    probe_matches += 1;
-                    debug!(id = %source.id, "remuxdb: probe data applied from version");
-                }
-            }
-        }
+        let probe_matches = probe_versions
+            .as_ref()
+            .map(|versions| apply_probe_versions(versions, &mut sources))
+            .unwrap_or(0);
 
         // Preserve a source's existing full local probe when RemuxDB did not
         // produce an exact version match. This lets the item-level chapter
@@ -2911,6 +2941,120 @@ mod tests {
             width: None,
             height: None,
         }
+    }
+
+    fn remuxdb_track(idx: i32, kind: &str) -> remuxdb::TrackDetail {
+        remuxdb::TrackDetail {
+            kind: kind.to_string(),
+            idx,
+            is_default: false,
+            is_forced: false,
+            is_hearing_impaired: false,
+            is_external: false,
+            is_anamorphic: false,
+            hdr10_plus_present: false,
+            codec: None,
+            language: None,
+            title: None,
+            bit_rate: None,
+            bit_depth: None,
+            pixel_format: None,
+            profile: None,
+            level: None,
+            ref_frames: None,
+            width: None,
+            height: None,
+            fps: None,
+            aspect_ratio: None,
+            rotation: None,
+            color_primaries: None,
+            color_range: None,
+            color_space: None,
+            color_transfer: None,
+            dv_profile: None,
+            channels: None,
+            sample_rate: None,
+            channel_layout: None,
+        }
+    }
+
+    fn remuxdb_version(filename: &str) -> remuxdb::MediaInfo {
+        remuxdb::MediaInfo {
+            content_hash: None,
+            container: Some("mkv".to_string()),
+            duration: Some(3600.0),
+            size: None,
+            bitrate: None,
+            virtual_chapters: false,
+            chapters: vec![],
+            sources: vec![remuxdb::ProbeSource {
+                kind: "torrent".to_string(),
+                filename: Some(filename.to_string()),
+                indexer: None,
+                indexer_guid: None,
+                torrent_info_hash: None,
+                torrent_file_idx: None,
+            }],
+            tracks: vec![
+                remuxdb::TrackDetail {
+                    codec: Some("h264".to_string()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    is_default: true,
+                    ..remuxdb_track(0, "video")
+                },
+                remuxdb::TrackDetail {
+                    codec: Some("eac3".to_string()),
+                    language: Some("eng".to_string()),
+                    channels: Some(6),
+                    ..remuxdb_track(1, "audio")
+                },
+            ],
+        }
+    }
+
+    fn unprobed_source(filename: &str) -> db::Media {
+        db::Media {
+            stream_info: Some(crate::stream::StreamInfo {
+                filename: Some(filename.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_probe_versions_hydrates_only_unique_unprobed_matches() {
+        let versions = vec![remuxdb_version("Movie.2024.1080p.WEB-DL.x264-GRP.mkv")];
+
+        // Unique filename match hydrates the unprobed source.
+        let mut sources = vec![unprobed_source("Movie.2024.1080p.WEB-DL.x264-GRP.mkv")];
+        assert_eq!(apply_probe_versions(&versions, &mut sources), 1);
+        let probe = sources[0]
+            .probe_data
+            .as_ref()
+            .expect("probe data applied");
+        assert!(probe
+            .media_streams
+            .iter()
+            .any(|stream| {
+                stream.language.as_deref() == Some("eng")
+                    && stream.channels == Some(6)
+            }));
+
+        // Existing probe data is never overwritten.
+        assert_eq!(apply_probe_versions(&versions, &mut sources), 0);
+
+        // Ambiguous matches stay unprobed by design.
+        let ambiguous = vec![
+            remuxdb_version("Movie.2024.1080p.WEB-DL.x264-GRP.mkv"),
+            remuxdb_version("Movie.2024.1080p.WEB-DL.x264-GRP.mkv"),
+        ];
+        let mut sources = vec![unprobed_source("Movie.2024.1080p.WEB-DL.x264-GRP.mkv")];
+        assert_eq!(apply_probe_versions(&ambiguous, &mut sources), 0);
+        assert!(sources[0]
+            .probe_data
+            .is_none());
     }
 
     // Simulates the refresh_meta accumulation: patch multiple addon results

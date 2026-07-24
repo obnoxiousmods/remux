@@ -1669,7 +1669,21 @@ pub async fn item(
         } else {
             grouped
         };
-        media.sources = Some(filtered);
+        // Resolve stream details from the RemuxDB probe cache where the
+        // local probe column is empty. Browse paths must not pay for network
+        // or ffprobe, so this is a synchronous cache lookup only; the
+        // PlaybackInfo path covers the fetch.
+        let mut sources = filtered;
+        if let Some(key) = crate::addons::remuxdb_probe_cache_key(&media) {
+            if let Some(versions) = state
+                .ctx
+                .store
+                .get::<Vec<remux_sdks::remuxdb::MediaInfo>>(&key)
+            {
+                crate::addons::apply_probe_versions(&versions, &mut sources);
+            }
+        }
+        media.sources = Some(sources);
         media
             .user_state(
                 &state
@@ -1699,7 +1713,21 @@ pub async fn item(
         } else {
             grouped
         };
-        media.sources = Some(filtered);
+        // Resolve stream details from the RemuxDB probe cache where the
+        // local probe column is empty. Browse paths must not pay for network
+        // or ffprobe, so this is a synchronous cache lookup only; the
+        // PlaybackInfo path covers the fetch.
+        let mut sources = filtered;
+        if let Some(key) = crate::addons::remuxdb_probe_cache_key(&media) {
+            if let Some(versions) = state
+                .ctx
+                .store
+                .get::<Vec<remux_sdks::remuxdb::MediaInfo>>(&key)
+            {
+                crate::addons::apply_probe_versions(&versions, &mut sources);
+            }
+        }
+        media.sources = Some(sources);
         media
             .user_state(
                 &state

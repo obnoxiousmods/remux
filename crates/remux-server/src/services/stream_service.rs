@@ -445,7 +445,7 @@ impl StreamService {
     /// for each candidate. Source ID/name/path/remux are stamped before returning so the
     /// handler only deals with playback-decision work.
     pub async fn probe_candidates(&self) -> anyhow::Result<ProbedStreams> {
-        let sel = self.select_streams();
+        let mut sel = self.select_streams();
         let probe_cfg = db::Settings::get_config_or_default(
             &self
                 .ctx
@@ -477,6 +477,40 @@ impl StreamService {
         .await
         .ok()
         .flatten();
+
+        // Hydrate candidates the scoped playback probe will skip (non-rank-1
+        // rows) with cached RemuxDB probe versions, so version rows carry
+        // stream details without a live ffprobe per source. The lookup is
+        // Store-first and fetches cheap JSON at most once per item per day.
+        if sel
+            .candidates
+            .iter()
+            .any(|stream| stream.probe_data.is_none())
+        {
+            if let Some(item) = item.as_ref() {
+                if let Some(versions) =
+                    crate::addons::fetch_probe_versions(&self.ctx, item).await
+                {
+                    let hydrated = crate::addons::apply_probe_versions(
+                        &versions,
+                        &mut sel.candidates,
+                    );
+                    if hydrated > 0 {
+                        if let Err(error) = db::Media::upsert(
+                            &self.ctx.db,
+                            &sel.candidates,
+                        )
+                        .await
+                        {
+                            debug!(
+                                %error,
+                                "failed to persist remuxdb-hydrated probe data"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let mut results = Vec::with_capacity(
             sel.candidates
