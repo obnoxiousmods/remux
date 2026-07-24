@@ -126,13 +126,14 @@ pub struct TranscodeSession {
     /// claiming request's ticks, and truncating to `start_time_secs` would
     /// lose sub-second precision.
     pub requested_start_ticks: i64,
-    /// Measured keyframe-aligned actual start in ticks. With `-c:v copy` the
-    /// input seek lands on a keyframe at or near the requested time — before
-    /// it or after it, container-dependent — so the stream can start a GOP
-    /// away from the request in either direction. Probed from the first
-    /// segment's first video PTS by the playback-start endpoint; None until
-    /// measured (or when measurement is not needed, e.g. accurate-seeked
-    /// transcodes).
+    /// Measured timeline anchor in ticks: the earliest audio/video packet
+    /// PTS of the first produced segment, which is where hls.js anchors its
+    /// zero-based clock. With `-c:v copy` the video keyframe can land on
+    /// either side of the request, and a cluster-skipped audio track can
+    /// start seconds later; the minimum of the two tracks is the value
+    /// subtitle offsets and the startup skip must use. Probed by the
+    /// playback-start endpoint; None until measured (or when measurement is
+    /// not needed, e.g. accurate-seeked transcodes).
     pub actual_start_ticks: Option<i64>,
     /// Set when the session was deliberately stopped (client Stop, seek
     /// replacement, ActiveEncodings DELETE). The engine loop checks this

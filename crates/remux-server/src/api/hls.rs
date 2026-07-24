@@ -212,36 +212,51 @@ fn first_segment_path(dir: &std::path::Path, use_fmp4: bool) -> Option<std::path
     best.map(|(_, path)| path)
 }
 
-/// Parse ffprobe's csv packet output for the first pts_time value. The
-/// `csv=p=0` writer terminates the row with a comma (`1.483000,`), which a
-/// bare f64 parse rejects.
-fn parse_ffprobe_pts_time(stdout: &str) -> Option<f64> {
-    stdout
-        .lines()
-        .find_map(|line| {
-            line
-                .trim()
-                .trim_end_matches(',')
-                .parse::<f64>()
-                .ok()
-        })
+/// Parse ffprobe's csv packet output for the first pts_time per track type.
+/// The `csv=p=0` writer terminates rows with a comma (`video,1.483000,`),
+/// which a bare f64 parse rejects.
+fn parse_ffprobe_first_track_pts(stdout: &str) -> Option<f64> {
+    let mut first_audio: Option<f64> = None;
+    let mut first_video: Option<f64> = None;
+    for line in stdout.lines() {
+        let mut parts = line.split(',');
+        let kind = parts.next().unwrap_or("").trim();
+        let pts = parts
+            .next()
+            .map(|raw| raw.trim().parse::<f64>().ok())
+            .flatten();
+        let Some(pts) = pts else { continue };
+        match kind {
+            "audio" if first_audio.is_none() => first_audio = Some(pts),
+            "video" if first_video.is_none() => first_video = Some(pts),
+            _ => {}
+        }
+        if first_audio.is_some() && first_video.is_some() {
+            break;
+        }
+    }
+    first_audio
+        .into_iter()
+        .chain(first_video)
+        .reduce(f64::min)
 }
 
-/// Read the first video packet's pts_time from a segment file. Bounded and
-/// local-only: `-read_intervals %+#1` stops after the first packet.
-async fn probe_first_video_pts_secs(path: &std::path::Path) -> Option<f64> {
+/// Read the earliest audio or video packet pts_time from a segment file.
+/// hls.js anchors its timeline at the first timestamp present, so the
+/// acknowledged playback start must be the minimum of the two tracks: the
+/// video keyframe can land on either side of the request, and a
+/// cluster-skipped audio track can start seconds later than the video.
+async fn probe_first_track_pts_secs(path: &std::path::Path) -> Option<f64> {
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::process::Command::new(ffprobe_bin())
             .args([
                 "-v",
                 "error",
-                "-select_streams",
-                "v:0",
                 "-show_entries",
-                "packet=pts_time",
+                "packet=stream_type,pts_time",
                 "-read_intervals",
-                "%+#1",
+                "%+1",
                 "-of",
                 "csv=p=0",
             ])
@@ -260,7 +275,7 @@ async fn probe_first_video_pts_secs(path: &std::path::Path) -> Option<f64> {
     {
         return None;
     }
-    parse_ffprobe_pts_time(&String::from_utf8_lossy(&output.stdout))
+    parse_ffprobe_first_track_pts(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Shared session setup: look up or create the transcode session for an HLS
@@ -945,7 +960,7 @@ pub async fn hls_playback_start(
         // so a session with no segment yet answers null rather than waiting.
         if let Some(path) = first_segment_path(&dir, use_fmp4) {
             for attempt in 0..3 {
-                if let Some(pts_time) = probe_first_video_pts_secs(&path).await {
+                if let Some(pts_time) = probe_first_track_pts_secs(&path).await {
                     let ticks = requested_ticks
                         + (pts_offset_secs(pts_time) * 10_000_000.0).round() as i64;
                     session
@@ -1325,11 +1340,21 @@ mod tests {
     }
 
     #[test]
-    fn ffprobe_pts_time_parses_csv_trailing_comma() {
-        assert_eq!(super::parse_ffprobe_pts_time("1.483000,\n"), Some(1.483));
-        assert_eq!(super::parse_ffprobe_pts_time("95443.7,\n"), Some(95443.7));
-        assert_eq!(super::parse_ffprobe_pts_time(""), None);
-        assert_eq!(super::parse_ffprobe_pts_time("N/A\n"), None);
+    fn ffprobe_first_track_pts_takes_earliest_of_audio_and_video() {
+        assert_eq!(
+            super::parse_ffprobe_first_track_pts("video,1.483000,\naudio,3.540667,\n"),
+            Some(1.483)
+        );
+        assert_eq!(
+            super::parse_ffprobe_first_track_pts("audio,0.000000,\nvideo,1.483000,\n"),
+            Some(0.0)
+        );
+        assert_eq!(
+            super::parse_ffprobe_first_track_pts("video,95443.7,\n"),
+            Some(95443.7)
+        );
+        assert_eq!(super::parse_ffprobe_first_track_pts(""), None);
+        assert_eq!(super::parse_ffprobe_first_track_pts("N/A\n"), None);
     }
 
     #[test]
