@@ -281,6 +281,29 @@ pub(crate) fn is_hw_encoder_failure(stderr: &str) -> bool {
         .any(|sig| lower.contains(sig))
 }
 
+/// Stderr signatures implicating the INPUT side of the pipeline: the remote
+/// source read failed (flaky debrid/HTTP stream). Only these justify an
+/// auto-restart at the last produced segment; encoder and output faults take
+/// their own paths.
+const INPUT_FAILURE_SIGNATURES: &[&str] = &[
+    "error during demuxing",
+    "error opening input",
+    "connection reset by peer",
+    "connection refused",
+    "connection timed out",
+];
+
+/// Whether ffmpeg's stderr implicates a read failure of the input source.
+/// Output-side I/O (e.g. a full disk) must not trigger a restart loop, so a
+/// bare "input/output error" only counts alongside ffmpeg's `in#0` marker.
+pub(crate) fn is_input_source_failure(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    INPUT_FAILURE_SIGNATURES
+        .iter()
+        .any(|sig| lower.contains(sig))
+        || (lower.contains("in#0") && lower.contains("input/output error"))
+}
+
 /// Consecutive hardware-encoder failures before hardware is abandoned
 /// process-wide. Without this, every new session re-attempts a doomed encoder,
 /// burning one wasted ffmpeg spawn apiece.
@@ -604,6 +627,17 @@ fn count_segments(dir: &PathBuf) -> u32 {
                 .count() as u32
         })
         .unwrap_or(0)
+}
+
+fn max_segment_index(dir: &PathBuf) -> Option<u32> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            HlsSegmentFile::parse(&e.file_name().to_string_lossy())
+                .map(|segment| segment.index())
+        })
+        .max()
 }
 
 /// Parameters for starting a new HLS transcode job.
@@ -1669,6 +1703,12 @@ pub async fn start_transcode(
         let mut full_probe_retry = false;
         let mut live_restarts = 0u32;
         const MAX_LIVE_RESTARTS: u32 = 10;
+        let mut input_restarts = 0u32;
+        const MAX_INPUT_RESTARTS: u32 = 3;
+        // The session's clock origin stays the ticks of the initial request.
+        // Input-failure restarts advance params.start_time_ticks for ffmpeg
+        // but must never move the acknowledged origin or the claim check.
+        let original_start_ticks = params.start_time_ticks;
 
         // Respect a process-wide hardware lockout from earlier failures so this
         // session doesn't pay for a spawn we already know is doomed.
@@ -1699,15 +1739,15 @@ pub async fn start_transcode(
                 let mut s = session_clone
                     .write()
                     .await;
-                s.start_time_secs = params
-                    .start_time_ticks
+                s.start_time_secs = original_start_ticks
                     .map(|t| (t / 10_000_000) as u32)
                     .unwrap_or(0);
-                // The running ffmpeg process defines the seek: record the exact
-                // ticks it was started with and invalidate any start measured
-                // for a previous generation.
-                s.requested_start_ticks = params
-                    .start_time_ticks
+                // The clock origin is the initial request's ticks, even when
+                // an input-failure restart advances params.start_time_ticks:
+                // claim checks and start acknowledgements must keep naming the
+                // original request. Any start measured for a previous
+                // generation is invalidated.
+                s.requested_start_ticks = original_start_ticks
                     .unwrap_or(0)
                     .max(0);
                 s.actual_start_ticks = None;
@@ -1786,6 +1826,60 @@ pub async fn start_transcode(
                 let _ = std::fs::create_dir_all(&params.output_dir);
                 params.trusted_probe_data = false;
                 full_probe_retry = true;
+                continue;
+            }
+
+            // Upstream input failure (flaky remote source): restart ffmpeg at
+            // the last produced segment with the session, output dir, and
+            // segment numbering intact. The client rides out a short stall
+            // with its buffer preserved instead of cold-starting a new
+            // session. Bounded per session; deliberately stopped sessions and
+            // encoder-side faults take their own paths.
+            let session_stopped = session_clone
+                .read()
+                .await
+                .stopped;
+            if ffmpeg_failed
+                && !params.is_live
+                && input_restarts < MAX_INPUT_RESTARTS
+                && is_input_source_failure(&stderr_out)
+                && !session_stopped
+            {
+                input_restarts += 1;
+                let resume_idx = max_segment_index(&params.output_dir).unwrap_or(0);
+                let resume_ticks = original_start_ticks
+                    .unwrap_or(0)
+                    .max(0)
+                    + resume_idx as i64
+                        * params.segment_length as i64
+                        * 10_000_000;
+                let backoff_secs = 1u64 << (input_restarts - 1);
+                let session_id = session_clone
+                    .read()
+                    .await
+                    .id
+                    .clone();
+                warn!(
+                    session_id = %session_id,
+                    attempt = input_restarts,
+                    resume_idx,
+                    stderr = stderr_out.trim(),
+                    "Input source read failed — restarting transcode at the last segment"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                if session_clone
+                    .read()
+                    .await
+                    .stopped
+                {
+                    debug!(
+                        session_id = %session_id,
+                        "Session stopped during input-failure backoff — not restarting"
+                    );
+                    break;
+                }
+                params.start_time_ticks = Some(resume_ticks);
+                params.hls_start_number = resume_idx;
                 continue;
             }
 
@@ -3271,6 +3365,30 @@ mod tests {
     }
 
     #[test]
+    fn input_failure_signatures_match_source_reads_only() {
+        // The observed flaky-source failure.
+        assert!(super::is_input_source_failure(
+            "[in#0/matroska,webm @ 0x55de1330dbc0] Error during demuxing: Input/output error"
+        ));
+        assert!(super::is_input_source_failure(
+            "Error opening input file https://example.invalid/x.mkv: Server returned 5xx"
+        ));
+        assert!(super::is_input_source_failure(
+            "[tls @ 0x1] Connection reset by peer"
+        ));
+        // Output-side I/O (full disk) must not restart into a loop.
+        assert!(!super::is_input_source_failure(
+            "[out#0/mpegts @ 0x1] Error writing frame: Input/output error"
+        ));
+        // Encoder faults take the HW fallback path instead.
+        assert!(!super::is_input_source_failure(
+            "[h264_nvenc @ 0x1] OpenEncodeSessionEx failed: out of memory"
+        ));
+        // Client kills carry no input signature.
+        assert!(!super::is_input_source_failure(""));
+    }
+
+    #[test]
     fn trusted_probe_uses_reduced_ffmpeg_analysis_budget() {
         let dir = PathBuf::from("/tmp/test_trusted_probe");
         let trusted = build_hls_args(&TranscodeParams {
@@ -3329,6 +3447,7 @@ mod tests {
             start_time_secs: 30,
             requested_start_ticks: 300_000_000,
             actual_start_ticks: None,
+            stopped: false,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
             prewarm: Arc::new(AtomicBool::new(false)),
             runtime_ticks: 120i64

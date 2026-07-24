@@ -957,6 +957,9 @@ async fn kill_transcode(ts: Arc<tokio::sync::RwLock<TranscodeSession>>) {
         let mut s = ts
             .write()
             .await;
+        // Mark deliberate stops so the engine's input-failure auto-restart
+        // never respawns ffmpeg behind the client's back.
+        s.stopped = true;
         (
             s.kill_tx
                 .take(),

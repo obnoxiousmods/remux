@@ -127,12 +127,18 @@ pub struct TranscodeSession {
     /// lose sub-second precision.
     pub requested_start_ticks: i64,
     /// Measured keyframe-aligned actual start in ticks. With `-c:v copy` the
-    /// input seek lands on the nearest keyframe at or before the requested
-    /// time, so the stream actually starts up to one GOP earlier than
-    /// requested. Probed from the first segment's first video PTS by the
-    /// master-playlist handler; None until measured (or when measurement is
-    /// not needed, e.g. accurate-seeked transcodes).
+    /// input seek lands on a keyframe at or near the requested time — before
+    /// it or after it, container-dependent — so the stream can start a GOP
+    /// away from the request in either direction. Probed from the first
+    /// segment's first video PTS by the playback-start endpoint; None until
+    /// measured (or when measurement is not needed, e.g. accurate-seeked
+    /// transcodes).
     pub actual_start_ticks: Option<i64>,
+    /// Set when the session was deliberately stopped (client Stop, seek
+    /// replacement, ActiveEncodings DELETE). The engine loop checks this
+    /// before auto-restarting a failed ffmpeg so a stopped session never
+    /// respawns behind the client's back.
+    pub stopped: bool,
     /// Playback offset in seconds relative to start_time_secs, updated from progress reports.
     pub playback_offset_secs: Arc<AtomicU32>,
     /// True while this is a speculative Item Details prewarm. The buffer
@@ -218,6 +224,7 @@ impl TranscodeSession {
             start_time_secs: 0,
             requested_start_ticks: 0,
             actual_start_ticks: None,
+            stopped: false,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
             prewarm: Arc::new(AtomicBool::new(prewarm)),
             runtime_ticks,
