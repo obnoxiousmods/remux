@@ -430,6 +430,10 @@ fn default_port() -> u16 {
     3000
 }
 
+fn default_hls_first_segment_secs() -> Option<u32> {
+    Some(2)
+}
+
 fn default_torrent_http_port() -> u16 {
     9876
 }
@@ -444,6 +448,11 @@ pub struct Config {
     /// during a short, explicitly configured cutover window.
     #[serde(default)]
     pub legacy_jellyfin_db_path: Option<std::path::PathBuf>,
+    /// Short first HLS segment in seconds for faster first frame. Encoded
+    /// video forces keyframes so only the opener is short; copied video runs
+    /// the whole stream at this cadence. Set to `null` or `0` to disable.
+    #[serde(default = "default_hls_first_segment_secs")]
+    pub hls_first_segment_secs: Option<u32>,
     /// RFC 3339 deadline for legacy Jellyfin password migration.
     #[serde(default)]
     pub legacy_jellyfin_auth_expires_at: Option<String>,
@@ -644,6 +653,7 @@ impl Default for Config {
             database_url: None,
             legacy_jellyfin_db_path: None,
             legacy_jellyfin_auth_expires_at: None,
+            hls_first_segment_secs: default_hls_first_segment_secs(),
             torrent_data_dir: None,
             port: default_port(),
             torrent_http_port: default_torrent_http_port_opt(),

@@ -640,6 +640,50 @@ fn max_segment_index(dir: &PathBuf) -> Option<u32> {
         .max()
 }
 
+/// Cumulative ticks up to the start of segment `before_idx`, summed from the
+/// EXTINF durations of ffmpeg's own playlist. Non-uniform segmentation (a
+/// short first segment) makes `index * segment_length` wrong by seconds, so
+/// the playlist is the authority; falls back to the uniform estimate when
+/// nothing usable is listed.
+fn cumulative_segment_ticks(
+    playlist: &str,
+    before_idx: u32,
+    segment_length: u32,
+) -> i64 {
+    let mut total_secs = 0f64;
+    let mut pending_duration: Option<f64> = None;
+    let mut counted = false;
+    for line in playlist.lines() {
+        if let Some(raw) = line.strip_prefix("#EXTINF:") {
+            pending_duration = raw
+                .trim_end_matches(',')
+                .parse::<f64>()
+                .ok();
+            continue;
+        }
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let Some(segment) = HlsSegmentFile::parse(line.trim()) else {
+            pending_duration = None;
+            continue;
+        };
+        if segment.index() < before_idx {
+            if let Some(duration) = pending_duration.take() {
+                total_secs += duration;
+                counted = true;
+            }
+        }
+    }
+    if counted {
+        (total_secs * 10_000_000.0).round() as i64
+    } else {
+        before_idx as i64
+            * segment_length as i64
+            * 10_000_000
+    }
+}
+
 /// Parameters for starting a new HLS transcode job.
 #[derive(Debug, Clone)]
 pub struct TranscodeParams {
@@ -653,6 +697,11 @@ pub struct TranscodeParams {
     /// generation always starts at zero even when its source seek is non-zero;
     /// segment-driven recovery may preserve the requested local sequence.
     pub hls_start_number: u32,
+    /// Short first segment for faster first frame. Encoded video forces
+    /// keyframes at `first + n*segment_length` so only the opener is short;
+    /// copied video keeps the source GOP, so its whole stream runs at this
+    /// shorter cadence. None keeps every segment at `segment_length`.
+    pub first_segment_length_secs: Option<u32>,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
     pub video_bitrate: Option<u32>,
@@ -723,6 +772,7 @@ impl Default for TranscodeParams {
             segment_length: 6,
             start_time_ticks: None,
             hls_start_number: 0,
+            first_segment_length_secs: None,
             max_width: None,
             max_height: None,
             video_bitrate: None,
@@ -1439,16 +1489,31 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         args.extend(["-b:v".into(), bitrate.to_string()]);
     }
 
+    // First-frame acceleration: a short first segment lets the client start
+    // after ~2s of output instead of a full segment. Encoded video forces
+    // keyframes at `first + n*segment_length` so only the opener is short;
+    // copied video keeps the source GOP, so every segment runs at the short
+    // cadence (more, smaller segments — the price of copy-mode startup
+    // without re-encoding).
+    let first_segment_secs = params
+        .first_segment_length_secs
+        .filter(|&f| f > 0 && f < params.segment_length);
+    let hls_time_secs = first_segment_secs.unwrap_or(params.segment_length);
+
     // HLS can only close a segment on a video keyframe. Hardware encoders may
     // otherwise choose a very long GOP, leaving one ever-growing .ts file and
     // no playlist until the muxer overflows. Force a boundary at the requested
     // segment cadence for every encoded-video path; copied video keeps the
     // source GOP unchanged.
     if ffmpeg_video_codec != "copy" {
-        args.extend([
-            "-force_key_frames".into(),
-            format!("expr:gte(t,n_forced*{})", params.segment_length),
-        ]);
+        let keyframe_expr = match first_segment_secs {
+            Some(first) => format!(
+                "expr:gte(t,{first}+n_forced*{})",
+                params.segment_length
+            ),
+            None => format!("expr:gte(t,n_forced*{})", params.segment_length),
+        };
+        args.extend(["-force_key_frames".into(), keyframe_expr]);
     }
 
     // Audio codec
@@ -1495,9 +1560,7 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         "-f".into(),
         "hls".into(),
         "-hls_time".into(),
-        params
-            .segment_length
-            .to_string(),
+        hls_time_secs.to_string(),
         "-start_number".into(),
         params
             .hls_start_number
@@ -1847,12 +1910,26 @@ pub async fn start_transcode(
             {
                 input_restarts += 1;
                 let resume_idx = max_segment_index(&params.output_dir).unwrap_or(0);
+                let resume_offset_ticks = std::fs::read_to_string(
+                    params.output_dir.join("main.m3u8"),
+                )
+                .ok()
+                .map(|playlist| {
+                    cumulative_segment_ticks(
+                        &playlist,
+                        resume_idx,
+                        params.segment_length,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    resume_idx as i64
+                        * params.segment_length as i64
+                        * 10_000_000
+                });
                 let resume_ticks = original_start_ticks
                     .unwrap_or(0)
                     .max(0)
-                    + resume_idx as i64
-                        * params.segment_length as i64
-                        * 10_000_000;
+                    + resume_offset_ticks;
                 let backoff_secs = 1u64 << (input_restarts - 1);
                 let session_id = session_clone
                     .read()
@@ -3362,6 +3439,58 @@ mod tests {
         let args = build_hls_args(&default_hls(dir));
         assert_eq!(arg_after(&args, "-start_number"), Some("0"));
         assert!(!args_contains(&args, "-ss"));
+    }
+
+    #[test]
+    fn short_first_segment_shapes_args_per_video_path() {
+        // Encoded video: hls_time drops to the first-segment length and
+        // keyframes are forced at first + n*segment_length, so only the
+        // opener is short.
+        let dir = PathBuf::from("/tmp/test_firstseg_enc");
+        let args = build_hls_args(&TranscodeParams {
+            video_codec: "libx264".into(),
+            first_segment_length_secs: Some(2),
+            ..default_hls(dir)
+        });
+        assert_eq!(arg_after(&args, "-hls_time"), Some("2"));
+        assert_eq!(
+            arg_after(&args, "-force_key_frames"),
+            Some("expr:gte(t,2+n_forced*6)")
+        );
+        // Copied video keeps the source GOP: forced keyframes are impossible,
+        // so the whole stream runs at the short cadence.
+        let dir = PathBuf::from("/tmp/test_firstseg_copy");
+        let args = build_hls_args(&TranscodeParams {
+            video_codec: "copy".into(),
+            first_segment_length_secs: Some(2),
+            ..default_hls(dir)
+        });
+        assert_eq!(arg_after(&args, "-hls_time"), Some("2"));
+        assert_eq!(arg_after(&args, "-force_key_frames"), None);
+        // Disabled: uniform segments, unchanged behaviour.
+        let dir = PathBuf::from("/tmp/test_firstseg_off");
+        let args = build_hls_args(&default_hls(dir));
+        assert_eq!(arg_after(&args, "-hls_time"), Some("6"));
+    }
+
+    #[test]
+    fn cumulative_ticks_sum_playlist_durations() {
+        let playlist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n\
+            #EXTINF:2.002,\nsegment_00000.ts\n#EXTINF:6.006,\nsegment_00001.ts\n\
+            #EXTINF:6.006,\nsegment_00002.ts\n#EXTINF:4.500,\nsegment_00003.ts\n";
+        // Non-uniform (short first segment): index*length would say 18s.
+        assert_eq!(
+            super::cumulative_segment_ticks(playlist, 3, 6),
+            140_140_000
+        );
+        assert_eq!(super::cumulative_segment_ticks(playlist, 1, 6), 20_020_000);
+        // Beyond the listed segments, everything listed counts.
+        assert_eq!(
+            super::cumulative_segment_ticks(playlist, 9, 6),
+            185_140_000
+        );
+        // Empty/missing playlist falls back to the uniform estimate.
+        assert_eq!(super::cumulative_segment_ticks("", 3, 6), 180_000_000);
     }
 
     #[test]

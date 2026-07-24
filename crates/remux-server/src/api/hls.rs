@@ -687,6 +687,10 @@ async fn create_hls_session(
             segment_length,
             start_time_ticks: q.start_time_ticks,
             hls_start_number: 0,
+            first_segment_length_secs: state
+                .ctx
+                .config
+                .hls_first_segment_secs,
             max_width: q
                 .max_width
                 .map(|v| v as u32),
@@ -1666,6 +1670,10 @@ async fn hls_segment_inner(
                         segment_length,
                         start_time_ticks: Some(start_time_ticks),
                         hls_start_number: requested_idx,
+                        first_segment_length_secs: state
+                            .ctx
+                            .config
+                            .hls_first_segment_secs,
                         max_width: q
                             .max_width
                             .map(|v| v as u32),
