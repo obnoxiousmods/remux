@@ -121,15 +121,18 @@ fn add_playback_generation_to_master(
         + "\n"
 }
 
-/// A prewarm session may only be claimed by a request whose seek matches the
-/// transcode it is already running, to the exact tick. Truncating to whole
-/// seconds could bind the acknowledgement to ticks ffmpeg never used.
-fn can_claim_prewarm_session(
-    prewarm: bool,
+/// A session may be claimed — left running rather than restarted — only when
+/// the request's seek matches the transcode it is already running, to the
+/// exact tick. Truncating to whole seconds could bind the acknowledgement to
+/// ticks ffmpeg never used. This must hold for every repeated master request,
+/// prewarm or not: playlist retries during the readiness window re-send the
+/// same StartTimeTicks and have to be idempotent, while a different value is
+/// a genuine seek and forces a restart.
+fn can_claim_hls_session(
     session_requested_ticks: i64,
     request_ticks: Option<i64>,
 ) -> bool {
-    prewarm && session_requested_ticks == request_ticks
+    session_requested_ticks == request_ticks
         .unwrap_or(0)
         .max(0)
 }
@@ -386,21 +389,22 @@ async fn create_hls_session(
             .sessions
             .get_transcode(&play_session_id)
         {
-            // A prewarm session may only be claimed for the exact seek it is
-            // already transcoding. Comparing truncated whole seconds could
-            // claim a session ffmpeg started up to ~1s away from the request,
-            // while the acknowledgement would report the new request's ticks —
-            // a baked-in subtitle desync. Anything but an exact tick match
-            // stops the session and restarts from the requested position.
-            let can_claim_prewarm = {
+            // A repeated master request carrying the same StartTimeTicks is a
+            // playlist retry, not a seek: claiming must be idempotent, or
+            // every retry during the readiness window kills and restarts the
+            // transcode and the first segment never materialises. Anything
+            // but an exact tick match is a genuine seek — stop the session
+            // and restart from the requested position. Truncated seconds
+            // could acknowledge ticks ffmpeg never used (baked-in subtitle
+            // desync).
+            let can_claim = {
                 let current = existing.read().await;
-                can_claim_prewarm_session(
-                    current.prewarm.load(Ordering::Relaxed),
+                can_claim_hls_session(
                     current.requested_start_ticks,
                     q.start_time_ticks,
                 )
             };
-            if !can_claim_prewarm {
+            if !can_claim {
                 debug!(
                     play_session_id = %play_session_id,
                     start_time_ticks = ?q.start_time_ticks,
@@ -1280,18 +1284,18 @@ mod tests {
     }
 
     #[test]
-    fn prewarm_claim_requires_exact_tick_match() {
-        // Exact match: claim allowed.
-        assert!(super::can_claim_prewarm_session(true, 1_000_000_000, Some(1_000_000_000)));
+    fn session_claim_requires_exact_tick_match() {
+        // Exact match: claim allowed, prewarm or not — playlist retries are
+        // idempotent and must never restart the transcode.
+        assert!(super::can_claim_hls_session(1_000_000_000, Some(1_000_000_000)));
         // A sub-second difference must NOT claim — ffmpeg was started with
-        // different ticks than the acknowledgement would report.
-        assert!(!super::can_claim_prewarm_session(true, 1_000_000_000, Some(1_000_000_001)));
-        assert!(!super::can_claim_prewarm_session(true, 1_000_400_000, Some(1_000_900_000)));
-        // Non-prewarm sessions are never claimable.
-        assert!(!super::can_claim_prewarm_session(false, 1_000_000_000, Some(1_000_000_000)));
-        // No seek in the request: claim only matches a from-start prewarm.
-        assert!(super::can_claim_prewarm_session(true, 0, None));
-        assert!(!super::can_claim_prewarm_session(true, 1_000_000_000, None));
+        // different ticks than the acknowledgement would report; this is a
+        // genuine seek and restarts the session.
+        assert!(!super::can_claim_hls_session(1_000_000_000, Some(1_000_000_001)));
+        assert!(!super::can_claim_hls_session(1_000_400_000, Some(1_000_900_000)));
+        // No seek in the request: claim only matches a from-start session.
+        assert!(super::can_claim_hls_session(0, None));
+        assert!(!super::can_claim_hls_session(1_000_000_000, None));
     }
 
     #[test]
