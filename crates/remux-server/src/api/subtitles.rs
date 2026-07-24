@@ -306,10 +306,13 @@ pub(crate) async fn extract_subtitle_to_cache(
         .map_err(|_| anyhow!("subtitle extraction capacity closed"))?;
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.kill_on_drop(true);
+    // No -copyts (here or in the ASS/PGS extractors): cues must be 0-based
+    // relative to the container start, matching the batch pre-extraction path
+    // and the video timeline. With -copyts, containers with a non-zero start
+    // time (e.g. ~1.4s for MPEG-TS) bake that offset into every cue.
     cmd.args([
         "-y",
         "-nostdin",
-        "-copyts",
         "-i",
         input_url,
         "-map",
@@ -399,7 +402,6 @@ async fn extract_raw_ass_to_cache(
     cmd.args([
         "-y",
         "-nostdin",
-        "-copyts",
         "-i",
         input_url,
         "-map",
@@ -493,7 +495,6 @@ async fn extract_binary_subtitle_to_cache(
     cmd.args([
         "-y",
         "-nostdin",
-        "-copyts",
         "-i",
         input_url,
         "-map",
