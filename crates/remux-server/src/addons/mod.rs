@@ -2165,11 +2165,7 @@ impl AddonService {
                 Some(format!("torrent:{}", info_hash.to_lowercase()))
             }
             crate::stream::StreamDescriptor::Http { url, .. } => {
-                let stable = url
-                    .split('?')
-                    .next()
-                    .unwrap_or(url.as_str());
-                Some(format!("http:{stable}"))
+                Some(format!("http:{url}"))
             }
             crate::stream::StreamDescriptor::Local(path) => {
                 Some(format!("local:{}", path.display()))
@@ -3382,6 +3378,36 @@ mod tests {
                 .as_deref(),
             Some("Provider Overview"),
             "unlocked Overview must still be updated"
+        );
+    }
+
+    #[test]
+    fn stream_dedup_keeps_http_query_params() {
+        let first = db::Media {
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Http {
+                    url: "https://example.com/stream.m3u8?itag=123&sig=abc".into(),
+                    request_headers: Default::default(),
+                    response_headers: Default::default(),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let second = db::Media {
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Http {
+                    url: "https://example.com/stream.m3u8?itag=456&sig=xyz".into(),
+                    request_headers: Default::default(),
+                    response_headers: Default::default(),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_ne!(
+            AddonService::stream_dedup_key(&first),
+            AddonService::stream_dedup_key(&second)
         );
     }
 }
