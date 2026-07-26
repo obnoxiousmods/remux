@@ -1840,9 +1840,6 @@ async fn build_tag_taste_categories(
             &db::MediaFilter {
                 id: Some(candidate_ids.clone()),
                 kind: Some(vec![kind.clone()]),
-                user_id: Some(user_id),
-                sort_by: vec![api::ItemSortBy::SimilarityScore],
-                sort_order: vec![api::SortOrder::Descending],
                 limit: Some(candidate_ids.len() as u32),
                 total_count: false,
                 ..Default::default()
@@ -2067,9 +2064,6 @@ async fn build_taste_similarity_categories(
             &db::MediaFilter {
                 id: Some(candidate_ids.clone()),
                 kind: Some(vec![kind.clone()]),
-                user_id: Some(user_id),
-                sort_by: vec![api::ItemSortBy::SimilarityScore],
-                sort_order: vec![api::SortOrder::Descending],
                 limit: Some(candidate_ids.len() as u32),
                 total_count: false,
                 ..Default::default()
@@ -2235,20 +2229,13 @@ async fn build_taste_similarity_categories(
             kind: Some(vec![kind.clone()]),
             parent_id,
             recursive: parent_id.is_some(),
-            user_id: Some(user_id),
             user_state: Some(db::UserMediaStateFilter {
                 user_id: Some(user_id),
                 played: Some(false),
                 ..Default::default()
             }),
-            sort_by: vec![
-                api::ItemSortBy::SimilarityScore,
-                api::ItemSortBy::CommunityRating,
-            ],
-            sort_order: vec![
-                api::SortOrder::Descending,
-                api::SortOrder::Descending,
-            ],
+            sort_by: vec![api::ItemSortBy::CommunityRating],
+            sort_order: vec![api::SortOrder::Descending],
             limit: Some(fetch_limit),
             total_count: false,
             ..Default::default()
@@ -2379,20 +2366,13 @@ async fn build_taste_similarity_categories(
                 kind: Some(vec![kind.clone()]),
                 parent_id,
                 recursive: parent_id.is_some(),
-                user_id: Some(user_id),
                 user_state: Some(db::UserMediaStateFilter {
                     user_id: Some(user_id),
                     played: Some(false),
                     ..Default::default()
                 }),
-                sort_by: vec![
-                    api::ItemSortBy::DateCreated,
-                    api::ItemSortBy::SimilarityScore,
-                ],
-                sort_order: vec![
-                    api::SortOrder::Descending,
-                    api::SortOrder::Descending,
-                ],
+                sort_by: vec![api::ItemSortBy::DateCreated],
+                sort_order: vec![api::SortOrder::Descending],
                 limit: Some(fetch_limit),
                 total_count: false,
                 ..Default::default()
