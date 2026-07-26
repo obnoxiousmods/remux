@@ -80,18 +80,6 @@ impl StreamService {
             return Ok(());
         }
 
-        let scoped_descriptor_is_reusable = self
-            .requested_id
-            .filter(|requested| *requested != self.item_id)
-            .is_some_and(|requested| {
-                requested == media.id
-                    && media
-                        .stream_info
-                        .as_ref()
-                        .is_some_and(|info| {
-                            info.is_valid_for(std::time::Duration::from_secs(120))
-                        })
-            });
         let mut root = resolve_stream_root(
             &media,
             self.item_id,
@@ -101,19 +89,11 @@ impl StreamService {
         )
         .await;
 
-        if scoped_descriptor_is_reusable {
-            debug!(
-                item_id = %self.item_id,
-                source_id = %media.id,
-                "reusing valid scoped stream descriptor without addon refresh"
-            );
-        } else {
-            self.ctx
-                .addons
-                .refresh_streams(&mut root, &self.ctx, self.user_id)
-                .await
-                .inspect_err(|e| tracing::error!("refresh_streams failed: {e:#}"));
-        }
+        self.ctx
+            .addons
+            .refresh_streams(&mut root, &self.ctx, self.user_id)
+            .await
+            .inspect_err(|e| tracing::error!("refresh_streams failed: {e:#}"));
 
         let db_streams = root
             .streams(
@@ -445,7 +425,7 @@ impl StreamService {
     /// for each candidate. Source ID/name/path/remux are stamped before returning so the
     /// handler only deals with playback-decision work.
     pub async fn probe_candidates(&self) -> anyhow::Result<ProbedStreams> {
-        let mut sel = self.select_streams();
+        let sel = self.select_streams();
         let probe_cfg = db::Settings::get_config_or_default(
             &self
                 .ctx
@@ -469,49 +449,12 @@ impl StreamService {
             .config
             .port;
         let item = db::Media::get_by_id(
-            &self
-                .ctx
-                .db,
+            &self.ctx.db,
             &self.item_id,
         )
         .await
         .ok()
         .flatten();
-
-        // Hydrate candidates the scoped playback probe will skip (non-rank-1
-        // rows) with cached RemuxDB probe versions, so version rows carry
-        // stream details without a live ffprobe per source. The lookup is
-        // Store-first and fetches cheap JSON at most once per item per day.
-        if sel
-            .candidates
-            .iter()
-            .any(|stream| stream.probe_data.is_none())
-        {
-            if let Some(item) = item.as_ref() {
-                if let Some(versions) =
-                    crate::addons::fetch_probe_versions(&self.ctx, item).await
-                {
-                    let hydrated = crate::addons::apply_probe_versions(
-                        &versions,
-                        &mut sel.candidates,
-                    );
-                    if hydrated > 0 {
-                        if let Err(error) = db::Media::upsert(
-                            &self.ctx.db,
-                            &sel.candidates,
-                        )
-                        .await
-                        {
-                            debug!(
-                                %error,
-                                "failed to persist remuxdb-hydrated probe data"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
         let mut results = Vec::with_capacity(
             sel.candidates
                 .len(),

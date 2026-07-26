@@ -431,7 +431,7 @@ fn default_port() -> u16 {
 }
 
 fn default_hls_first_segment_secs() -> Option<u32> {
-    Some(2)
+    None
 }
 
 fn default_torrent_http_port() -> u16 {

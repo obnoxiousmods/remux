@@ -1098,18 +1098,13 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             .map(VideoCodec::is_hevc)
             .unwrap_or(false);
 
-    let (analyze_duration, probe_size) = if params.trusted_probe_data {
-        ("250000", "262144")
-    } else {
-        ("1000000", "1000000")
-    };
     let mut args: Vec<String> = vec![
         "-v".into(),
         "error".into(),
         "-analyzeduration".into(),
-        analyze_duration.into(),
+        "1000000".into(),
         "-probesize".into(),
-        probe_size.into(),
+        "1000000".into(),
         "-reconnect".into(),
         "1".into(),
         "-reconnect_at_eof".into(),
@@ -1763,7 +1758,6 @@ pub async fn start_transcode(
         let mut params = params;
         let mut sw_fallback = false;
         let mut hw_intact_retry = false;
-        let mut full_probe_retry = false;
         let mut live_restarts = 0u32;
         const MAX_LIVE_RESTARTS: u32 = 10;
         let mut input_restarts = 0u32;
@@ -1873,22 +1867,6 @@ pub async fn start_transcode(
                 let _ = std::fs::create_dir_all(&params.output_dir);
                 params.hardware_acceleration_type = HardwareAccelerationType::None;
                 sw_fallback = true;
-                continue;
-            }
-
-            if ffmpeg_failed
-                && params.trusted_probe_data
-                && !full_probe_retry
-                && count_segments(&params.output_dir) == 0
-            {
-                warn!(
-                    stderr = stderr_out.trim(),
-                    "Fast probe-budget startup failed — retrying with full analysis"
-                );
-                let _ = std::fs::remove_dir_all(&params.output_dir);
-                let _ = std::fs::create_dir_all(&params.output_dir);
-                params.trusted_probe_data = false;
-                full_probe_retry = true;
                 continue;
             }
 
@@ -3518,7 +3496,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_probe_uses_reduced_ffmpeg_analysis_budget() {
+    fn probe_metadata_does_not_reduce_ffmpeg_analysis_budget() {
         let dir = PathBuf::from("/tmp/test_trusted_probe");
         let trusted = build_hls_args(&TranscodeParams {
             trusted_probe_data: true,
@@ -3526,8 +3504,8 @@ mod tests {
         });
         let conservative = build_hls_args(&default_hls(dir));
 
-        assert_eq!(arg_after(&trusted, "-analyzeduration"), Some("250000"));
-        assert_eq!(arg_after(&trusted, "-probesize"), Some("262144"));
+        assert_eq!(arg_after(&trusted, "-analyzeduration"), Some("1000000"));
+        assert_eq!(arg_after(&trusted, "-probesize"), Some("1000000"));
         assert_eq!(
             arg_after(&conservative, "-analyzeduration"),
             Some("1000000")

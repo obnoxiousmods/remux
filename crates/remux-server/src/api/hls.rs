@@ -630,11 +630,6 @@ async fn create_hls_session(
             s.codec
                 .clone()
         });
-        let trusted_probe_data = !is_live
-            && resolved_media
-                .probe_data
-                .as_ref()
-                .is_some_and(|probe| probe.video_stream().is_some());
         let burn_subtitle =
             q.subtitle_method == Some(api::SubtitleDeliveryMethod::Encode);
         let session = TranscodeSession::new(
@@ -750,7 +745,7 @@ async fn create_hls_session(
                 .await
                 .source_audio_codec
                 .clone(),
-            trusted_probe_data,
+            trusted_probe_data: false,
             source_frame_rate,
             hardware_acceleration_type: encoding_opts
                 .hardware_acceleration_type
@@ -1732,11 +1727,7 @@ async fn hls_segment_inner(
                             .await
                             .source_audio_codec
                             .clone(),
-                        trusted_probe_data: session
-                            .read()
-                            .await
-                            .source_video_codec
-                            .is_some(),
+                        trusted_probe_data: false,
                         source_frame_rate: session
                             .read()
                             .await
