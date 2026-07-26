@@ -94,3 +94,41 @@ The initial 1280x720 H.264/AAC synthetic cold-start proof on this host produced
 the master playlist at 614 ms, listed the first 200 ms part at 630 ms, and
 successfully fetched it at 639 ms. These numbers isolate local encode and
 packaging overhead; remote source open time still has to be measured separately.
+
+## Playback KPI snapshot script
+
+Use `tools/playback/telemetry-kpi.sh` to get a fast baseline of the same metrics we
+use for playback work:
+
+```sh
+# last 24h (default DB + window)
+./tools/playback/telemetry-kpi.sh
+
+# explicit db path + window
+./tools/playback/telemetry-kpi.sh /opt/remux/data/db.sqlite 24
+
+# explicit startup window (seconds) for startup-impact checks (default 60)
+./tools/playback/telemetry-kpi.sh /opt/remux/data/db.sqlite 24 60
+```
+
+It prints:
+
+- route-level request counts/error rates/latencies for core playback endpoints,
+- route latency quantiles,
+- per-item playbackinfo error concentration,
+- segment 404 concentration (item and playback_key),
+- approximate startup chains (`playbackinfo -> main`, `main -> first segment`),
+- client first-frame event visibility.
+
+Use it after any playback change and compare against the previous snapshot before
+and after deployment. The actionable pass/fail targets we’ve been tracking are:
+
+- `/items/{id}/playbackinfo` 24h error rate < 5%
+- `/videos/{id}/main.m3u8` error rate < 10%
+- No single item with persistent 100% playbackinfo failures
+- `/videos/{id}/stream` is considered healthy on `2xx` (includes expected `206` range responses)
+- `client-first-frame` events present on normal playback traffic (non-zero and stable)
+- Startup-segment misses are tracked separately from all segment 404s: the new
+  `startup segment 404 concentration` section shows misses that happen within the
+  first N seconds of a playback key (default N=60), so long-tail 404s don’t
+  pollute first-frame/startup decisions.

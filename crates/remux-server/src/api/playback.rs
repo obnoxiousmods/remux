@@ -102,10 +102,31 @@ async fn items_playbackinfo_inner(
     .await
     .unwrap_or_default();
 
-    let media =
-        MediaResolveService::resolve_item(media_source_id.unwrap_or(id), &state.ctx)
+    let media = {
+        let media_request_id = media_source_id.unwrap_or(id);
+        let media = MediaResolveService::resolve_item(media_request_id, &state.ctx)
             .await?
             .context_not_found("not found")?;
+        if media_source_id
+            .is_some_and(|requested_id| {
+                requested_id != id
+                    && matches!(
+                        media.kind,
+                        db::MediaKind::Movie | db::MediaKind::Episode | db::MediaKind::Track
+                    )
+            }) {
+            debug!(
+                item_id = %id,
+                media_source_id = %media_request_id,
+                "ignoring stale top-level media_source_id, using path item id"
+            );
+            MediaResolveService::resolve_item(id, &state.ctx)
+                .await?
+                .context_not_found("not found")?
+        } else {
+            media
+        }
+    };
 
     let mut service = StreamService::new(StreamServiceConfig {
         ctx: state
