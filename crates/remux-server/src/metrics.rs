@@ -555,6 +555,7 @@ fn schedule_telemetry_retention(db: &sqlx::SqlitePool) {
     tokio::spawn(async move {
         let _ = sqlx::query("DELETE FROM telemetry_request_events WHERE created_at < datetime('now', '-14 days')").execute(&db).await;
         let _ = sqlx::query("DELETE FROM telemetry_playback_events WHERE created_at < datetime('now', '-14 days')").execute(&db).await;
+        let _ = sqlx::query("DELETE FROM telemetry_recommendation_events WHERE created_at < datetime('now', '-30 days')").execute(&db).await;
         let _ = sqlx::query("DELETE FROM telemetry_hourly_rollups WHERE bucket_start < datetime('now', '-180 days')").execute(&db).await;
     });
 }

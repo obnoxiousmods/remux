@@ -682,6 +682,87 @@ pub async fn telemetry_playback_event(
     Ok(StatusCode::CREATED)
 }
 
+/// Jellyflix recommendation shelf observations. These events are retained for
+/// aggregate evaluation only and are never inputs to recommendation ranking.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryRecommendationEventRequest {
+    pub session_key: String,
+    pub event: String,
+    pub category_id: String,
+    pub recommendation_type: String,
+    pub baseline_item_id: Option<String>,
+    pub baseline_item_name: Option<String>,
+    pub media_kind: String,
+    pub shelf_position: u32,
+    pub item_id: Option<String>,
+    pub item_position: Option<u32>,
+    pub shuffle_seed: u64,
+}
+
+fn valid_recommendation_event(event: &TelemetryRecommendationEventRequest) -> bool {
+    let action_has_item = matches!(event.event.as_str(), "item-opened" | "play-requested");
+    matches!(
+        event.event.as_str(),
+        "shelf-impression" | "item-opened" | "play-requested"
+    ) && matches!(event.media_kind.as_str(), "Movie" | "Series")
+        && matches!(
+            event.recommendation_type.as_str(),
+            "SimilarToRecentlyPlayed"
+                | "SimilarToLikedItem"
+                | "HasDirectorFromRecentlyPlayed"
+                | "HasActorFromRecentlyPlayed"
+                | "HasLikedDirector"
+                | "HasLikedActor"
+                | "MatchesUserTaste"
+                | "Popular"
+                | "RecentlyAdded"
+        )
+        && !event.session_key.trim().is_empty()
+        && event.session_key.len() <= 160
+        && !event.category_id.trim().is_empty()
+        && event.category_id.len() <= 160
+        && (!action_has_item || event.item_id.as_deref().is_some_and(|id| !id.trim().is_empty()))
+}
+
+#[post("/remux/telemetry/recommendation")]
+pub async fn telemetry_recommendation_event(
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Json(event): Json<TelemetryRecommendationEventRequest>,
+) -> Result<impl IntoResponse> {
+    if !state.ctx.config.telemetry_enabled {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if !valid_recommendation_event(&event) {
+        return Ok(StatusCode::BAD_REQUEST);
+    }
+    sqlx::query(
+        "INSERT INTO telemetry_recommendation_events \
+         (session_key, event, category_id, recommendation_type, baseline_item_id, baseline_item_name, media_kind, shelf_position, item_id, item_position, shuffle_seed, user_id, device_id, device_name, client_name, client_version) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(event.session_key.trim())
+    .bind(&event.event)
+    .bind(event.category_id.trim())
+    .bind(&event.recommendation_type)
+    .bind(event.baseline_item_id.map(|value| value.chars().take(160).collect::<String>()))
+    .bind(event.baseline_item_name.map(|value| value.chars().take(500).collect::<String>()))
+    .bind(&event.media_kind)
+    .bind(event.shelf_position)
+    .bind(event.item_id.map(|value| value.chars().take(160).collect::<String>()))
+    .bind(event.item_position)
+    .bind(event.shuffle_seed.to_string())
+    .bind(session.user.id.to_string())
+    .bind(&session.device.id)
+    .bind(&session.device.name)
+    .bind(&session.device.app_name)
+    .bind(&session.device.app_version)
+    .execute(&state.ctx.db)
+    .await?;
+    Ok(StatusCode::CREATED)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelemetryOverviewResponse {
@@ -1030,6 +1111,30 @@ mod tests {
             .expect_failure()
             .await;
         resp.assert_status_bad_request();
+    }
+
+    #[test]
+    fn recommendation_telemetry_requires_known_dimensions_and_action_item() {
+        let mut event = TelemetryRecommendationEventRequest {
+            session_key: "home-session".to_string(),
+            event: "shelf-impression".to_string(),
+            category_id: "category".to_string(),
+            recommendation_type: "MatchesUserTaste".to_string(),
+            baseline_item_id: None,
+            baseline_item_name: Some("science fiction".to_string()),
+            media_kind: "Movie".to_string(),
+            shelf_position: 0,
+            item_id: None,
+            item_position: None,
+            shuffle_seed: 42,
+        };
+        assert!(valid_recommendation_event(&event));
+        event.event = "play-requested".to_string();
+        assert!(!valid_recommendation_event(&event));
+        event.item_id = Some("item".to_string());
+        assert!(valid_recommendation_event(&event));
+        event.recommendation_type = "LearnedFromClicks".to_string();
+        assert!(!valid_recommendation_event(&event));
     }
 
     /// When `metrics_enabled` is false the endpoint is invisible (404), so it
