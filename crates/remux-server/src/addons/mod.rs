@@ -2180,24 +2180,6 @@ impl AddonService {
     }
 }
 
-fn strip_video_ext(name: &str) -> &str {
-    if let Some((stem, ext)) = name.rsplit_once('.') {
-        if opendal::VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
-            return stem;
-        }
-    }
-    name
-}
-
-fn normalized_release_name(name: &str) -> String {
-    let basename = name
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(name)
-        .trim();
-    strip_video_ext(basename).to_ascii_lowercase()
-}
-
 /// IMDb id and season/episode lookup coordinates shared by the RemuxDB
 /// probe-cache key and the fetch helper. Episodes fall back to the series
 /// IMDb id, mirroring the refresh-time lookup.
@@ -2313,9 +2295,20 @@ pub(crate) fn apply_probe_versions(
             continue;
         }
         if let Some(version) = match_probe_version(versions, source) {
-            source.probe_data = Some(version.into());
+            let probe: api::MediaSourceInfo = version.into();
+            if probe
+                .video_stream()
+                .is_none()
+                && probe
+                    .audio_stream()
+                    .is_none()
+            {
+                debug!(id = %source.id, "remuxdb: exact probe match has no playable tracks");
+                continue;
+            }
+            source.probe_data = Some(probe);
             applied += 1;
-            debug!(id = %source.id, "remuxdb: probe data applied from version");
+            debug!(id = %source.id, "remuxdb: complete exact probe data applied from version");
         }
     }
     applied
@@ -2343,8 +2336,8 @@ pub(crate) fn match_probe_version<'a>(
             si.torrent_file_idx,
         ),
     };
-    if let Some(hash) = hash.map(str::trim) {
-        let hash_matches: Vec<&remuxdb::MediaInfo> = versions
+    if let (Some(hash), Some(file_idx)) = (hash.map(str::trim), hash_file_idx) {
+        let exact_matches: Vec<&remuxdb::MediaInfo> = versions
             .iter()
             .filter(|version| {
                 version
@@ -2355,74 +2348,12 @@ pub(crate) fn match_probe_version<'a>(
                             .torrent_info_hash
                             .as_deref()
                             .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(hash))
+                            && source.torrent_file_idx == Some(file_idx)
                     })
             })
             .collect();
-
-        // Prefer the exact file within a multi-file torrent. Some addons omit
-        // the file index while RemuxDB has it (or vice versa), so a unique hash
-        // remains safe and substantially more useful than falling through to a
-        // live ffprobe.
-        if let Some(file_idx) = hash_file_idx {
-            let exact_matches: Vec<&remuxdb::MediaInfo> = hash_matches
-                .iter()
-                .copied()
-                .filter(|version| {
-                    version
-                        .sources
-                        .iter()
-                        .any(|source| {
-                            source
-                                .torrent_info_hash
-                                .as_deref()
-                                .is_some_and(|candidate| {
-                                    candidate.trim().eq_ignore_ascii_case(hash)
-                                })
-                                && source.torrent_file_idx == Some(file_idx)
-                        })
-                })
-                .collect();
-            if exact_matches.len() == 1 {
-                return exact_matches.first().copied();
-            }
-        }
-        if hash_matches.len() == 1 {
-            return hash_matches.first().copied();
-        }
-        if let Some(filename) = si.filename.as_deref() {
-            let normalized = normalized_release_name(filename);
-            let named_matches: Vec<&remuxdb::MediaInfo> = hash_matches
-                .iter()
-                .copied()
-                .filter(|version| {
-                    version
-                        .sources
-                        .iter()
-                        .filter(|source| {
-                            source
-                                .torrent_info_hash
-                                .as_deref()
-                                .is_some_and(|candidate| {
-                                    candidate.trim().eq_ignore_ascii_case(hash)
-                                })
-                        })
-                        .filter_map(|source| source.filename.as_deref())
-                        .map(normalized_release_name)
-                        .any(|candidate| candidate == normalized)
-                })
-                .collect();
-            if named_matches.len() == 1 {
-                return named_matches.first().copied();
-            }
-        }
-        if let Some(size) = si.size {
-            let sized_matches: Vec<&remuxdb::MediaInfo> = hash_matches
-                .into_iter()
-                .filter(|version| version.size == Some(size))
-                .collect();
-            if sized_matches.len() == 1 {
-                return sized_matches.first().copied();
-            }
+        if exact_matches.len() == 1 {
+            return exact_matches.first().copied();
         }
     }
 
@@ -2457,43 +2388,7 @@ pub(crate) fn match_probe_version<'a>(
         }
     }
 
-    // HTTP: exact size is useful only when it identifies one probe version.
-    // Picking the first of multiple equal-sized versions can attach a sibling
-    // release's codecs and streams to the active source.
-    if let Some(size) = si.size {
-        let matches: Vec<&remuxdb::MediaInfo> = versions
-            .iter()
-            .filter(|version| version.size == Some(size))
-            .collect();
-        if matches.len() == 1 {
-            return matches.first().copied();
-        }
-    }
-
-    // Fallback: match release basenames case-insensitively, ignoring a known
-    // video extension and any path prefix supplied by the addon.
-    let filename = si
-        .filename
-        .as_deref()?;
-    let normalized = normalized_release_name(filename);
-    let matches: Vec<&remuxdb::MediaInfo> = versions
-        .iter()
-        .filter(|version| {
-            version
-                .sources
-                .iter()
-                .any(|source| {
-                    source
-                        .filename
-                        .as_deref()
-                        .map(normalized_release_name)
-                        .map(|candidate| candidate == normalized)
-                        .unwrap_or(false)
-                })
-        })
-        .collect();
-    (matches.len() == 1)
-        .then(|| matches[0])
+    None
 }
 
 fn inherit_missing_item_chapters(sources: &mut [db::Media]) -> usize {
@@ -2545,7 +2440,13 @@ impl AddonService {
         user_id: Option<Uuid>,
     ) -> Result<()> {
         const STREAMS_TTL_SECS: i64 = 60;
+        const NEGATIVE_REFRESH_TTL_SECS: u64 = 45;
         static STREAM_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
+        let negative_cache_key = format!(
+            "streams-refresh-negative:{}:{}",
+            media.id,
+            user_id.map_or_else(|| "anonymous".to_string(), |id| id.to_string())
+        );
 
         // Fast path: TTL not expired — skip the lock entirely.
         let is_fresh = |refreshed: Option<chrono::NaiveDateTime>| {
@@ -2554,6 +2455,14 @@ impl AddonService {
             })
         };
         if is_fresh(media.streams_refreshed_at) {
+            return Ok(());
+        }
+        if ctx
+            .store
+            .get::<bool>(&negative_cache_key)
+            .unwrap_or(false)
+        {
+            debug!(item_id = %media.id, "source refresh skipped after recent failure");
             return Ok(());
         }
 
@@ -2576,12 +2485,30 @@ impl AddonService {
             media.streams_refreshed_at = refreshed_at;
             return Ok(());
         }
+        if ctx
+            .store
+            .get::<bool>(&negative_cache_key)
+            .unwrap_or(false)
+        {
+            debug!(item_id = %media.id, "source refresh skipped after recent failure");
+            return Ok(());
+        }
 
         let instant = Instant::now();
         let probe_versions_fut = fetch_probe_versions(ctx, media);
-        let (raw, probe_versions) =
+        let (raw_result, probe_versions) =
             tokio::join!(self.get_streams(media, ctx, user_id), probe_versions_fut);
-        let mut raw = raw?;
+        let mut raw = match raw_result {
+            Ok(raw) => raw,
+            Err(error) => {
+                ctx.store.save(
+                    negative_cache_key,
+                    true,
+                    Duration::from_secs(NEGATIVE_REFRESH_TTL_SECS),
+                );
+                return Err(error);
+            }
+        };
         for source in raw.iter_mut() {
             if let Some(info) = source.stream_info.as_mut() {
                 info.infer_valid_until();
@@ -2615,6 +2542,11 @@ impl AddonService {
         };
         info!(streams = deduped.len(), ?sources, elapsed = ?instant.elapsed(), "streams synced");
         if deduped.is_empty() {
+            ctx.store.save(
+                negative_cache_key,
+                true,
+                Duration::from_secs(NEGATIVE_REFRESH_TTL_SECS),
+            );
             return Ok(());
         }
 
@@ -2974,7 +2906,7 @@ mod tests {
         }
     }
 
-    fn remuxdb_version(filename: &str) -> remuxdb::MediaInfo {
+    fn remuxdb_version(filename: &str, info_hash: &str, file_idx: i32) -> remuxdb::MediaInfo {
         remuxdb::MediaInfo {
             content_hash: None,
             container: Some("mkv".to_string()),
@@ -2988,8 +2920,8 @@ mod tests {
                 filename: Some(filename.to_string()),
                 indexer: None,
                 indexer_guid: None,
-                torrent_info_hash: None,
-                torrent_file_idx: None,
+                torrent_info_hash: Some(info_hash.to_string()),
+                torrent_file_idx: Some(file_idx),
             }],
             tracks: vec![
                 remuxdb::TrackDetail {
@@ -3009,10 +2941,12 @@ mod tests {
         }
     }
 
-    fn unprobed_source(filename: &str) -> db::Media {
+    fn unprobed_source(filename: &str, info_hash: Option<&str>, file_idx: Option<i32>) -> db::Media {
         db::Media {
             stream_info: Some(crate::stream::StreamInfo {
                 filename: Some(filename.to_string()),
+                torrent_info_hash: info_hash.map(str::to_string),
+                torrent_file_idx: file_idx,
                 ..Default::default()
             }),
             ..Default::default()
@@ -3021,10 +2955,12 @@ mod tests {
 
     #[test]
     fn apply_probe_versions_hydrates_only_unique_unprobed_matches() {
-        let versions = vec![remuxdb_version("Movie.2024.1080p.WEB-DL.x264-GRP.mkv")];
+        let filename = "Movie.2024.1080p.WEB-DL.x264-GRP.mkv";
+        let info_hash = "0123456789abcdef0123456789abcdef01234567";
+        let versions = vec![remuxdb_version(filename, info_hash, 3)];
 
-        // Unique filename match hydrates the unprobed source.
-        let mut sources = vec![unprobed_source("Movie.2024.1080p.WEB-DL.x264-GRP.mkv")];
+        // Exact torrent hash + file index hydrates the unprobed source.
+        let mut sources = vec![unprobed_source(filename, Some(info_hash), Some(3))];
         assert_eq!(apply_probe_versions(&versions, &mut sources), 1);
         let probe = sources[0]
             .probe_data
@@ -3043,11 +2979,18 @@ mod tests {
 
         // Ambiguous matches stay unprobed by design.
         let ambiguous = vec![
-            remuxdb_version("Movie.2024.1080p.WEB-DL.x264-GRP.mkv"),
-            remuxdb_version("Movie.2024.1080p.WEB-DL.x264-GRP.mkv"),
+            remuxdb_version(filename, info_hash, 3),
+            remuxdb_version(filename, info_hash, 3),
         ];
-        let mut sources = vec![unprobed_source("Movie.2024.1080p.WEB-DL.x264-GRP.mkv")];
+        let mut sources = vec![unprobed_source(filename, Some(info_hash), Some(3))];
         assert_eq!(apply_probe_versions(&ambiguous, &mut sources), 0);
+        assert!(sources[0]
+            .probe_data
+            .is_none());
+
+        // A matching filename without a strong source identity never hydrates.
+        let mut sources = vec![unprobed_source(filename, None, None)];
+        assert_eq!(apply_probe_versions(&versions, &mut sources), 0);
         assert!(sources[0]
             .probe_data
             .is_none());

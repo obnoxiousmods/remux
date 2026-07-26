@@ -85,6 +85,7 @@ async fn items_playbackinfo_inner(
         .device_profile
         .clone();
 
+    let settings_started = std::time::Instant::now();
     let probe_cfg = db::Settings::get_config_or_default(
         &state
             .ctx
@@ -101,7 +102,9 @@ async fn items_playbackinfo_inner(
     )
     .await
     .unwrap_or_default();
+    let settings_ms = settings_started.elapsed().as_secs_f64() * 1_000.0;
 
+    let media_resolve_started = std::time::Instant::now();
     let media = {
         let media_request_id = media_source_id.unwrap_or(id);
         let media = MediaResolveService::resolve_item(media_request_id, &state.ctx)
@@ -127,6 +130,7 @@ async fn items_playbackinfo_inner(
             media
         }
     };
+    let media_resolve_ms = media_resolve_started.elapsed().as_secs_f64() * 1_000.0;
 
     let mut service = StreamService::new(StreamServiceConfig {
         ctx: state
@@ -151,9 +155,11 @@ async fn items_playbackinfo_inner(
     });
     let is_live = media.is_live();
     let is_track_item = media.is_track();
+    let source_refresh_started = std::time::Instant::now();
     service
         .load(media)
         .await?;
+    let source_refresh_ms = source_refresh_started.elapsed().as_secs_f64() * 1_000.0;
     // Load the top-level Movie/Episode for subtitle lookup.
     // `id` is always the movie/episode UUID; `media_source_id` may point to a
     // child Source, so we always resolve via `id` to get the IMDB fields.
@@ -203,9 +209,12 @@ async fn items_playbackinfo_inner(
         .ctx
         .config
         .port;
+    let probe_started = std::time::Instant::now();
     let probed = service
         .probe_candidates()
         .await?;
+    let probe_ms = probe_started.elapsed().as_secs_f64() * 1_000.0;
+    let response_build_started = std::time::Instant::now();
     let specific_stream_requested = probed.specific_requested;
     let mut media_sources = Vec::with_capacity(
         probed
@@ -523,6 +532,7 @@ async fn items_playbackinfo_inner(
             }
         }
     }
+    let response_build_ms = response_build_started.elapsed().as_secs_f64() * 1_000.0;
 
     let info = api::PlaybackInfoResponse {
         media_sources,
@@ -553,6 +563,17 @@ async fn items_playbackinfo_inner(
         });
         let source_count = info.media_sources.len();
         let elapsed_ms = playback_info_started.elapsed().as_secs_f64() * 1_000.0;
+        info!(
+            item_id = %id,
+            elapsed_ms,
+            settings_ms,
+            media_resolve_ms,
+            source_refresh_ms,
+            probe_ms,
+            response_build_ms,
+            source_count,
+            "playback info stages complete"
+        );
         let user_id = session.user.id.to_string();
         let device_id = session.device.id.clone();
         let device_name = session.device.name.clone();
@@ -580,7 +601,14 @@ async fn items_playbackinfo_inner(
                 serde_json::json!({
                     "scoped": media_source_id.is_some_and(|source_id| source_id != id),
                     "sourceCount": source_count,
-                    "source": "server"
+                    "source": "server",
+                    "stagesMs": {
+                        "settings": settings_ms,
+                        "mediaResolve": media_resolve_ms,
+                        "sourceRefresh": source_refresh_ms,
+                        "probe": probe_ms,
+                        "responseBuild": response_build_ms
+                    }
                 })
                 .to_string(),
             )
