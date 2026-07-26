@@ -256,7 +256,7 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                                 },
                             }
                             p { class: "field-hint",
-                                "Maximum number of items imported per collection."
+                                "Maximum number of items imported per catalog."
                             }
                         }
 
@@ -741,7 +741,7 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
 
                         div { class: "field",
                             label { class: "field-label", "Audio Loudness Normalization" }
-                            div { class: "field-hint", "Apply EBU R128 loudness normalization (loudnorm=I=-14:TP=-1:LRA=11) when transcoding audio. This buffers several seconds before playback can start; leave it off for the fastest video startup. Has no effect when audio is stream-copied." }
+                            div { class: "field-hint", "Normalize transcoded audio to a consistent volume level. May increase time to first segment. Has no effect when audio is stream-copied." }
                             label { style: "display:flex;align-items:center;gap:8px",
                                 input {
                                     r#type: "checkbox",
