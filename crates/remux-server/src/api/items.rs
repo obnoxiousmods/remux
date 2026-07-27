@@ -2614,11 +2614,7 @@ pub async fn items_similar(
                     .id,
             )),
         include_user_state: true,
-        include_child_count: q
-            .fields
-            .as_deref()
-            .map(|fields| fields.contains(&api::ItemFields::ChildCount))
-            .unwrap_or(false),
+        include_child_count: true,
         ..Default::default()
     };
     let result = db::Media::get_by_filter(

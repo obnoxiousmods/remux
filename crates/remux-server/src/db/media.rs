@@ -3963,6 +3963,10 @@ impl Media {
                     sep.push_bind(id);
                 }
                 cc_qb.push(")");
+                cc_qb.push(
+                    " AND (kind = 'season' OR parent_id NOT IN \
+                     (SELECT id FROM media WHERE kind = 'series'))",
+                );
                 if let Some(pf) = child_policy_filter {
                     apply_filter_rules(&mut cc_qb, pf);
                 }
