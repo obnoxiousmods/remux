@@ -7,7 +7,7 @@ use remux_sdks::{
     remux::{MediaStreamType, StreamFilter, VideoRangeType},
     remuxdb,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Result of probing a single stream candidate.
@@ -459,6 +459,7 @@ impl StreamService {
             sel.candidates
                 .len(),
         );
+        let mut has_probed_source = false;
         for (idx, stream) in sel
             .candidates
             .into_iter()
@@ -471,7 +472,7 @@ impl StreamService {
                     si.descriptor
                         .server_input(stream.id, port)
                 });
-            let skip_probe = sel.probe_only_first && idx > 0;
+            let skip_probe = sel.probe_only_first && has_probed_source;
             let was_cached = stream
                 .probe_data
                 .as_ref()
@@ -486,7 +487,7 @@ impl StreamService {
             } else {
                 timeout
             };
-            let (mut source, effective_stream) = probe_stream(
+            let probe_result = probe_stream(
                 &stream,
                 url_opt,
                 skip_probe,
@@ -500,8 +501,25 @@ impl StreamService {
                     .ctx
                     .db,
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            .await;
+            let (mut source, effective_stream) = match probe_result {
+                Ok(result) => {
+                    if !skip_probe {
+                        has_probed_source = true;
+                    }
+                    result
+                }
+                Err(error) if sel.probe_only_first => {
+                    warn!(
+                        stream_id = %stream.id,
+                        candidate_index = idx,
+                        error = ?error,
+                        "catalog source probe failed, trying next catalog entry"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(anyhow::anyhow!("{error:?}")),
+            };
 
             // Use the StreamGroup UUID when this candidate is a group representative
             // (group_id is set by filter_sources). This ensures the client sends back
@@ -566,6 +584,12 @@ impl StreamService {
                 stream,
                 effective_stream,
             });
+        }
+
+        if results.is_empty() {
+            return Err(anyhow::anyhow!(
+                "stream probe failed - no usable catalog sources found"
+            ));
         }
 
         Ok(ProbedStreams {
