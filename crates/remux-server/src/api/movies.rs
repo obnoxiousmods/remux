@@ -2150,10 +2150,7 @@ async fn build_taste_similarity_categories(
                 let context = top_overlap_context_tags(baseline_tags, &media, 2);
                 let reason = taste_profile_reason(Some(&genre_name), &context);
                 attach_recommendation_explanation(&mut item, &reason, signals);
-                let row_context = context
-                    .first()
-                    .cloned();
-                Some((media.id, item, confidence, index, row_context))
+                Some((media.id, item, confidence, index, context))
             })
             .collect();
         candidate_items.sort_by(|left, right| {
@@ -2167,15 +2164,35 @@ async fn build_taste_similarity_categories(
                 })
         });
         let mut row_context_counts: HashMap<String, usize> = HashMap::new();
+        for (_, _, _, _, context) in &candidate_items {
+            for tag in context {
+                *row_context_counts
+                    .entry(tag.clone())
+                    .or_insert(0) += 1;
+            }
+        }
+        let row_context = row_context_counts
+            .into_iter()
+            .filter(|(tag, count)| *count >= 2 && is_strong_taste_row_tag(tag))
+            .max_by(|left, right| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| {
+                        right
+                            .0
+                            .cmp(&left.0)
+                    })
+            })
+            .map(|(tag, _count)| tag);
         let category_items: Vec<_> = candidate_items
             .into_iter()
-            .filter_map(|(id, item, _confidence, _index, row_context)| {
+            .filter(|(_, _, _, _, context)| {
+                row_context
+                    .as_ref()
+                    .is_none_or(|tag| context.contains(tag))
+            })
+            .filter_map(|(id, item, _confidence, _index, _context)| {
                 if seen_item_ids.insert(id) {
-                    if let Some(row_context) = row_context {
-                        *row_context_counts
-                            .entry(row_context)
-                            .or_insert(0) += 1;
-                    }
                     Some(item)
                 } else {
                     None
@@ -2185,19 +2202,6 @@ async fn build_taste_similarity_categories(
             .collect();
 
         if !category_items.is_empty() {
-            let row_context = row_context_counts
-                .into_iter()
-                .filter(|(tag, count)| *count >= 2 && is_strong_taste_row_tag(tag))
-                .max_by(|left, right| {
-                    left.1
-                        .cmp(&right.1)
-                        .then_with(|| {
-                            right
-                                .0
-                                .cmp(&left.0)
-                        })
-                })
-                .map(|(tag, _count)| tag);
             let baseline_name = row_context
                 .as_ref()
                 .map(|tag| format!("{genre_name} + {tag}"))
