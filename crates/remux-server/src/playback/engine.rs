@@ -1884,6 +1884,7 @@ pub async fn start_transcode(
                 && !params.is_live
                 && input_restarts < MAX_INPUT_RESTARTS
                 && is_input_source_failure(&stderr_out)
+                && max_segment_index(&params.output_dir).is_some()
                 && !session_stopped
             {
                 input_restarts += 1;
@@ -1940,7 +1941,11 @@ pub async fn start_transcode(
 
             // Failure unrelated to the encoder: retry once keeping HW accel,
             // recreating the output dir in case it was the cause.
-            if ffmpeg_failed && using_hw && !hw_intact_retry {
+            if ffmpeg_failed
+                && using_hw
+                && !hw_intact_retry
+                && !is_input_source_failure(&stderr_out)
+            {
                 warn!(
                     accel = ?params.hardware_acceleration_type,
                     stderr = stderr_out.trim(),

@@ -339,6 +339,32 @@ async fn create_hls_session(
     let _create_guard = TRANSCODE_CREATE_LOCKS
         .lock(play_session_id.clone())
         .await;
+    let requested_media_source_id = q
+        .media_source_id
+        .unwrap_or(id);
+    if let Some(existing) = state
+        .ctx
+        .sessions
+        .get_transcode(&play_session_id)
+    {
+        let current_media_source_id = existing
+            .read()
+            .await
+            .media_source_id;
+        if current_media_source_id != requested_media_source_id {
+            info!(
+                play_session_id = %play_session_id,
+                current_media_source_id = %current_media_source_id,
+                requested_media_source_id = %requested_media_source_id,
+                "media source changed - stopping old transcode session"
+            );
+            state
+                .ctx
+                .sessions
+                .stop_transcode(&play_session_id)
+                .await;
+        }
+    }
     let is_seeking = q
         .start_time_ticks
         .is_some_and(|t| t > 0);
@@ -394,9 +420,7 @@ async fn create_hls_session(
         existing
     } else {
         // Fetch media info to get the stream URL
-        let media_source_id = q
-            .media_source_id
-            .unwrap_or(id);
+        let media_source_id = requested_media_source_id;
         let media = db::Media::get_by_id(
             &state
                 .ctx
