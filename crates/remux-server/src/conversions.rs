@@ -166,9 +166,6 @@ impl From<db::Media> for api::MediaSourceInfo {
         let is_stub = descriptor
             .and_then(|d| d.as_http_url())
             .is_none();
-        let inferred_container = descriptor
-            .and_then(|d| d.as_http_url())
-            .and_then(infer_container_from_url);
         let container = source
             .probe_data
             .as_ref()
@@ -176,8 +173,11 @@ impl From<db::Media> for api::MediaSourceInfo {
                 p.container
                     .clone()
             })
-            .or(inferred_container)
-            .unwrap_or_else(|| fallback_container_for_media_kind(source.kind));
+            .or_else(|| {
+                descriptor
+                    .and_then(|d| d.as_http_url())
+                    .and_then(infer_container_from_url)
+            });
 
         let remux = Some(api::MediaSourceRemuxInfo {
             provider_info: source
@@ -242,6 +242,14 @@ impl From<db::Media> for api::MediaSourceInfo {
             .runtime
             .and_then(|r| r.to_ticks(common::TickUnit::Seconds));
         let run_time_ticks = probe_ticks.or(meta_ticks);
+        let probe_bitrate = source
+            .probe_data
+            .as_ref()
+            .and_then(|p| p.bitrate);
+        let probe_size = source
+            .probe_data
+            .as_ref()
+            .and_then(|p| p.size);
         let (
             mut media_streams,
             default_audio_stream_index,
@@ -348,6 +356,8 @@ impl From<db::Media> for api::MediaSourceInfo {
             formats: vec![],
             required_http_headers: HashMap::new(),
             run_time_ticks,
+            bitrate: probe_bitrate,
+            size: probe_size,
             media_streams,
             chapters,
             virtual_chapters,

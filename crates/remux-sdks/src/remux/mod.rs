@@ -845,23 +845,40 @@ pub struct AuthenticateUserByName {
 
 impl<'de> serde::Deserialize<'de> for AuthenticateUserByName {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // Jellyfin clients send both `Pw` and `Password` in the same request.
-        // Using `alias` causes serde to error on duplicate keys, so we
-        // deserialize into a flat helper and merge the two fields.
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Raw {
-            pw: Option<String>,
-            password: Option<String>,
-            username: Option<String>,
+        use serde::de::{IgnoredAny, MapAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = AuthenticateUserByName;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("AuthenticateUserByName object")
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut pw: Option<String> = None;
+                let mut password: Option<String> = None;
+                let mut username: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "pw" => pw = map.next_value()?,
+                        "password" => password = map.next_value()?,
+                        "username" => username = map.next_value()?,
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AuthenticateUserByName {
+                    pw: pw.or(password),
+                    username,
+                })
+            }
         }
-        let raw = Raw::deserialize(d)?;
-        Ok(Self {
-            pw: raw
-                .pw
-                .or(raw.password),
-            username: raw.username,
-        })
+        d.deserialize_map(V)
     }
 }
 
@@ -1707,6 +1724,76 @@ mod tests {
             q.tags
                 .is_none()
         );
+    }
+
+    #[test]
+    fn stream_rule_audio_language_round_trips() {
+        let rule = StreamRule::AudioLanguage {
+            op: SetOp::Is,
+            values: vec!["rus".to_string()],
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert_eq!(
+            json,
+            r#"{"field":"audio_language","op":"is","values":["rus"]}"#
+        );
+        let back: StreamRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, back);
+    }
+
+    #[test]
+    fn stream_rule_size_round_trips() {
+        let rule = StreamRule::Size {
+            op: NumericOp::Gt,
+            value: 20_000_000_000,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert_eq!(json, r#"{"field":"size","op":"gt","value":20000000000}"#);
+        let back: StreamRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, back);
+    }
+
+    #[test]
+    fn language_label_maps_known_codes_and_falls_back() {
+        assert_eq!(language_label("rus"), "Russian");
+        assert_eq!(language_label("ENG"), "English");
+        assert_eq!(language_label("fra"), "French");
+        assert_eq!(language_label("deu"), "German");
+        assert_eq!(language_label("xxx"), "xxx");
+    }
+
+    #[test]
+    fn normalize_lang_code_maps_terminologic_to_bibliographic() {
+        assert_eq!(normalize_lang_code("fra"), "fre");
+        assert_eq!(normalize_lang_code("DEU"), "ger");
+        assert_eq!(normalize_lang_code("rus"), "rus");
+    }
+
+    #[test]
+    fn common_audio_languages_includes_russian_and_english() {
+        let codes: Vec<&str> = common_audio_languages()
+            .iter()
+            .map(|(c, _)| *c)
+            .collect();
+        assert!(codes.contains(&"rus"));
+        assert!(codes.contains(&"eng"));
+        assert!(!codes.contains(&"fra"));
+        assert!(!codes.contains(&"deu"));
+    }
+
+    #[test]
+    fn format_size_rule_picks_gib_for_large_values() {
+        let v = 20 * 1024 * 1024 * 1024;
+        assert_eq!(format_size_rule(NumericOp::Gt, v), "> 20.00 GiB");
+        assert_eq!(format_size_rule(NumericOp::Lt, v), "< 20.00 GiB");
+        assert_eq!(format_size_rule(NumericOp::Eq, v), "= 20.00 GiB");
+        assert_eq!(format_size_rule(NumericOp::NotEq, v), "≠ 20.00 GiB");
+    }
+
+    #[test]
+    fn format_size_rule_falls_back_to_mib() {
+        let v = 500 * 1024 * 1024;
+        assert_eq!(format_size_rule(NumericOp::Gt, v), "> 500.00 MiB");
     }
 }
 
@@ -2885,8 +2972,8 @@ impl From<stremio::MediaType> for MediaKind {
     }
 }
 
-/// Operators for numeric fields (Year, Rating).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Operators for numeric fields (Year, Rating, Size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NumericOp {
     Eq,
@@ -6235,6 +6322,70 @@ impl StreamCodec {
     }
 }
 
+/// Common audio languages for the stream-group UI, alphabetical by display name.
+/// Key = ISO 639-2/B code (`MediaStream.language`), value = display name.
+pub fn common_audio_languages() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("ara", "Arabic"),
+        ("chi", "Chinese"),
+        ("eng", "English"),
+        ("fre", "French"),
+        ("ger", "German"),
+        ("heb", "Hebrew"),
+        ("hin", "Hindi"),
+        ("ita", "Italian"),
+        ("jpn", "Japanese"),
+        ("kor", "Korean"),
+        ("pol", "Polish"),
+        ("por", "Portuguese"),
+        ("ron", "Romanian"),
+        ("rus", "Russian"),
+        ("spa", "Spanish"),
+        ("tur", "Turkish"),
+        ("ukr", "Ukrainian"),
+        ("vie", "Vietnamese"),
+    ]
+}
+
+pub fn normalize_lang_code(code: &str) -> String {
+    match code
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fra" => "fre".to_string(),
+        "deu" => "ger".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Display name for an ISO 639-2/B code, falling back to the raw code.
+pub fn language_label(code: &str) -> String {
+    let canon = normalize_lang_code(code);
+    common_audio_languages()
+        .iter()
+        .find(|(c, _)| c.eq_ignore_ascii_case(&canon))
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| code.to_string())
+}
+
+/// Human-readable label for a [`StreamRule::Size`] condition, e.g. `"> 18.63 GiB"`.
+pub fn format_size_rule(op: NumericOp, value: i64) -> String {
+    let sym = match op {
+        NumericOp::Eq => "=",
+        NumericOp::NotEq => "≠",
+        NumericOp::Gt => ">",
+        NumericOp::Lt => "<",
+    };
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    let (n, unit) = if value.unsigned_abs() >= GIB {
+        (value as f64 / GIB as f64, "GiB")
+    } else {
+        (value as f64 / MIB as f64, "MiB")
+    };
+    format!("{sym} {n:.2} {unit}")
+}
+
 /// One condition in a stream group filter. Mirrors `FilterRule` but for stream attributes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "field", rename_all = "snake_case")]
@@ -6250,6 +6401,19 @@ pub enum StreamRule {
     Codec {
         op: SetOp,
         values: Vec<StreamCodec>,
+    },
+    /// Minimum/maximum file size in bytes. A stream with unknown size (`None`)
+    /// passes the rule so HTTP/debrid/IPTV sources are not silently dropped.
+    Size {
+        op: NumericOp,
+        value: i64,
+    },
+    /// Audio track language (ISO 639-2/B code, e.g. "rus", "eng"). Matches if any
+    /// audio stream in `probe_data` has a listed language. A stream with no probe
+    /// data passes the rule so unprobed sources are not silently dropped.
+    AudioLanguage {
+        op: SetOp,
+        values: Vec<String>,
     },
 }
 

@@ -1,4 +1,4 @@
-use crate::services::{MediaResolveService, image::ImageService};
+use crate::services::{MediaResolveService, StreamService, image::ImageService};
 use anyhow::Context;
 use axum::{
     Json,
@@ -1572,13 +1572,19 @@ pub async fn item(
         .stream_groups_show_ungrouped
         .unwrap_or(true);
     let resolved_id = match MediaResolveService::resolve_item(id, &state.ctx).await? {
-        // Stream-group UUIDs are client-facing source IDs, not independently
-        // browsable items. Resolve them back to their movie/episode parent.
-        Some(media) if media.kind == db::MediaKind::StreamGroup => {
-            match media.parent_id {
-                Some(parent_id) => parent_id,
-                None => return Ok(None),
-            }
+        Some(m) if m.kind == db::MediaKind::StreamGroup => {
+            // Stream groups have no parent_id on the row (they're global). Look up the
+            // group→item mapping written by the items pipeline and PlaybackInfo.
+            StreamService::get_group_item(
+                &state
+                    .ctx
+                    .store,
+                session
+                    .user
+                    .id,
+                m.id,
+            )
+            .context_not_found("stream group not yet associated with an item")?
         }
         Some(media) => media.id,
         None => return Ok(None),
@@ -1669,6 +1675,20 @@ pub async fn item(
         } else {
             grouped
         };
+        for source in &filtered {
+            if let Some(gid) = source.group_id {
+                StreamService::save_group_item(
+                    &state
+                        .ctx
+                        .store,
+                    session
+                        .user
+                        .id,
+                    gid,
+                    media.id,
+                );
+            }
+        }
         // Resolve stream details from the RemuxDB probe cache where the
         // local probe column is empty. Browse paths must not pay for network
         // or ffprobe, so this is a synchronous cache lookup only; the
@@ -1713,6 +1733,20 @@ pub async fn item(
         } else {
             grouped
         };
+        for source in &filtered {
+            if let Some(gid) = source.group_id {
+                StreamService::save_group_item(
+                    &state
+                        .ctx
+                        .store,
+                    session
+                        .user
+                        .id,
+                    gid,
+                    media.id,
+                );
+            }
+        }
         // Resolve stream details from the RemuxDB probe cache where the
         // local probe column is empty. Browse paths must not pay for network
         // or ffprobe, so this is a synchronous cache lookup only; the
@@ -1913,7 +1947,8 @@ pub async fn items_get(
             q.fields
                 .as_deref(),
         )
-        .await?,
+        .await?
+        .context_not_found("item not found")?,
     )
     .into_response());
 }

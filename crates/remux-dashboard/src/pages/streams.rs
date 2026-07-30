@@ -4,8 +4,9 @@ use crate::{
 };
 use dioxus::prelude::*;
 use remux_sdks::remux::{
-    CreateStreamGroup, CreateStreamGroupRequest, DeleteStreamGroup, FilterMatchMode,
-    GetStreamGroupPreview, GetSystemConfiguration, ListStreamGroups,
+    common_audio_languages, format_size_rule, language_label, CreateStreamGroup,
+    CreateStreamGroupRequest, DeleteStreamGroup, FilterMatchMode,
+    GetStreamGroupPreview, GetSystemConfiguration, ListStreamGroups, NumericOp,
     ServerConfiguration, SetOp, StreamCodec, StreamFilter, StreamGroupDto,
     StreamGroupPreviewDto, StreamQuality, StreamResolution, StreamRule,
     UpdateStreamGroup, UpdateStreamGroupRequest, UpdateSystemConfiguration,
@@ -22,11 +23,20 @@ pub(crate) fn StreamRuleRow(
         StreamRule::Resolution { .. } => "resolution",
         StreamRule::Quality { .. } => "quality",
         StreamRule::Codec { .. } => "codec",
+        StreamRule::Size { .. } => "size",
+        StreamRule::AudioLanguage { .. } => "audio_language",
     };
+    let is_size = field_val == "size";
     let op_not_in = match &rule {
         StreamRule::Resolution { op, .. }
         | StreamRule::Quality { op, .. }
-        | StreamRule::Codec { op, .. } => matches!(op, SetOp::NotIn),
+        | StreamRule::Codec { op, .. }
+        | StreamRule::AudioLanguage { op, .. } => matches!(op, SetOp::NotIn),
+        StreamRule::Size { .. } => false,
+    };
+    let size_op = match &rule {
+        StreamRule::Size { op, .. } => Some(*op),
+        _ => None,
     };
 
     rsx! {
@@ -45,33 +55,93 @@ pub(crate) fn StreamRuleRow(
                         *r = match v.as_str() {
                             "quality" => StreamRule::Quality { op: SetOp::In, values: vec![] },
                             "codec"  => StreamRule::Codec  { op: SetOp::In, values: vec![] },
+                            "audio_language" => {
+                                StreamRule::AudioLanguage { op: SetOp::In, values: vec![] }
+                            }
+                            "size"   => StreamRule::Size { op: NumericOp::Gt, value: 0 },
                             _        => StreamRule::Resolution { op: SetOp::In, values: vec![] },
                         };
                     }
                 },
+                option { value: "resolution", selected: field_val == "resolution", "Resolution" }
+                option { value: "quality",     selected: field_val == "quality",     "Quality" }
+                option { value: "codec",      selected: field_val == "codec",      "Codec" }
+                option { value: "size",       selected: is_size,                   "Size" }
+                option { value: "audio_language", selected: field_val == "audio_language", "Audio Language" }
             }
             // Operator selector
-            Select {
-                class: "flex-[1]".to_string(),
-                value: if op_not_in { "not_in".to_string() } else { "in".to_string() },
-                options: vec![
-                    SelectOption::new("in", "In"),
-                    SelectOption::new("not_in", "Not in"),
-                ],
-                on_change: move |v: String| {
-                    let new_op = if v == "not_in" { SetOp::NotIn } else { SetOp::In };
+            select {
+                class: "select-input",
+                style: "flex:1",
+                onchange: move |e| {
                     if let Some(r) = rules.write().get_mut(idx) {
-                        *r = match r.clone() {
-                            StreamRule::Resolution { values, .. } => StreamRule::Resolution { op: new_op, values },
-                            StreamRule::Quality { values, .. }     => StreamRule::Quality { op: new_op, values },
-                            StreamRule::Codec { values, .. }      => StreamRule::Codec  { op: new_op, values },
-                        };
+                        if is_size {
+                            let new_op = match e.value().as_str() {
+                                "lt"     => NumericOp::Lt,
+                                "eq"     => NumericOp::Eq,
+                                "not_eq" => NumericOp::NotEq,
+                                _        => NumericOp::Gt,
+                            };
+                            if let StreamRule::Size { value, .. } = r.clone() {
+                                *r = StreamRule::Size { op: new_op, value };
+                            }
+                        } else {
+                            let new_op = if e.value() == "not_in" { SetOp::NotIn } else { SetOp::In };
+                            *r = match r.clone() {
+                                StreamRule::Resolution { values, .. } => StreamRule::Resolution { op: new_op, values },
+                                StreamRule::Quality { values, .. }     => StreamRule::Quality { op: new_op, values },
+                                StreamRule::Codec { values, .. }      => StreamRule::Codec  { op: new_op, values },
+                                StreamRule::AudioLanguage { values, .. } => StreamRule::AudioLanguage { op: new_op, values },
+                                StreamRule::Size { .. } => unreachable!("is_size branch handles Size"),
+                            };
+                        }
                     }
                 },
+                if is_size {
+                    option { value: "gt",     selected: size_op == Some(NumericOp::Gt),    ">" }
+                    option { value: "lt",     selected: size_op == Some(NumericOp::Lt),    "<" }
+                    option { value: "eq",     selected: size_op == Some(NumericOp::Eq),    "=" }
+                    option { value: "not_eq", selected: size_op == Some(NumericOp::NotEq), "≠" }
+                } else {
+                    option { value: "in",     selected: !op_not_in, "In" }
+                    option { value: "not_in", selected:  op_not_in, "Not in" }
+                }
             }
             // Value checkboxes
             div { style: "flex:2;display:flex;flex-wrap:wrap;gap:6px;padding-top:2px",
-                if field_val == "resolution" {
+                if is_size {
+                    {
+                        // Stored as bytes; the field shows GiB and converts on edit.
+                        let gib = match &rule {
+                            StreamRule::Size { value, .. } => *value as f64 / (1024.0 * 1024.0 * 1024.0),
+                            _ => 0.0,
+                        };
+                        let gib_str = format!("{gib:.2}");
+                        rsx! {
+                            label { style: "display:flex;align-items:center;gap:4px;font-size:.82rem",
+                                input {
+                                    r#type: "number",
+                                    class: "select-input",
+                                    style: "width:90px",
+                                    step: "0.01",
+                                    min: "0",
+                                    value: "{gib_str}",
+                                    onchange: move |e| {
+                                        let bytes = (e.value().parse::<f64>().unwrap_or(0.0)
+                                            * 1024.0 * 1024.0 * 1024.0)
+                                            .round() as i64;
+                                        if let Some(r) = rules.write().get_mut(idx) {
+                                            if let StreamRule::Size { op, .. } = r.clone() {
+                                                *r = StreamRule::Size { op, value: bytes };
+                                            }
+                                        }
+                                    },
+                                }
+                                "GiB"
+                            }
+                        }
+                    }
+                } else if field_val == "resolution" {
                     for res in StreamResolution::all() {
                         {
                             let res = res.clone();
@@ -111,6 +181,33 @@ pub(crate) fn StreamRuleRow(
                                         },
                                     }
                                     "{src.label()}"
+                                }
+                            }
+                        }
+                    }
+                } else if field_val == "audio_language" {
+                    div { style: "display:grid;grid-template-columns:1fr 1fr;gap:6px;width:100%",
+                        for (code, name) in common_audio_languages() {
+                            {
+                                let code = code.to_string();
+                                let checked = match &rule {
+                                    StreamRule::AudioLanguage { values, .. } => values.contains(&code),
+                                    _ => false,
+                                };
+                                rsx! {
+                                    label { style: "display:flex;align-items:center;gap:3px;font-size:.82rem;cursor:pointer",
+                                        input {
+                                            r#type: "checkbox",
+                                            checked,
+                                            onchange: move |e| {
+                                                if let Some(StreamRule::AudioLanguage { values, .. }) = rules.write().get_mut(idx) {
+                                                    if e.checked() { if !values.contains(&code) { values.push(code.clone()); } }
+                                                    else { values.retain(|c| c != &code); }
+                                                }
+                                            },
+                                        }
+                                        "{name}"
+                                    }
                                 }
                             }
                         }
@@ -402,6 +499,13 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                                                             StreamRule::Codec { op, values } => {
                                                                 let lbl = values.iter().map(|v| v.label()).collect::<Vec<_>>().join("/");
                                                                 (lbl, matches!(op, SetOp::NotIn), "background:color-mix(in srgb, var(--success) 15%, transparent);color:var(--success);padding:1px 6px;border-radius:4px")
+                                                            }
+                                                            StreamRule::AudioLanguage { op, values } => {
+                                                                let lbl = values.iter().map(|c| language_label(c)).collect::<Vec<_>>().join("/");
+                                                                (lbl, matches!(op, SetOp::NotIn), "background:rgba(245,158,11,.12);color:rgb(217,119,6);padding:1px 6px;border-radius:4px")
+                                                            }
+                                                            StreamRule::Size { op, value } => {
+                                                                (format_size_rule(*op, *value), false, "background:rgba(245,158,11,.12);color:rgb(217,119,6);padding:1px 6px;border-radius:4px")
                                                             }
                                                         };
                                                         let prefix = if is_excl { "NOT " } else { "" };

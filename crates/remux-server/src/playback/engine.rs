@@ -995,6 +995,72 @@ fn build_qsv_scale_filter(max_width: Option<u32>, max_height: Option<u32>) -> St
     }
 }
 
+/// Build the main video processing chain for a CPU-based subtitle overlay.
+///
+/// Applies optional scaling and, for HDR sources, the appropriate colour treatment:
+/// - `do_sw_tonemap` → tonemapx (outputs yuv420p SDR)
+/// - HDR without tonemap → setparams clears BT.2020/PQ metadata + format=yuv420p
+/// - SDR → plain scale (or empty string if no scale needed)
+fn build_cpu_main_video_filters(
+    scale: Option<String>,
+    hdr: bool,
+    do_sw_tonemap: bool,
+    algo: &str,
+    desat: f32,
+    peak: f32,
+) -> String {
+    let scale_part = scale.unwrap_or_default();
+    if !hdr {
+        return scale_part;
+    }
+    let hdr_part = if do_sw_tonemap {
+        format!(
+            "tonemapx=tonemap={algo}:desat={desat:.1}:peak={peak:.1}:t=bt709:m=bt709:p=bt709:format=yuv420p"
+        )
+    } else {
+        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuv420p"
+            .to_string()
+    };
+    if scale_part.is_empty() {
+        hdr_part
+    } else {
+        format!("{scale_part},{hdr_part}")
+    }
+}
+
+/// Compose a filter_complex string for a CPU-based (non-QSV) subtitle overlay.
+///
+/// Places `sub_preproc` on the subtitle stream, composites it over `main_video`
+/// via `overlay`, then optionally passes through `hw_suffix` (e.g.
+/// `format=nv12,hwupload` for VAAPI) before the final `[v]` output.
+fn build_cpu_overlay_complex(
+    sub_idx: i32,
+    sub_preproc: &str,
+    main_video: &str,
+    hw_suffix: Option<&str>,
+) -> String {
+    let overlay = "overlay=eof_action=pass:repeatlast=0";
+    if main_video.is_empty() {
+        match hw_suffix {
+            Some(suf) => format!(
+                "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0][sub]{overlay}[vraw];[vraw]{suf}[v]"
+            ),
+            None => {
+                format!("[0:{sub_idx}]{sub_preproc}[sub];[0:v:0][sub]{overlay}[v]")
+            }
+        }
+    } else {
+        match hw_suffix {
+            Some(suf) => format!(
+                "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_video}[main];[main][sub]{overlay}[vraw];[vraw]{suf}[v]"
+            ),
+            None => format!(
+                "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_video}[main];[main][sub]{overlay}[v]"
+            ),
+        }
+    }
+}
+
 fn is_hdr(range_type: Option<&VideoRangeType>) -> bool {
     matches!(
         range_type,
@@ -1119,20 +1185,16 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         "30000000".into(),
     ];
 
+    let burn_subtitle_filter = params.burn_subtitle
+        && params
+            .subtitle_stream_index
+            .is_some();
+
     // Hardware acceleration input flags (before -ss and -i).
     // For QSV+HDR without VPP tonemapping: SW-decode so CPU filters can run.
     // For QSV+HDR with VPP tonemapping: keep VAAPI hw-decode (tonemap_vaapi needs GPU frames).
-    if ffmpeg_video_codec != "copy"
-        && !params.burn_subtitle
-        && matches!(accel, HardwareAccelerationType::Nvenc)
-    {
-        args.extend([
-            "-hwaccel".into(),
-            "cuda".into(),
-            "-hwaccel_output_format".into(),
-            "cuda".into(),
-        ]);
-    } else if hdr && matches!(accel, HardwareAccelerationType::Qsv) && !do_vpp_tonemap {
+    // QSV+burn_subtitle (non-HDR) keeps VAAPI hw-decode — overlay_qsv handles compositing on-GPU.
+    if matches!(accel, HardwareAccelerationType::Qsv) && hdr && !do_vpp_tonemap {
         args.extend(qsv_init_only_args(
             &params.vaapi_device,
             &params.vaapi_driver,
@@ -1194,7 +1256,8 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
 
     // HW filter suffix appended after scale.
     // QSV+VPP: tonemap_vaapi in VAAPI memory then hwmap to QSV surface.
-    // QSV+HDR (SW decode, no VPP): just format=nv12 — QSV encoder accepts system-memory NV12.
+    // QSV+HDR (SW decode, no VPP): frames in CPU memory — format=nv12 for the QSV encoder.
+    // QSV+burn_subtitle: hw_suffix is not used — overlay_qsv path builds its own filter chain.
     // Otherwise: standard hw_filter_suffix (e.g. format=nv12,hwupload for VAAPI).
     let cuda_native = ffmpeg_video_codec != "copy"
         && !params.burn_subtitle
@@ -1206,7 +1269,7 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         let vpp =
             "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709:extra_hw_frames=32";
         Some(format!("{vpp},hwmap=derive_device=qsv,format=qsv"))
-    } else if hdr && matches!(accel, HardwareAccelerationType::Qsv) && !do_vpp_tonemap {
+    } else if matches!(accel, HardwareAccelerationType::Qsv) && hdr && !do_vpp_tonemap {
         Some("format=nv12".to_string())
     } else {
         hw_filter_suffix(accel)
@@ -1233,29 +1296,49 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             } else {
                 format!("scale,{sub_scale}")
             };
-            let main_scale_part = build_scale_filter(params)
-                .map(|s| format!("{s}"))
-                .unwrap_or_default();
-            let main_preproc = main_scale_part;
-            let overlay = "overlay=eof_action=pass:repeatlast=0";
-            let filter = if main_preproc.is_empty() {
-                match &hw_suffix {
-                    Some(suf) => format!(
-                        "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0][sub]{overlay}[vraw];[vraw]{suf}[v]"
-                    ),
-                    None => format!(
-                        "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0][sub]{overlay}[v]"
-                    ),
-                }
+
+
+            let filter = if is_hw
+                && matches!(accel, HardwareAccelerationType::Qsv)
+                && !hdr
+                && !do_vpp_tonemap
+            {
+                // QSV path: keep VAAPI hw decode throughout. Sub is prepared on CPU
+                // (format=bgra) then uploaded to the QSV device. overlay_qsv composites
+                // both surfaces on-GPU — no CPU round-trip for video frames.
+                // Mirrors Jellyfin's GetIntelQsvVaapiVidFiltersPrefered graphical-sub path.
+                let sub_upload =
+                    "format=bgra,hwupload=derive_device=qsv:extra_hw_frames=64";
+                let overlay_size = match (out_w, out_h) {
+                    (Some(w), Some(h)) => format!(":w={w}:h={h}"),
+                    _ => String::new(),
+                };
+                let overlay_qsv =
+                    format!("overlay_qsv=eof_action=pass:repeatlast=0{overlay_size}");
+                // Video: scale_vaapi (still in VAAPI memory after decode) then map to QSV
+                // surface. overlay_qsv output is already in QSV format for the encoder.
+                let video_scale =
+                    build_qsv_scale_filter(params.max_width, params.max_height);
+                format!(
+                    "[0:{sub_idx}]{sub_preproc},{sub_upload}[sub];\
+                     [0:v:0]{video_scale},hwmap=derive_device=qsv,format=qsv[vmain];\
+                     [vmain][sub]{overlay_qsv}[v]"
+                )
             } else {
-                match &hw_suffix {
-                    Some(suf) => format!(
-                        "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_preproc}[main];[main][sub]{overlay}[vraw];[vraw]{suf}[v]"
-                    ),
-                    None => format!(
-                        "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_preproc}[main];[main][sub]{overlay}[v]"
-                    ),
-                }
+                let main_video = build_cpu_main_video_filters(
+                    build_scale_filter(params),
+                    hdr,
+                    do_sw_tonemap,
+                    &params.tonemapping_algorithm,
+                    params.tonemapping_desat,
+                    params.tonemapping_peak,
+                );
+                build_cpu_overlay_complex(
+                    sub_idx,
+                    &sub_preproc,
+                    &main_video,
+                    hw_suffix.as_deref(),
+                )
             };
             args.extend(["-filter_complex".into(), filter]);
             args.extend(["-map".into(), "[v]".into()]);
@@ -2197,8 +2280,15 @@ pub(crate) fn build_progressive_args(
         "30000000".into(),
     ];
 
+    let burn_subtitle_filter = params.burn_subtitle
+        && params
+            .subtitle_stream_index
+            .is_some();
+
     // Hardware acceleration input flags (before -ss and -i).
-    if hdr && matches!(accel, HardwareAccelerationType::Qsv) && !do_vpp_tonemap {
+    // QSV+HDR without VPP: SW-decode so CPU filters can run.
+    // QSV+burn_subtitle (non-HDR): keeps VAAPI hw-decode — overlay_qsv handles on-GPU.
+    if matches!(accel, HardwareAccelerationType::Qsv) && hdr && !do_vpp_tonemap {
         args.extend(qsv_init_only_args(
             &params.vaapi_device,
             &params.vaapi_driver,
@@ -2229,7 +2319,7 @@ pub(crate) fn build_progressive_args(
         let vpp =
             "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709:extra_hw_frames=32";
         Some(format!("{vpp},hwmap=derive_device=qsv,format=qsv"))
-    } else if hdr && matches!(accel, HardwareAccelerationType::Qsv) && !do_vpp_tonemap {
+    } else if matches!(accel, HardwareAccelerationType::Qsv) && hdr && !do_vpp_tonemap {
         Some("format=nv12".to_string())
     } else {
         hw_filter_suffix(accel)
@@ -2266,20 +2356,42 @@ pub(crate) fn build_progressive_args(
             } else {
                 format!("scale,{sub_scale}")
             };
-            let overlay = "overlay=eof_action=pass:repeatlast=0";
-            let filter = match (&scale_filter, &hw_suffix) {
-                (Some(main_scale), Some(suf)) => format!(
-                    "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_scale}[main];[main][sub]{overlay}[vraw];[vraw]{suf}[v]"
-                ),
-                (Some(main_scale), None) => format!(
-                    "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0]{main_scale}[main];[main][sub]{overlay}[v]"
-                ),
-                (None, Some(suf)) => format!(
-                    "[0:{sub_idx}]{sub_preproc}[sub];[0:v:0][sub]{overlay}[vraw];[vraw]{suf}[v]"
-                ),
-                (None, None) => {
-                    format!("[0:{sub_idx}]{sub_preproc}[sub];[0:v:0][sub]{overlay}[v]")
-                }
+
+            let filter = if is_hw
+                && matches!(accel, HardwareAccelerationType::Qsv)
+                && !hdr
+                && !do_vpp_tonemap
+            {
+                // QSV path: overlay_qsv keeps video in GPU memory throughout.
+                let sub_upload =
+                    "format=bgra,hwupload=derive_device=qsv:extra_hw_frames=64";
+                let overlay_size = match (out_w, out_h) {
+                    (Some(w), Some(h)) => format!(":w={w}:h={h}"),
+                    _ => String::new(),
+                };
+                let overlay_qsv =
+                    format!("overlay_qsv=eof_action=pass:repeatlast=0{overlay_size}");
+                let video_scale = build_qsv_scale_filter(out_w, out_h);
+                format!(
+                    "[0:{sub_idx}]{sub_preproc},{sub_upload}[sub];\
+                     [0:v:0]{video_scale},hwmap=derive_device=qsv,format=qsv[vmain];\
+                     [vmain][sub]{overlay_qsv}[v]"
+                )
+            } else {
+                let main_video = build_cpu_main_video_filters(
+                    scale_filter.clone(),
+                    hdr,
+                    do_sw_tonemap,
+                    &params.tonemapping_algorithm,
+                    params.tonemapping_desat,
+                    params.tonemapping_peak,
+                );
+                build_cpu_overlay_complex(
+                    sub_idx,
+                    &sub_preproc,
+                    &main_video,
+                    hw_suffix.as_deref(),
+                )
             };
             args.extend(["-filter_complex".into(), filter]);
             args.extend(["-map".into(), "[v]".into()]);

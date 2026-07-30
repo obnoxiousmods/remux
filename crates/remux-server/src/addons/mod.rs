@@ -984,6 +984,39 @@ fn user_scoped(runtime: &AddonRuntime, override_ids: Option<&[Uuid]>) -> bool {
     }
 }
 
+/// Returns `None` for a manifest type with no recognized `MediaKind`
+/// equivalent (e.g. fankai's "anime") instead of collapsing it to `Movie`
+/// like the default `From<stremio::MediaType>` impl does — that would make
+/// `supports_type` believe an anime/series-only addon serves only movies,
+/// excluding it from `addons_for::<dyn StreamAddon>` for every
+/// Series/Season/Episode lookup.
+fn recognized_manifest_media_kind(
+    t: sdks::stremio::MediaType,
+) -> Option<sdks::remux::MediaKind> {
+    use sdks::{remux::MediaKind as MK, stremio::MediaType as MT};
+    Some(match t {
+        MT::Movie => MK::Movie,
+        MT::Series => MK::Series,
+        MT::Tv | MT::Channel => MK::TvChannel,
+        MT::Album => MK::Album,
+        MT::Artist => MK::Artist,
+        MT::Track => MK::Track,
+        MT::Events => MK::TvProgram,
+        MT::Unknown(s) => match s.as_str() {
+            "episode" => MK::Episode,
+            "season" => MK::Season,
+            "person" => MK::Person,
+            "genre" => MK::Genre,
+            "studio" => MK::Studio,
+            "collection" => MK::Collection,
+            "folder" => MK::Folder,
+            "stream" => MK::Stream,
+            "playlist" => MK::Playlist,
+            _ => return None,
+        },
+    })
+}
+
 fn kind_in_type_list(kind: &db::MediaKind, list: &[db::MediaKind]) -> bool {
     list.contains(kind)
         || (matches!(kind, db::MediaKind::Episode | db::MediaKind::Season)
@@ -1242,7 +1275,7 @@ impl AddonService {
                                     caps.metadata
                                         .supported_types = raw_types
                                         .into_iter()
-                                        .map(Into::into)
+                                        .filter_map(recognized_manifest_media_kind)
                                         .collect();
                                 }
                             }
@@ -2125,12 +2158,14 @@ impl AddonService {
             .into_iter()
             .map(|r| async move {
                 let name = &r.row.name;
+                let t = std::time::Instant::now();
                 match r.stream.as_ref().unwrap().get_streams(media, ctx).await {
                     Ok(mut streams) => {
+                        let elapsed = t.elapsed();
                         if streams.is_empty() {
-                            debug!(addon = %name, "addon: no streams");
+                            debug!(addon = %name, ?elapsed, "addon: no streams");
                         } else {
-                            debug!(addon = %name, count = streams.len(), "addon: streams found");
+                            debug!(addon = %name, count = streams.len(), ?elapsed, "addon: streams found");
                             let addon_id = r.row.id;
                             for s in &mut streams {
                                 s.source = Some(name.clone());
@@ -2140,7 +2175,7 @@ impl AddonService {
                         streams
                     }
                     Err(e) => {
-                        warn!(addon = %name, error = %e, "stream addon failed");
+                        warn!(addon = %name, error = %e, elapsed = ?t.elapsed(), "stream addon failed");
                         vec![]
                     }
                 }
@@ -2495,26 +2530,83 @@ impl AddonService {
         }
 
         let instant = Instant::now();
-        let probe_versions_fut = fetch_probe_versions(ctx, media);
-        let (raw_result, probe_versions) =
-            tokio::join!(self.get_streams(media, ctx, user_id), probe_versions_fut);
-        let mut raw = match raw_result {
-            Ok(raw) => raw,
-            Err(error) => {
-                ctx.store.save(
-                    negative_cache_key,
-                    true,
-                    Duration::from_secs(NEGATIVE_REFRESH_TTL_SECS),
-                );
-                return Err(error);
+        let probe_versions_fut = async {
+            let Some(url) = ctx
+                .config
+                .remuxdb_url
+                .clone()
+            else {
+                return None;
+            };
+            let imdb_id = if media.kind == db::MediaKind::Episode {
+                media
+                    .external_ids
+                    .series_imdb
+                    .as_deref()
+                    .or(media
+                        .external_ids
+                        .imdb
+                        .as_deref())
+            } else {
+                media
+                    .external_ids
+                    .imdb
+                    .as_deref()
+            };
+            let Some(imdb_id) = imdb_id else {
+                return None;
+            };
+            let cfg = db::Settings::get_config_or_default(&ctx.db).await;
+            if !cfg
+                .remuxdb_enabled
+                .unwrap_or(true)
+            {
+                return None;
+            }
+            let (season, episode) = if media.kind == db::MediaKind::Episode {
+                (
+                    media
+                        .parent_idx
+                        .map(|v| v as i32),
+                    media
+                        .idx
+                        .map(|v| v as i32),
+                )
+            } else {
+                (None, None)
+            };
+            remuxdb::fetch_probe(
+                &url,
+                cfg.remuxdb_token
+                    .as_deref(),
+                Some(crate::common::server_id().as_str()),
+                imdb_id,
+                season,
+                episode,
+            )
+            .await
+        };
+        let probe_t = std::time::Instant::now();
+        let (raw, probe_versions) = tokio::join!(
+            self.get_streams(media, ctx, user_id),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                probe_versions_fut,
+            )
+        );
+        let raw = raw?;
+        let probe_versions = match probe_versions {
+            Ok(v) => v,
+            Err(_) => {
+                debug!(remuxdb_elapsed = ?probe_t.elapsed(), "remuxdb probe timed out");
+                None
             }
         };
-        for source in raw.iter_mut() {
-            if let Some(info) = source.stream_info.as_mut() {
-                info.infer_valid_until();
-            }
-        }
-        debug!(raw_count = raw.len(), "raw streams fetched");
+        debug!(
+            raw_count = raw.len(),
+            remuxdb_elapsed = ?probe_t.elapsed(),
+            "raw streams fetched"
+        );
 
         // Dedup by descriptor content; order preserves addon priority (DB load order).
         // First occurrence wins, so higher-priority addons' streams survive.
@@ -3351,6 +3443,26 @@ mod tests {
         assert_ne!(
             AddonService::stream_dedup_key(&first),
             AddonService::stream_dedup_key(&second)
+        );
+    }
+
+    #[test]
+    fn recognized_manifest_media_kind_drops_unrecognized_custom_type() {
+        assert_eq!(
+            recognized_manifest_media_kind(sdks::stremio::MediaType::Unknown(
+                "anime".to_string()
+            )),
+            None
+        );
+        assert_eq!(
+            recognized_manifest_media_kind(sdks::stremio::MediaType::Series),
+            Some(sdks::remux::MediaKind::Series)
+        );
+        assert_eq!(
+            recognized_manifest_media_kind(sdks::stremio::MediaType::Unknown(
+                "episode".to_string()
+            )),
+            Some(sdks::remux::MediaKind::Episode)
         );
     }
 }
