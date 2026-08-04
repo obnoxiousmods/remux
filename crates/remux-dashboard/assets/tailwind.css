@@ -218,12 +218,6 @@
   .flex-\[0_0_auto\] {
     flex: 0 0 auto;
   }
-  .flex-\[1\.2\] {
-    flex: 1.2;
-  }
-  .flex-\[1\] {
-    flex: 1;
-  }
   .shrink-0 {
     flex-shrink: 0;
   }
