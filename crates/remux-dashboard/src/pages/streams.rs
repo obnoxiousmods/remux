@@ -42,19 +42,13 @@ pub(crate) fn StreamRuleRow(
     rsx! {
         div { style: "display:flex;align-items:flex-start;gap:6px",
             // Field selector
-            Select {
-                class: "flex-[1.2]".to_string(),
-                value: field_val.to_string(),
-                options: vec![
-                    SelectOption::new("resolution", "Resolution"),
-                    SelectOption::new("quality", "Quality"),
-                    SelectOption::new("codec", "Codec"),
-                    SelectOption::new("size", "Size"),
-                    SelectOption::new("audio_language", "Audio Language"),
-                ],
-                on_change: move |v: String| {
+            select {
+                class: "select-input",
+                style: "flex:1.2",
+                value: "{field_val}",
+                onchange: move |e| {
                     if let Some(r) = rules.write().get_mut(idx) {
-                        *r = match v.as_str() {
+                        *r = match e.value().as_str() {
                             "quality" => StreamRule::Quality { op: SetOp::In, values: vec![] },
                             "codec"  => StreamRule::Codec  { op: SetOp::In, values: vec![] },
                             "audio_language" => {
@@ -65,6 +59,11 @@ pub(crate) fn StreamRuleRow(
                         };
                     }
                 },
+                option { value: "resolution", selected: field_val == "resolution", "Resolution" }
+                option { value: "quality", selected: field_val == "quality", "Quality" }
+                option { value: "codec", selected: field_val == "codec", "Codec" }
+                option { value: "size", selected: is_size, "Size" }
+                option { value: "audio_language", selected: field_val == "audio_language", "Audio Language" }
             }
             // Operator selector
             select {

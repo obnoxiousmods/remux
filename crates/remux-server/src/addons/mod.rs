@@ -2783,9 +2783,9 @@ impl AddonService {
             );
         }
 
-        // delete stale items
+        // delete stale items (stream URLs have short-lived tokens, expire quickly)
         sqlx::query(
-            "DELETE FROM media WHERE kind = 'stream' AND parent_id = ? AND updated_at < datetime('now', '-7 days')",
+            "DELETE FROM media WHERE kind = 'stream' AND parent_id = ? AND updated_at < datetime('now', '-12 hours')",
         )
         .bind(media.id)
         .execute(&ctx.db)

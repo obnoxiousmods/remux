@@ -324,7 +324,7 @@ impl From<db::Media> for api::MediaSourceInfo {
             media_streams = vec![api::MediaStream {
                 type_: Some(api::MediaStreamType::Audio),
                 index: 0,
-                codec: Some(container.clone()),
+                codec: container.clone(),
                 channels: Some(2),
                 is_default: Some(true),
                 display_title: Some("Audio".to_string()),
@@ -342,7 +342,7 @@ impl From<db::Media> for api::MediaSourceInfo {
                     .title
                     .clone()
             })),
-            container: Some(container),
+            container,
             bitrate: probe_bitrate,
             size: probe_size,
             video_type,
