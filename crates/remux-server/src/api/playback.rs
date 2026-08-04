@@ -1,9 +1,7 @@
 use anyhow::anyhow;
 use axum::Json;
 
-use super::subtitles::{
-    inject_external_subtitles, lang_to_two_letter, scored_external_subtitles,
-};
+use super::subtitles::{inject_external_subtitles, scored_external_subtitles};
 use axum::{
     body::Body,
     extract::{Path, State},
@@ -70,6 +68,33 @@ pub async fn items_playbackinfo_get(
     items_playbackinfo_inner(state, session, id, q).await
 }
 
+/// Load remembered audio/subtitle stream selections for a user+item
+/// (best-effort; failure means no recall).
+async fn load_saved_selections(
+    db: &sqlx::SqlitePool,
+    user_id: &uuid::Uuid,
+    media_id: &uuid::Uuid,
+) -> (Option<i64>, Option<i64>) {
+    let media = crate::db::Media::get_by_id(db, media_id)
+        .await
+        .ok()
+        .flatten();
+    let Some(media) = media else {
+        return (None, None);
+    };
+    match sqlx::query_as::<_, crate::db::UserMediaState>(
+        "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
+    )
+    .bind(user_id)
+    .bind(media.id)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(Some(state)) => (state.audio_idx, state.subtitle_idx),
+        _ => (None, None),
+    }
+}
+
 async fn items_playbackinfo_inner(
     state: AppState,
     session: auth::AuthSession,
@@ -102,7 +127,10 @@ async fn items_playbackinfo_inner(
     )
     .await
     .unwrap_or_default();
-    let settings_ms = settings_started.elapsed().as_secs_f64() * 1_000.0;
+    let settings_ms = settings_started
+        .elapsed()
+        .as_secs_f64()
+        * 1_000.0;
 
     let media_resolve_started = std::time::Instant::now();
     let media = {
@@ -110,14 +138,15 @@ async fn items_playbackinfo_inner(
         let media = MediaResolveService::resolve_item(media_request_id, &state.ctx)
             .await?
             .context_not_found("not found")?;
-        if media_source_id
-            .is_some_and(|requested_id| {
-                requested_id != id
-                    && matches!(
-                        media.kind,
-                        db::MediaKind::Movie | db::MediaKind::Episode | db::MediaKind::Track
-                    )
-            }) {
+        if media_source_id.is_some_and(|requested_id| {
+            requested_id != id
+                && matches!(
+                    media.kind,
+                    db::MediaKind::Movie
+                        | db::MediaKind::Episode
+                        | db::MediaKind::Track
+                )
+        }) {
             debug!(
                 item_id = %id,
                 media_source_id = %media_request_id,
@@ -130,7 +159,10 @@ async fn items_playbackinfo_inner(
             media
         }
     };
-    let media_resolve_ms = media_resolve_started.elapsed().as_secs_f64() * 1_000.0;
+    let media_resolve_ms = media_resolve_started
+        .elapsed()
+        .as_secs_f64()
+        * 1_000.0;
 
     let mut service = StreamService::new(StreamServiceConfig {
         ctx: state
@@ -159,7 +191,10 @@ async fn items_playbackinfo_inner(
     service
         .load(media)
         .await?;
-    let source_refresh_ms = source_refresh_started.elapsed().as_secs_f64() * 1_000.0;
+    let source_refresh_ms = source_refresh_started
+        .elapsed()
+        .as_secs_f64()
+        * 1_000.0;
     // Load the top-level Movie/Episode for subtitle lookup.
     // `id` is always the movie/episode UUID; `media_source_id` may point to a
     // child Source, so we always resolve via `id` to get the IMDB fields.
@@ -213,7 +248,10 @@ async fn items_playbackinfo_inner(
     let probed = service
         .probe_candidates()
         .await?;
-    let probe_ms = probe_started.elapsed().as_secs_f64() * 1_000.0;
+    let probe_ms = probe_started
+        .elapsed()
+        .as_secs_f64()
+        * 1_000.0;
     let response_build_started = std::time::Instant::now();
     let specific_stream_requested = probed.specific_requested;
     let mut media_sources = Vec::with_capacity(
@@ -221,6 +259,31 @@ async fn items_playbackinfo_inner(
             .results
             .len(),
     );
+
+    // Per-user playback preferences + remembered selections, resolved per source
+    // via `MediaSourceInfo::resolve_default_streams` (see below).
+    let user_cfg = session
+        .user
+        .configuration
+        .as_ref()
+        .map(|c| {
+            c.0.clone()
+        })
+        .unwrap_or_default();
+    let server_subtitle_lang = probe_cfg
+        .preferred_metadata_language
+        .as_deref();
+    let (saved_audio, saved_subtitle) = load_saved_selections(
+        &state
+            .ctx
+            .db,
+        &session
+            .user
+            .id,
+        &id,
+    )
+    .await;
+
     for ProbeResult {
         mut source,
         stream,
@@ -348,6 +411,19 @@ async fn items_playbackinfo_inner(
             }
         }
 
+        // Resolve default audio/subtitle stream indexes for this source. These are
+        // per-request API values (never persisted); resolving before the burn
+        // check, transcode decision and subtitle delivery means those consumers
+        // see the stream the client will actually get.
+        source.resolve_default_streams(
+            &user_cfg,
+            server_subtitle_lang,
+            q.audio_stream_index,
+            q.subtitle_stream_index,
+            saved_audio,
+            saved_subtitle,
+        );
+
         // Detect embedded subtitle codecs unsupported by the client device profile.
         // In Burn mode this triggers transcoding so the subtitle can be burned in.
         // In Extract/Strip modes, no transcode reason is added for subtitles.
@@ -442,6 +518,13 @@ async fn items_playbackinfo_inner(
 
         source.transcoding_reasons = transcode_reasons;
 
+        // Recompute from codec — never trust the stored DB value (may be stale).
+        for s in &mut source.media_streams {
+            if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
+                s.is_text_subtitle_stream = s.is_text_subtitle_stream();
+            }
+        }
+
         media_sources.push(source);
     }
 
@@ -469,21 +552,19 @@ async fn items_playbackinfo_inner(
         .await;
     }
 
-    // Apply per-user playback preferences
-    apply_user_playback_prefs(
-        &state
-            .ctx
-            .db,
-        &session.user,
-        &id,
-        &mut media_sources,
-        q.audio_stream_index,
-        q.subtitle_stream_index,
-        probe_cfg
-            .preferred_metadata_language
-            .as_deref(),
-    )
-    .await;
+    // Re-resolve defaults after external subtitles were injected so language
+    // matching can also pick addon subtitles (same request context as the
+    // per-source resolve inside the probe loop).
+    for source in &mut media_sources {
+        source.resolve_default_streams(
+            &user_cfg,
+            server_subtitle_lang,
+            q.audio_stream_index,
+            q.subtitle_stream_index,
+            saved_audio,
+            saved_subtitle,
+        );
+    }
 
     // Cache the group-resolved stream UUID so the stream endpoint can find it
     // without re-running filter_sources (which could pick a different candidate).
@@ -532,7 +613,10 @@ async fn items_playbackinfo_inner(
             }
         }
     }
-    let response_build_ms = response_build_started.elapsed().as_secs_f64() * 1_000.0;
+    let response_build_ms = response_build_started
+        .elapsed()
+        .as_secs_f64()
+        * 1_000.0;
 
     let info = api::PlaybackInfoResponse {
         media_sources,
@@ -540,29 +624,55 @@ async fn items_playbackinfo_inner(
         ..Default::default()
     };
 
-    if state.ctx.config.telemetry_enabled {
-        let db = state.ctx.db.clone();
-        let playback_key = info.play_session_id.clone().unwrap_or_default();
+    if state
+        .ctx
+        .config
+        .telemetry_enabled
+    {
+        let db = state
+            .ctx
+            .db
+            .clone();
+        let playback_key = info
+            .play_session_id
+            .clone()
+            .unwrap_or_default();
         let source_id = info
             .media_sources
             .first()
-            .map(|source| source.id.to_string());
+            .map(|source| {
+                source
+                    .id
+                    .to_string()
+            });
         let source_name = info
             .media_sources
             .first()
-            .and_then(|source| source.name.clone());
-        let delivery_class = info.media_sources.first().map(|source| {
-            if source.supports_direct_play {
-                "direct-play"
-            } else if source.supports_direct_stream {
-                "direct-stream"
-            } else {
-                "transcode"
-            }
-            .to_string()
-        });
-        let source_count = info.media_sources.len();
-        let elapsed_ms = playback_info_started.elapsed().as_secs_f64() * 1_000.0;
+            .and_then(|source| {
+                source
+                    .name
+                    .clone()
+            });
+        let delivery_class = info
+            .media_sources
+            .first()
+            .map(|source| {
+                if source.supports_direct_play {
+                    "direct-play"
+                } else if source.supports_direct_stream {
+                    "direct-stream"
+                } else {
+                    "transcode"
+                }
+                .to_string()
+            });
+        let source_count = info
+            .media_sources
+            .len();
+        let elapsed_ms = playback_info_started
+            .elapsed()
+            .as_secs_f64()
+            * 1_000.0;
         info!(
             item_id = %id,
             elapsed_ms,
@@ -574,11 +684,26 @@ async fn items_playbackinfo_inner(
             source_count,
             "playback info stages complete"
         );
-        let user_id = session.user.id.to_string();
-        let device_id = session.device.id.clone();
-        let device_name = session.device.name.clone();
-        let client_name = session.device.app_name.clone();
-        let client_version = session.device.app_version.clone();
+        let user_id = session
+            .user
+            .id
+            .to_string();
+        let device_id = session
+            .device
+            .id
+            .clone();
+        let device_name = session
+            .device
+            .name
+            .clone();
+        let client_name = session
+            .device
+            .app_name
+            .clone();
+        let client_version = session
+            .device
+            .app_version
+            .clone();
         let item_id = id.to_string();
         tokio::spawn(async move {
             let _ = sqlx::query(
@@ -632,6 +757,7 @@ async fn items_playbackinfo_inner(
 pub async fn items_file(
     headers: headers::HeaderMap,
     State(state): State<AppState>,
+    session: auth::AuthSession,
     Path(id): Path<Uuid>,
     Query(mut q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
@@ -654,9 +780,19 @@ pub async fn items_file(
     let safe = filename
         .replace('"', "")
         .replace('\\', "");
-    let mut response = videos_stream_inner(headers, state, id, q)
-        .await?
-        .into_response();
+    let mut response = videos_stream_inner(
+        headers,
+        state,
+        Some(
+            session
+                .user
+                .id,
+        ),
+        id,
+        q,
+    )
+    .await?
+    .into_response();
     if let Ok(val) =
         http::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", safe))
     {
@@ -678,7 +814,7 @@ pub async fn audio_stream(
     Path(id): Path<Uuid>,
     Query(q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
-    videos_stream_inner(headers, state, id, q).await
+    videos_stream_inner(headers, state, None, id, q).await
 }
 
 #[get("/audio/{id}/stream.{container}")]
@@ -693,7 +829,7 @@ pub async fn audio_stream_by_container(
     {
         q.container = Some(container);
     }
-    videos_stream_inner(headers, state, id, q).await
+    videos_stream_inner(headers, state, None, id, q).await
 }
 
 #[get("/videos/{id}/stream")]
@@ -703,7 +839,7 @@ pub async fn videos_stream(
     Path(id): Path<Uuid>,
     Query(q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
-    videos_stream_inner(headers, state, id, q).await
+    videos_stream_inner(headers, state, None, id, q).await
 }
 
 #[get("/videos/{id}/stream.{container}")]
@@ -718,7 +854,7 @@ pub async fn videos_stream_by_container(
     {
         q.container = Some(container);
     }
-    videos_stream_inner(headers, state, id, q).await
+    videos_stream_inner(headers, state, None, id, q).await
 }
 
 fn ext_from_descriptor(descriptor: &crate::stream::StreamDescriptor) -> String {
@@ -754,6 +890,7 @@ fn ext_from_descriptor(descriptor: &crate::stream::StreamDescriptor) -> String {
 async fn videos_stream_inner(
     headers: headers::HeaderMap,
     state: AppState,
+    user_id: Option<Uuid>,
     id: Uuid,
     q: api::VideoStreamQuery,
 ) -> Result<impl IntoResponse> {
@@ -763,6 +900,7 @@ async fn videos_stream_inner(
         q.media_source_id,
         q.device_id
             .as_deref(),
+        user_id,
     )
     .await?;
 
@@ -990,6 +1128,91 @@ async fn videos_stream_inner(
         .header("Cache-Control", "no-cache, no-store")
         .body(body)
         .unwrap())
+}
+
+/// Returns additional parts for a multi-file video item.
+#[get("/videos/{id}/additionalparts")]
+pub async fn video_additional_parts(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse> {
+    Ok(Json(api::BaseItemDtoQueryResult::default()))
+}
+
+#[get("/audio/{id}/universal")]
+pub async fn audio_universal(
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Path(id): Path<Uuid>,
+    Query(q): Query<api::HlsVideoQuery>,
+) -> Result<impl IntoResponse> {
+    let mut media = db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &id,
+    )
+    .await?
+    .context_not_found("track not found")?;
+
+    state
+        .ctx
+        .addons
+        .refresh_streams(
+            &mut media,
+            &state.ctx,
+            Some(
+                session
+                    .user
+                    .id,
+            ),
+        )
+        .await
+        .inspect_err(|e| error!("refresh_streams failed: {e:#}"));
+
+    let play_session_id = q
+        .play_session_id
+        .unwrap_or_else(|| {
+            common::get_uuid()
+                .as_simple()
+                .to_string()
+        });
+
+    let transcoding_url = format!(
+        "/videos/{}/master.m3u8?PlaySessionId={}&MediaSourceId={}&VideoCodec=copy&AudioCodec=aac&ApiKey={}",
+        id,
+        play_session_id,
+        id,
+        session
+            .device
+            .access_token
+    );
+
+    Ok(axum::response::Redirect::temporary(&transcoding_url).into_response())
+}
+
+/// Bitrate test endpoint - returns a body of the requested size for bandwidth measurement.
+#[get("/playback/bitratetest")]
+pub async fn playback_bitratetest_sized(
+    Query(q): Query<BitrateTestQuery>,
+) -> Result<impl IntoResponse> {
+    let size = q
+        .size
+        .unwrap_or(100_000)
+        .min(10_000_000) as usize;
+    let body = vec![0u8; size];
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", size.to_string())
+        .body(Body::from(body))
+        .unwrap())
+}
+
+#[query]
+pub struct BitrateTestQuery {
+    pub size: Option<u64>,
 }
 
 #[cfg(test)]
@@ -2271,7 +2494,8 @@ mod tests {
     }
 
     /// `AudioLanguagePreference` set to a language not present in the source
-    /// → `DefaultAudioStreamIndex` is left null.
+    /// → nothing matches and no stream is flagged default, so
+    /// `DefaultAudioStreamIndex` is null.
     #[tokio::test]
     async fn test_audio_language_preference_no_match_leaves_unset() {
         let (server, guard, token) = authenticated_server().await;
@@ -2314,14 +2538,18 @@ mod tests {
         let body: serde_json::Value = resp.json();
         assert!(
             body["MediaSources"][0]["DefaultAudioStreamIndex"].is_null(),
-            "With no German track present, DefaultAudioStreamIndex should be null"
+            "With no German track present and no stream flagged default, DefaultAudioStreamIndex should be null"
         );
     }
 
     /// After reporting progress with `AudioStreamIndex=2`, the next PlaybackInfo
     /// request should recall that selection as `DefaultAudioStreamIndex`.
+    /// PlayDefaultAudioTrack=true must NOT suppress a matching audio language
+    /// preference: remux honors the configured language (English here, index 2)
+    /// over the container's first-track default (Dutch, index 1).
     #[tokio::test]
-    async fn test_play_default_audio_track_true_ignores_language_preference() {
+    async fn test_audio_language_preference_honored_even_with_play_default_audio_track()
+    {
         let (server, guard, token) = authenticated_server().await;
         let auth = auth_header_with_token(&token);
         let media = insert_multilang_source(&guard.0).await;
@@ -2338,8 +2566,8 @@ mod tests {
             .as_str()
             .unwrap();
 
-        // PlayDefaultAudioTrack=true means "play the container default regardless of language" —
-        // the language preference must be ignored.
+        // English is NOT the container's first track — only the language
+        // preference can select it.
         server
             .post(&format!("/users/{}/configuration", user_id))
             .add_header(
@@ -2347,7 +2575,7 @@ mod tests {
                 HeaderValue::from_str(&auth).unwrap(),
             )
             .json(&user_config_with(
-                json!({ "AudioLanguagePreference": "nl", "PlayDefaultAudioTrack": true }),
+                json!({ "AudioLanguagePreference": "en", "PlayDefaultAudioTrack": true }),
             ))
             .await;
 
@@ -2362,9 +2590,10 @@ mod tests {
 
         resp.assert_status_ok();
         let body: serde_json::Value = resp.json();
-        assert!(
-            body["MediaSources"][0]["DefaultAudioStreamIndex"].is_null(),
-            "PlayDefaultAudioTrack=true should ignore AudioLanguagePreference; DefaultAudioStreamIndex must be null"
+        assert_eq!(
+            body["MediaSources"][0]["DefaultAudioStreamIndex"].as_i64(),
+            Some(2),
+            "AudioLanguagePreference=en should be honored even with PlayDefaultAudioTrack=true"
         );
     }
 
@@ -2494,7 +2723,7 @@ mod tests {
         let body: serde_json::Value = resp.json();
         assert!(
             body["MediaSources"][0]["DefaultAudioStreamIndex"].is_null(),
-            "With RememberAudioSelections=false, audio track switch must not be recalled"
+            "With RememberAudioSelections=false, audio track switch must not be recalled and nothing is flagged default"
         );
     }
 
@@ -2961,457 +3190,244 @@ mod tests {
 
         resp.assert_status_ok();
         let body: serde_json::Value = resp.json();
-        assert_eq!(
-            body["MediaSources"][0]["DefaultSubtitleStreamIndex"].as_i64(),
-            None,
-            "server fallback must not fire when user has a preference set, even if it matches nothing"
+        assert!(
+            body["MediaSources"][0]["DefaultSubtitleStreamIndex"].is_null(),
+            "server fallback must not fire when user has a preference set, even if it matches nothing; no stream is flagged default"
         );
     }
-}
 
-/// Returns additional parts for a multi-file video item.
-#[get("/videos/{id}/additionalparts")]
-pub async fn video_additional_parts(
-    State(state): State<AppState>,
-    _session: auth::AuthSession,
-    Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse> {
-    Ok(Json(api::BaseItemDtoQueryResult::default()))
-}
+    /// Jellyfin web/SDK send `"SubtitleLanguagePreference": ""` (empty string, not
+    /// null) when the user has not configured a subtitle language. The server
+    /// metadata-language fallback must still fire in that case.
+    #[tokio::test]
+    async fn test_server_fallback_fires_when_user_pref_is_empty_string() {
+        use crate::{api::ServerConfiguration, db::Settings};
 
-#[get("/audio/{id}/universal")]
-pub async fn audio_universal(
-    State(state): State<AppState>,
-    session: auth::AuthSession,
-    Path(id): Path<Uuid>,
-    Query(q): Query<api::HlsVideoQuery>,
-) -> Result<impl IntoResponse> {
-    let mut media = db::Media::get_by_id(
-        &state
-            .ctx
-            .db,
-        &id,
-    )
-    .await?
-    .context_not_found("track not found")?;
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let media = insert_subtitle_source(ctx).await;
 
-    state
-        .ctx
-        .addons
-        .refresh_streams(
-            &mut media,
-            &state.ctx,
-            Some(
-                session
-                    .user
-                    .id,
-            ),
+        Settings::set_config(
+            &ctx.db,
+            &ServerConfiguration {
+                preferred_metadata_language: Some("fr".to_string()),
+                ..ServerConfiguration::default()
+            },
         )
         .await
-        .inspect_err(|e| error!("refresh_streams failed: {e:#}"));
+        .expect("set server config");
 
-    let play_session_id = q
-        .play_session_id
-        .unwrap_or_else(|| {
-            common::get_uuid()
-                .as_simple()
-                .to_string()
-        });
+        let me: serde_json::Value = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let user_id = me["Id"]
+            .as_str()
+            .unwrap();
+        // Jellyfin sends an empty string when no subtitle language is configured
+        server
+            .post(&format!("/users/{}/configuration", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&user_config_with(
+                json!({ "SubtitleLanguagePreference": "" }),
+            ))
+            .await;
 
-    let transcoding_url = format!(
-        "/videos/{}/master.m3u8?PlaySessionId={}&MediaSourceId={}&VideoCodec=copy&AudioCodec=aac&ApiKey={}",
-        id,
-        play_session_id,
-        id,
-        session
-            .device
-            .access_token
-    );
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
 
-    Ok(axum::response::Redirect::temporary(&transcoding_url).into_response())
-}
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"][0]["DefaultSubtitleStreamIndex"].as_i64(),
+            Some(2),
+            "empty-string SubtitleLanguagePreference should be treated as unset, so the server fallback (fr) selects French subtitle (index 2)"
+        );
+    }
+    /// probe.rs sets `default_subtitle_stream_index` to the first subtitle stream
+    /// unconditionally (ignoring the container's disposition flags). Because
+    /// `apply_user_playback_prefs` only runs its preference/fallback blocks when
+    /// `default_subtitle_stream_index.is_none()`, the server metadata-language
+    /// fallback never fires for real probed media. This test reproduces that.
+    #[tokio::test]
+    async fn test_server_fallback_ignored_when_probe_pre_set_default() {
+        use crate::{api::ServerConfiguration, db::Settings};
 
-/// Bitrate test endpoint - returns a body of the requested size for bandwidth measurement.
-#[get("/playback/bitratetest")]
-pub async fn playback_bitratetest_sized(
-    Query(q): Query<BitrateTestQuery>,
-) -> Result<impl IntoResponse> {
-    let size = q
-        .size
-        .unwrap_or(100_000)
-        .min(10_000_000) as usize;
-    let body = vec![0u8; size];
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/octet-stream")
-        .header("Content-Length", size.to_string())
-        .body(Body::from(body))
-        .unwrap())
-}
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
 
-#[query]
-pub struct BitrateTestQuery {
-    pub size: Option<u64>,
-}
+        // Mimic probe_media(): default subtitle index pre-set to the first subtitle
+        // (eng, index 3) regardless of what the server fallback would pick.
+        let mut media = insert_subtitle_source(ctx).await;
+        if let Some(pd) = media
+            .probe_data
+            .as_mut()
+        {
+            pd.default_subtitle_stream_index = Some(3);
+        }
+        media
+            .save(&ctx.db)
+            .await
+            .expect("re-save media");
 
-/// If `media.url` is a magnet URI, resolve it via the torrent manager to a local
-/// HTTP URL and return a clone with the resolved URL.  For all other URLs this is
-/// a no-op that returns the original `media` unchanged.
-
-async fn apply_user_playback_prefs(
-    db: &sqlx::SqlitePool,
-    user: &crate::db::User,
-    media_id: &uuid::Uuid,
-    media_sources: &mut Vec<api::MediaSourceInfo>,
-    client_audio_idx: Option<i64>,
-    client_subtitle_idx: Option<i64>,
-    server_subtitle_lang_fallback: Option<&str>,
-) {
-    let cfg = user
-        .configuration
-        .as_ref()
-        .map(|c| {
-            c.0.clone()
-        })
-        .unwrap_or_default();
-
-    // Load saved stream selections (best-effort; failure means no recall)
-    let resolved_media = crate::db::Media::get_by_id(db, media_id)
-        .await
-        .ok()
-        .flatten();
-
-    let saved_audio: Option<i64>;
-    let saved_subtitle: Option<i64>;
-
-    if let Some(media) = resolved_media {
-        match sqlx::query_as::<_, crate::db::UserMediaState>(
-            "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
+        Settings::set_config(
+            &ctx.db,
+            &ServerConfiguration {
+                preferred_metadata_language: Some("fr".to_string()),
+                ..ServerConfiguration::default()
+            },
         )
-        .bind(user.id)
-        .bind(media.id)
-        .fetch_optional(db)
         .await
-        {
-            Ok(Some(state)) => {
-                saved_audio = state.audio_idx;
-                saved_subtitle = state.subtitle_idx;
-            }
-            _ => {
-                saved_audio = None;
-                saved_subtitle = None;
-            }
-        }
-    } else {
-        saved_audio = None;
-        saved_subtitle = None;
+        .expect("set server config");
+
+        let me: serde_json::Value = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let user_id = me["Id"]
+            .as_str()
+            .unwrap();
+        server
+            .post(&format!("/users/{}/configuration", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&default_user_config())
+            .await;
+
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"][0]["DefaultSubtitleStreamIndex"].as_i64(),
+            Some(2),
+            "server metadata-language fallback (fr) should override the probe's container default (eng, index 3)"
+        );
     }
 
-    // -1 is Jellyfin's sentinel for "not set"; treat it the same as None.
-    let client_wants_audio = client_audio_idx
-        .map(|x| x >= 0)
-        .unwrap_or(false);
-    let client_wants_subtitle = client_subtitle_idx
-        .map(|x| x >= 0)
-        .unwrap_or(false);
+    /// When the user has no subtitle preference AND the server has no metadata
+    /// language, the container's default subtitle stream (the is_default flag
+    /// recorded by the probe) is used as the last fallback — and the stream's
+    /// is_default flag is left untouched.
+    #[tokio::test]
+    async fn test_container_default_subtitle_used_as_last_fallback() {
+        use crate::{api::ServerConfiguration, db::Settings};
 
-    for source in media_sources.iter_mut() {
-        // --- client explicit selection wins ---
-        if client_wants_audio {
-            if let Some(idx) = client_audio_idx {
-                let exists = source
-                    .media_streams
-                    .iter()
-                    .any(|s| {
-                        s.index == idx
-                            && matches!(s.type_, Some(api::MediaStreamType::Audio))
-                    });
-                if exists {
-                    source.default_audio_stream_index = Some(idx);
-                }
-            }
-        }
-        if client_wants_subtitle {
-            if let Some(idx) = client_subtitle_idx {
-                let exists = source
-                    .media_streams
-                    .iter()
-                    .any(|s| {
-                        s.index == idx
-                            && matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                    });
-                if exists {
-                    source.default_subtitle_stream_index = Some(idx);
-                }
-            }
-        }
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
 
-        // --- remember_audio_selections ---
-        if !client_wants_audio && cfg.remember_audio_selections {
-            if let Some(idx) = saved_audio {
-                let exists = source
-                    .media_streams
-                    .iter()
-                    .any(|s| {
-                        s.index == idx
-                            && matches!(s.type_, Some(api::MediaStreamType::Audio))
-                    });
-                if exists {
-                    source.default_audio_stream_index = Some(idx);
-                }
-            }
-        }
-
-        // --- remember_subtitle_selections ---
-        if !client_wants_subtitle && cfg.remember_subtitle_selections {
-            if let Some(idx) = saved_subtitle {
-                let exists = source
-                    .media_streams
-                    .iter()
-                    .any(|s| {
-                        s.index == idx
-                            && matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                    });
-                if exists {
-                    // Clear any previous default flag, set the recalled one
-                    for s in source
-                        .media_streams
-                        .iter_mut()
-                    {
-                        if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
-                            s.is_default = Some(false);
-                        }
-                    }
-                    source.default_subtitle_stream_index = Some(idx);
-                    if let Some(s) = source
-                        .media_streams
-                        .iter_mut()
-                        .find(|s| s.index == idx)
-                    {
-                        s.is_default = Some(true);
-                    }
-                }
-            }
-        }
-
-        // --- audio_language_preference ---
-        // Only act when play_default_audio_track is false (the user wants their language
-        // preference honoured over the container default), the client didn't specify a
-        // track explicitly, and no default has already been chosen (e.g. remembered
-        // selection above takes precedence).
-        if !cfg.play_default_audio_track
-            && !client_wants_audio
-            && source
-                .default_audio_stream_index
-                .is_none()
+        // Probe-style: the container flags eng (index 3) as the default subtitle.
+        let mut media = insert_subtitle_source(ctx).await;
+        if let Some(pd) = media
+            .probe_data
+            .as_mut()
         {
-            if let Some(ref pref) = cfg.audio_language_preference {
-                let pref_two = lang_to_two_letter(pref);
-                if let Some(ref target) = pref_two {
-                    if let Some(stream) = source
-                        .media_streams
-                        .iter()
-                        .find(|s| {
-                            matches!(s.type_, Some(api::MediaStreamType::Audio))
-                                && s.language
-                                    .as_deref()
-                                    .and_then(lang_to_two_letter)
-                                    .as_deref()
-                                    == Some(target.as_str())
-                        })
-                    {
-                        source.default_audio_stream_index = Some(stream.index);
-                    }
+            for s in &mut pd.media_streams {
+                if matches!(s.type_, Some(crate::api::MediaStreamType::Subtitle)) {
+                    s.is_default = Some(s.index == 3);
                 }
             }
+            pd.default_subtitle_stream_index = Some(3);
         }
+        media
+            .save(&ctx.db)
+            .await
+            .expect("re-save media");
 
-        // --- subtitle_language_preference ---
-        // Only act if the client didn't specify a track and no subtitle default is already set.
-        if !client_wants_subtitle
-            && source
-                .default_subtitle_stream_index
-                .is_none()
+        // No global metadata language configured at all.
+        Settings::set_config(
+            &ctx.db,
+            &ServerConfiguration {
+                preferred_metadata_language: None,
+                ..ServerConfiguration::default()
+            },
+        )
+        .await
+        .expect("set server config");
+
+        let me: serde_json::Value = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let user_id = me["Id"]
+            .as_str()
+            .unwrap();
+        server
+            .post(&format!("/users/{}/configuration", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&default_user_config())
+            .await;
+
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"][0]["DefaultSubtitleStreamIndex"].as_i64(),
+            Some(3),
+            "container default subtitle (eng, index 3) should be used when no user preference and no global metadata language exist"
+        );
+        // The stream's is_default flag must be left exactly as the container set it.
+        let subs = &body["MediaSources"][0]["MediaStreams"];
+        for s in subs
+            .as_array()
+            .unwrap()
         {
-            if let Some(ref pref) = cfg.subtitle_language_preference {
-                let pref_two = lang_to_two_letter(pref);
-                if let Some(ref target) = pref_two {
-                    if let Some(stream) = source
-                        .media_streams
-                        .iter_mut()
-                        .find(|s| {
-                            matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                                && s.language
-                                    .as_deref()
-                                    .and_then(lang_to_two_letter)
-                                    .as_deref()
-                                    == Some(target.as_str())
-                        })
-                    {
-                        let idx = stream.index;
-                        stream.is_default = Some(true);
-                        source.default_subtitle_stream_index = Some(idx);
-                    }
-                }
+            if s["Type"] == "Subtitle" {
+                assert_eq!(
+                    s["IsDefault"]
+                        .as_bool()
+                        .unwrap(),
+                    s["Index"]
+                        .as_i64()
+                        .unwrap()
+                        == 3,
+                    "subtitle is_default flags must be preserved untouched"
+                );
             }
         }
-
-        // --- server preferred_metadata_language fallback ---
-        // Only fires when the user has no SubtitleLanguagePreference configured at all.
-        if !client_wants_subtitle
-            && source
-                .default_subtitle_stream_index
-                .is_none()
-            && cfg
-                .subtitle_language_preference
-                .is_none()
-        {
-            if let Some(pref) = server_subtitle_lang_fallback {
-                let pref_two = lang_to_two_letter(pref);
-                if let Some(ref target) = pref_two {
-                    if let Some(stream) = source
-                        .media_streams
-                        .iter_mut()
-                        .find(|s| {
-                            matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                                && s.language
-                                    .as_deref()
-                                    .and_then(lang_to_two_letter)
-                                    .as_deref()
-                                    == Some(target.as_str())
-                        })
-                    {
-                        let idx = stream.index;
-                        stream.is_default = Some(true);
-                        source.default_subtitle_stream_index = Some(idx);
-                    }
-                }
-            }
-        }
-
-        // --- subtitle_mode ---
-        apply_subtitle_mode(&cfg.subtitle_mode, source);
-    }
-}
-
-fn apply_subtitle_mode(mode: &api::SubtitleMode, source: &mut api::MediaSourceInfo) {
-    let clear_all = |source: &mut api::MediaSourceInfo| {
-        for s in source
-            .media_streams
-            .iter_mut()
-        {
-            if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
-                s.is_default = Some(false);
-            }
-        }
-        source.default_subtitle_stream_index = None;
-    };
-
-    let set_default = |source: &mut api::MediaSourceInfo, idx: Option<i64>| {
-        for s in source
-            .media_streams
-            .iter_mut()
-        {
-            if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
-                s.is_default = Some(false);
-            }
-        }
-        source.default_subtitle_stream_index = idx;
-        if let Some(i) = idx {
-            if let Some(s) = source
-                .media_streams
-                .iter_mut()
-                .find(|s| s.index == i)
-            {
-                s.is_default = Some(true);
-            }
-        }
-    };
-
-    match mode {
-        api::SubtitleMode::None => {
-            // Never auto-show subtitles
-            clear_all(source);
-        }
-        api::SubtitleMode::Always => {
-            // If no subtitle is already selected, pick the first non-forced subtitle
-            if source
-                .default_subtitle_stream_index
-                .is_none()
-            {
-                let idx = source
-                    .media_streams
-                    .iter()
-                    .find_map(|s| {
-                        if matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                            && !s.is_forced
-                        {
-                            Some(s.index)
-                        } else {
-                            None
-                        }
-                    });
-                if idx.is_some() {
-                    set_default(source, idx);
-                }
-            }
-        }
-        api::SubtitleMode::OnlyForced => {
-            // Only a forced subtitle may be default; clear any non-forced default
-            let forced_idx = source
-                .media_streams
-                .iter()
-                .find_map(|s| {
-                    if matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                        && s.is_forced
-                    {
-                        Some(s.index)
-                    } else {
-                        None
-                    }
-                });
-            // Replace whatever is set with the first forced sub (or nothing)
-            set_default(source, forced_idx);
-        }
-        api::SubtitleMode::Smart => {
-            // Like Default but clear the selection if the subtitle language already
-            // matches the audio language (i.e. no translation needed).
-            if let Some(def_idx) = source.default_subtitle_stream_index {
-                let audio_lang = source
-                    .media_streams
-                    .iter()
-                    .find(|s| {
-                        matches!(s.type_, Some(api::MediaStreamType::Audio))
-                            && Some(s.index) == source.default_audio_stream_index
-                    })
-                    .and_then(|s| {
-                        s.language
-                            .clone()
-                    });
-
-                let sub_lang = source
-                    .media_streams
-                    .iter()
-                    .find(|s| s.index == def_idx)
-                    .and_then(|s| {
-                        s.language
-                            .clone()
-                    });
-
-                let audio_two = audio_lang
-                    .as_deref()
-                    .and_then(lang_to_two_letter);
-                let sub_two = sub_lang
-                    .as_deref()
-                    .and_then(lang_to_two_letter);
-
-                if audio_two.is_some() && audio_two == sub_two {
-                    // Subtitle language matches audio — no need to display it
-                    clear_all(source);
-                }
-            }
-        }
-        // Default: do not alter what was already set by prior steps
-        api::SubtitleMode::Default => {}
     }
 }

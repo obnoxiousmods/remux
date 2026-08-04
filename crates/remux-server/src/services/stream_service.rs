@@ -191,12 +191,14 @@ impl StreamService {
         item_id: Uuid,
         requested_id: Option<Uuid>,
         device_key: Option<&str>,
+        user_id: Option<Uuid>,
     ) -> anyhow::Result<db::Media> {
         let lookup_id = requested_id.unwrap_or(item_id);
         let media = db::Media::get_by_id(&ctx.db, &lookup_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("stream not found: {}", lookup_id))?;
-        Self::dispatch_lookup(ctx, item_id, requested_id, device_key, media).await
+        Self::dispatch_lookup(ctx, item_id, requested_id, device_key, user_id, media)
+            .await
     }
 
     async fn dispatch_lookup(
@@ -204,6 +206,7 @@ impl StreamService {
         item_id: Uuid,
         requested_id: Option<Uuid>,
         device_key: Option<&str>,
+        user_id: Option<Uuid>,
         media: db::Media,
     ) -> anyhow::Result<db::Media> {
         match media.kind {
@@ -231,8 +234,9 @@ impl StreamService {
                 // observes the same 60-second TTL as the PlaybackInfo path instead
                 // of reading an empty or expired cached source indefinitely.
                 if requested_id.is_none() || requested_id == Some(item_id) {
-                    ctx.addons
-                        .refresh_streams(&mut media, ctx, None)
+                    let _ = ctx
+                        .addons
+                        .refresh_streams(&mut media, ctx, user_id)
                         .await
                         .inspect_err(|error| {
                             tracing::error!(
@@ -463,7 +467,9 @@ impl StreamService {
             .config
             .port;
         let item = db::Media::get_by_id(
-            &self.ctx.db,
+            &self
+                .ctx
+                .db,
             &self.item_id,
         )
         .await
@@ -569,10 +575,17 @@ impl StreamService {
             let remuxdb_enabled = probe_cfg
                 .remuxdb_enabled
                 .unwrap_or(true);
+            let is_remuxdb_kind = item
+                .as_ref()
+                .map_or(false, |it| {
+                    matches!(it.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+                });
             if was_cached {
                 debug!(id = %effective_stream.id, "remuxdb: skipping (probe cache hit)");
             } else if !remuxdb_enabled {
                 debug!(id = %effective_stream.id, "remuxdb: skipping (disabled)");
+            } else if !is_remuxdb_kind {
+                debug!(id = %effective_stream.id, kind = ?item.as_ref().map(|it| &it.kind), "remuxdb: skipping (not movie/episode)");
             } else if let Some(url) = self
                 .ctx
                 .config

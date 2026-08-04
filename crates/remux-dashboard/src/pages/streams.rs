@@ -49,6 +49,8 @@ pub(crate) fn StreamRuleRow(
                     SelectOption::new("resolution", "Resolution"),
                     SelectOption::new("quality", "Quality"),
                     SelectOption::new("codec", "Codec"),
+                    SelectOption::new("size", "Size"),
+                    SelectOption::new("audio_language", "Audio Language"),
                 ],
                 on_change: move |v: String| {
                     if let Some(r) = rules.write().get_mut(idx) {
@@ -63,11 +65,6 @@ pub(crate) fn StreamRuleRow(
                         };
                     }
                 },
-                option { value: "resolution", selected: field_val == "resolution", "Resolution" }
-                option { value: "quality",     selected: field_val == "quality",     "Quality" }
-                option { value: "codec",      selected: field_val == "codec",      "Codec" }
-                option { value: "size",       selected: is_size,                   "Size" }
-                option { value: "audio_language", selected: field_val == "audio_language", "Audio Language" }
             }
             // Operator selector
             select {

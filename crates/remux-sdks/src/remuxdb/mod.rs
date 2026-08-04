@@ -1,8 +1,8 @@
 use crate::{
     ClientError, Endpoint, RestClient,
     remux::{
-        MediaChapterInfo, MediaSegmentType, MediaSegments, MediaSourceInfo, MediaStream,
-        MediaStreamType, Segment, VideoRange, VideoRangeType,
+        MediaChapterInfo, MediaSegmentType, MediaSegments, MediaSourceInfo,
+        MediaStream, MediaStreamType, Segment, VideoRange, VideoRangeType,
     },
 };
 use http::{HeaderMap, HeaderValue};
@@ -655,7 +655,9 @@ fn chapter_info(version: &MediaInfo) -> Vec<MediaChapterInfo> {
                 .filter(|end| *end > start_position_ticks);
             Some(MediaChapterInfo {
                 id: chapter.id,
-                title: chapter.title.clone(),
+                title: chapter
+                    .title
+                    .clone(),
                 start_position_ticks,
                 end_position_ticks,
             })
@@ -681,19 +683,39 @@ fn chapter_segments(chapters: &[MediaChapterInfo]) -> MediaSegments {
             end_ticks,
         };
         match kind {
-            MediaSegmentType::Intro if segments.intro.is_none() => {
+            MediaSegmentType::Intro
+                if segments
+                    .intro
+                    .is_none() =>
+            {
                 segments.intro = Some(segment)
             }
-            MediaSegmentType::Outro if segments.outro.is_none() => {
+            MediaSegmentType::Outro
+                if segments
+                    .outro
+                    .is_none() =>
+            {
                 segments.outro = Some(segment)
             }
-            MediaSegmentType::Recap if segments.recap.is_none() => {
+            MediaSegmentType::Recap
+                if segments
+                    .recap
+                    .is_none() =>
+            {
                 segments.recap = Some(segment)
             }
-            MediaSegmentType::Preview if segments.preview.is_none() => {
+            MediaSegmentType::Preview
+                if segments
+                    .preview
+                    .is_none() =>
+            {
                 segments.preview = Some(segment)
             }
-            MediaSegmentType::Commercial if segments.commercial.is_none() => {
+            MediaSegmentType::Commercial
+                if segments
+                    .commercial
+                    .is_none() =>
+            {
                 segments.commercial = Some(segment)
             }
             _ => {}
@@ -726,8 +748,12 @@ impl From<&MediaInfo> for MediaSourceInfo {
             chapters,
             virtual_chapters: version.virtual_chapters,
             chapters_inherited: false,
-            chapter_source_content_hash: version.content_hash.clone(),
-            content_hash: version.content_hash.clone(),
+            chapter_source_content_hash: version
+                .content_hash
+                .clone(),
+            content_hash: version
+                .content_hash
+                .clone(),
             segments,
             ..Default::default()
         }

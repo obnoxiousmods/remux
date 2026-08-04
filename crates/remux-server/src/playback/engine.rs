@@ -144,7 +144,8 @@ async fn encoder_smoke_test(accel: HardwareAccelerationType) -> Result<(), Strin
         return Ok(());
     };
 
-    let mut args: Vec<String> = vec!["-hide_banner".into(), "-v".into(), "error".into()];
+    let mut args: Vec<String> =
+        vec!["-hide_banner".into(), "-v".into(), "error".into()];
     // VAAPI and QSV encode from GPU surfaces, so the test frame must be uploaded.
     // NVENC/VideoToolbox/V4L2/RKMPP accept system-memory frames directly.
     let needs_upload = matches!(
@@ -177,7 +178,10 @@ async fn encoder_smoke_test(accel: HardwareAccelerationType) -> Result<(), Strin
         .await
         .map_err(|e| format!("could not spawn ffmpeg: {e}"))?;
 
-    if out.status.success() {
+    if out
+        .status
+        .success()
+    {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr)
@@ -196,11 +200,13 @@ pub(crate) fn hw_accel_candidates(
 ) -> Vec<HardwareAccelerationType> {
     // `ffmpeg -encoders` rows look like " V....D h264_nvenc  NVIDIA NVENC ...".
     let has_encoder = |name: &str| {
-        encoders_output.lines().any(|l| {
-            l.split_whitespace()
-                .nth(1)
-                == Some(name)
-        })
+        encoders_output
+            .lines()
+            .any(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    == Some(name)
+            })
     };
 
     let has_render_node = device_exists("/dev/dri/renderD128");
@@ -209,8 +215,7 @@ pub(crate) fn hw_accel_candidates(
     let is_nvidia = vendor.as_deref() == Some(PCI_VENDOR_NVIDIA);
 
     let viable = |accel: HardwareAccelerationType| -> bool {
-        let encoder_present = h264_encoder_for(accel)
-            .is_some_and(has_encoder);
+        let encoder_present = h264_encoder_for(accel).is_some_and(has_encoder);
         encoder_present
             && match accel {
                 HardwareAccelerationType::Nvenc => device_exists("/dev/nvidia0"),
@@ -383,7 +388,9 @@ impl AdaptiveBufferState {
         now: Instant,
     ) -> u32 {
         self.sessions
-            .retain(|_, demand| now.saturating_duration_since(demand.last_seen) < Duration::from_secs(5));
+            .retain(|_, demand| {
+                now.saturating_duration_since(demand.last_seen) < Duration::from_secs(5)
+            });
         let demand = self
             .sessions
             .entry(session_id.to_string())
@@ -425,13 +432,20 @@ impl AdaptiveBufferState {
             return ahead_secs.max(segment_length);
         }
 
-        let filler_expired = self.filler.as_ref().is_none_or(|(id, started)| {
-            !self.sessions.contains_key(id)
-                || now.saturating_duration_since(*started)
-                    >= Duration::from_secs(IDLE_FILL_QUANTUM_SECS)
-        });
+        let filler_expired = self
+            .filler
+            .as_ref()
+            .is_none_or(|(id, started)| {
+                !self
+                    .sessions
+                    .contains_key(id)
+                    || now.saturating_duration_since(*started)
+                        >= Duration::from_secs(IDLE_FILL_QUANTUM_SECS)
+            });
         if filler_expired {
-            self.fill_turn = self.fill_turn.saturating_add(1);
+            self.fill_turn = self
+                .fill_turn
+                .saturating_add(1);
             let next = self
                 .sessions
                 .iter()
@@ -439,7 +453,10 @@ impl AdaptiveBufferState {
                 .min_by_key(|(_, candidate)| candidate.last_fill_turn)
                 .map(|(id, _)| id.clone());
             self.filler = next.map(|id| {
-                if let Some(candidate) = self.sessions.get_mut(&id) {
+                if let Some(candidate) = self
+                    .sessions
+                    .get_mut(&id)
+                {
                     candidate.last_fill_turn = self.fill_turn;
                 }
                 (id, now)
@@ -458,7 +475,8 @@ impl AdaptiveBufferState {
     }
 
     fn remove(&mut self, session_id: &str) {
-        self.sessions.remove(session_id);
+        self.sessions
+            .remove(session_id);
         if self
             .filler
             .as_ref()
@@ -623,7 +641,13 @@ fn count_segments(dir: &PathBuf) -> u32 {
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|e| HlsSegmentFile::parse(&e.file_name().to_string_lossy()).is_some())
+                .filter(|e| {
+                    HlsSegmentFile::parse(
+                        &e.file_name()
+                            .to_string_lossy(),
+                    )
+                    .is_some()
+                })
                 .count() as u32
         })
         .unwrap_or(0)
@@ -634,8 +658,11 @@ fn max_segment_index(dir: &PathBuf) -> Option<u32> {
         .ok()?
         .flatten()
         .filter_map(|e| {
-            HlsSegmentFile::parse(&e.file_name().to_string_lossy())
-                .map(|segment| segment.index())
+            HlsSegmentFile::parse(
+                &e.file_name()
+                    .to_string_lossy(),
+            )
+            .map(|segment| segment.index())
         })
         .max()
 }
@@ -661,7 +688,11 @@ fn cumulative_segment_ticks(
                 .ok();
             continue;
         }
-        if line.starts_with('#') || line.trim().is_empty() {
+        if line.starts_with('#')
+            || line
+                .trim()
+                .is_empty()
+        {
             continue;
         }
         let Some(segment) = HlsSegmentFile::parse(line.trim()) else {
@@ -678,9 +709,7 @@ fn cumulative_segment_ticks(
     if counted {
         (total_secs * 10_000_000.0).round() as i64
     } else {
-        before_idx as i64
-            * segment_length as i64
-            * 10_000_000
+        before_idx as i64 * segment_length as i64 * 10_000_000
     }
 }
 
@@ -859,10 +888,14 @@ fn hw_input_args(
     };
 
     match accel {
-        // NVENC is an encoder API. Keep decoded frames in system memory until
-        // this pipeline uses CUDA-native filters; combining CUDA decode with
-        // the software scale filter can corrupt the chroma planes.
-        HardwareAccelerationType::Nvenc => vec![],
+        // Follow upstream's CUDA decode path and retain the CUDA surface for
+        // the local scale_cuda/tonemap_cuda filter chain and NVENC encoder.
+        HardwareAccelerationType::Nvenc => vec![
+            "-hwaccel".into(),
+            "cuda".into(),
+            "-hwaccel_output_format".into(),
+            "cuda".into(),
+        ],
         HardwareAccelerationType::Vaapi => {
             // Initialise the VAAPI device via init_hw_device so that the
             // driver= option takes effect (fixes iHD resolution on Intel).
@@ -1115,7 +1148,11 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             accel,
             HardwareAccelerationType::Vaapi | HardwareAccelerationType::Qsv
         );
-    let do_sw_tonemap = hdr && params.enable_tonemapping && !do_vpp_tonemap;
+    // VideoToolbox has no HW tone mapping — always use CPU tonemapx for HDR.
+    let do_sw_tonemap = hdr
+        && (params.enable_tonemapping
+            || matches!(accel, HardwareAccelerationType::VideoToolbox))
+        && !do_vpp_tonemap;
 
     let ffmpeg_video_codec = {
         let base = match params
@@ -1194,11 +1231,14 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     // For QSV+HDR without VPP tonemapping: SW-decode so CPU filters can run.
     // For QSV+HDR with VPP tonemapping: keep VAAPI hw-decode (tonemap_vaapi needs GPU frames).
     // QSV+burn_subtitle (non-HDR) keeps VAAPI hw-decode — overlay_qsv handles compositing on-GPU.
+    // VideoToolbox+HDR: SW-decode so tonemapx can run on CPU (VT encoder accepts yuv420p).
     if matches!(accel, HardwareAccelerationType::Qsv) && hdr && !do_vpp_tonemap {
         args.extend(qsv_init_only_args(
             &params.vaapi_device,
             &params.vaapi_driver,
         ));
+    } else if matches!(accel, HardwareAccelerationType::VideoToolbox) && hdr {
+        // No hw input args — SW decode so tonemapx filter has CPU frames to work with.
     } else {
         args.extend(hw_input_args(
             accel,
@@ -1264,8 +1304,7 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         && matches!(accel, HardwareAccelerationType::Nvenc);
     let hw_suffix = if cuda_native {
         Some(build_cuda_video_filter(params, hdr))
-    } else if do_vpp_tonemap && matches!(accel, HardwareAccelerationType::Qsv)
-    {
+    } else if do_vpp_tonemap && matches!(accel, HardwareAccelerationType::Qsv) {
         let vpp =
             "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709:extra_hw_frames=32";
         Some(format!("{vpp},hwmap=derive_device=qsv,format=qsv"))
@@ -1296,7 +1335,6 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             } else {
                 format!("scale,{sub_scale}")
             };
-
 
             let filter = if is_hw
                 && matches!(accel, HardwareAccelerationType::Qsv)
@@ -1374,7 +1412,8 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         let vf = if hdr && ffmpeg_video_codec != "copy" {
             if cuda_native {
                 vf
-            } else if do_vpp_tonemap && matches!(accel, HardwareAccelerationType::Vaapi) {
+            } else if do_vpp_tonemap && matches!(accel, HardwareAccelerationType::Vaapi)
+            {
                 // VAAPI VPP: frames are in VAAPI memory after hwupload; append tonemap_vaapi.
                 let vpp = "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709:extra_hw_frames=32";
                 let base = vf.unwrap_or_default();
@@ -1585,10 +1624,9 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     // source GOP unchanged.
     if ffmpeg_video_codec != "copy" {
         let keyframe_expr = match first_segment_secs {
-            Some(first) => format!(
-                "expr:gte(t,{first}+n_forced*{})",
-                params.segment_length
-            ),
+            Some(first) => {
+                format!("expr:gte(t,{first}+n_forced*{})", params.segment_length)
+            }
             None => format!("expr:gte(t,n_forced*{})", params.segment_length),
         };
         args.extend(["-force_key_frames".into(), keyframe_expr]);
@@ -1808,7 +1846,11 @@ fn hls_output_signature(output_dir: &std::path::Path) -> (u64, u64) {
         .map(|entries| {
             entries
                 .flatten()
-                .filter_map(|entry| entry.metadata().ok())
+                .filter_map(|entry| {
+                    entry
+                        .metadata()
+                        .ok()
+                })
                 .fold((0_u64, 0_u64), |(count, bytes), metadata| {
                     (count + 1, bytes.saturating_add(metadata.len()))
                 })
@@ -1938,7 +1980,11 @@ pub async fn start_transcode(
             // A missing output directory or unreadable input can fail a session
             // while HW accel happens to be on; downgrading for those costs ~3x the
             // CPU for the rest of the session and hides the real fault.
-            if ffmpeg_failed && using_hw && !sw_fallback && is_hw_encoder_failure(&stderr_out) {
+            if ffmpeg_failed
+                && using_hw
+                && !sw_fallback
+                && is_hw_encoder_failure(&stderr_out)
+            {
                 warn!(
                     accel = ?params.hardware_acceleration_type,
                     stderr = stderr_out.trim(),
@@ -1973,7 +2019,9 @@ pub async fn start_transcode(
                 input_restarts += 1;
                 let resume_idx = max_segment_index(&params.output_dir).unwrap_or(0);
                 let resume_offset_ticks = std::fs::read_to_string(
-                    params.output_dir.join("main.m3u8"),
+                    params
+                        .output_dir
+                        .join("main.m3u8"),
                 )
                 .ok()
                 .map(|playlist| {
@@ -1984,9 +2032,7 @@ pub async fn start_transcode(
                     )
                 })
                 .unwrap_or_else(|| {
-                    resume_idx as i64
-                        * params.segment_length as i64
-                        * 10_000_000
+                    resume_idx as i64 * params.segment_length as i64 * 10_000_000
                 });
                 let resume_ticks = original_start_ticks
                     .unwrap_or(0)
@@ -2204,7 +2250,11 @@ pub(crate) fn build_progressive_args(
             accel,
             HardwareAccelerationType::Vaapi | HardwareAccelerationType::Qsv
         );
-    let do_sw_tonemap = hdr && params.enable_tonemapping && !do_vpp_tonemap;
+    // VideoToolbox has no HW tone mapping — always use CPU tonemapx for HDR.
+    let do_sw_tonemap = hdr
+        && (params.enable_tonemapping
+            || matches!(accel, HardwareAccelerationType::VideoToolbox))
+        && !do_vpp_tonemap;
 
     let ffmpeg_video_codec = {
         let base = match params
@@ -2288,11 +2338,14 @@ pub(crate) fn build_progressive_args(
     // Hardware acceleration input flags (before -ss and -i).
     // QSV+HDR without VPP: SW-decode so CPU filters can run.
     // QSV+burn_subtitle (non-HDR): keeps VAAPI hw-decode — overlay_qsv handles on-GPU.
+    // VideoToolbox+HDR: SW-decode so tonemapx can run on CPU (VT encoder accepts yuv420p).
     if matches!(accel, HardwareAccelerationType::Qsv) && hdr && !do_vpp_tonemap {
         args.extend(qsv_init_only_args(
             &params.vaapi_device,
             &params.vaapi_driver,
         ));
+    } else if matches!(accel, HardwareAccelerationType::VideoToolbox) && hdr {
+        // No hw input args — SW decode so tonemapx filter has CPU frames to work with.
     } else {
         args.extend(hw_input_args(
             accel,
@@ -2725,7 +2778,7 @@ pub fn generate_variant_playlist(
     let remaining_ticks = runtime_ticks % seg_length_ticks;
     let total_segments = whole_segments + if remaining_ticks > 0 { 1 } else { 0 };
 
-    let target_duration = segment_length; // always an integer ceiling
+    let target_duration = segment_length + 1; // +1 to cover keyframe-boundary drift (HLS spec: must be >= any segment duration)
 
     let mut buf = String::with_capacity(total_segments as usize * 120);
     buf.push_str("#EXTM3U\n");
@@ -2937,23 +2990,11 @@ mod tests {
         let mut state = AdaptiveBufferState::default();
         assert_eq!(state.target_for("first", 0, false, 6, now), 180);
         assert_eq!(
-            state.target_for(
-                "second",
-                0,
-                false,
-                6,
-                now + Duration::from_millis(1)
-            ),
+            state.target_for("second", 0, false, 6, now + Duration::from_millis(1)),
             180
         );
         assert_eq!(
-            state.target_for(
-                "third",
-                0,
-                false,
-                6,
-                now + Duration::from_millis(2)
-            ),
+            state.target_for("third", 0, false, 6, now + Duration::from_millis(2)),
             6
         );
     }
@@ -2967,13 +3008,7 @@ mod tests {
             IDLE_FILL_BUFFER_SECS
         );
         assert_eq!(
-            state.target_for(
-                "cold",
-                0,
-                false,
-                6,
-                now + Duration::from_millis(1)
-            ),
+            state.target_for("cold", 0, false, 6, now + Duration::from_millis(1)),
             GUARANTEED_BUFFER_SECS
         );
         assert_eq!(
@@ -3271,7 +3306,9 @@ mod tests {
     fn hw_selects_nvenc_when_encoder_and_device_present() {
         let encoders = encoders_listing(&["h264_nvenc", "h264_vaapi"]);
         assert_eq!(
-            super::select_hw_accel(&encoders, all_devices, || Some("0x10de".to_string())),
+            super::select_hw_accel(&encoders, all_devices, || Some(
+                "0x10de".to_string()
+            )),
             HardwareAccelerationType::Nvenc
         );
     }
@@ -3574,16 +3611,10 @@ mod tests {
             #EXTINF:2.002,\nsegment_00000.ts\n#EXTINF:6.006,\nsegment_00001.ts\n\
             #EXTINF:6.006,\nsegment_00002.ts\n#EXTINF:4.500,\nsegment_00003.ts\n";
         // Non-uniform (short first segment): index*length would say 18s.
-        assert_eq!(
-            super::cumulative_segment_ticks(playlist, 3, 6),
-            140_140_000
-        );
+        assert_eq!(super::cumulative_segment_ticks(playlist, 3, 6), 140_140_000);
         assert_eq!(super::cumulative_segment_ticks(playlist, 1, 6), 20_020_000);
         // Beyond the listed segments, everything listed counts.
-        assert_eq!(
-            super::cumulative_segment_ticks(playlist, 9, 6),
-            185_140_000
-        );
+        assert_eq!(super::cumulative_segment_ticks(playlist, 9, 6), 185_140_000);
         // Empty/missing playlist falls back to the uniform estimate.
         assert_eq!(super::cumulative_segment_ticks("", 3, 6), 180_000_000);
     }
@@ -3687,6 +3718,8 @@ mod tests {
             source_video_width: None,
             source_video_height: None,
             source_frame_rate: None,
+            video_bitrate: None,
+            hardware_acceleration_type: None,
         };
 
         let playlist = generate_variant_playlist(&session, "");
@@ -3903,8 +3936,16 @@ mod tests {
             ..default_hls(dir)
         });
 
-        assert!(!args.iter().any(|arg| arg == "-noaccurate_seek"));
-        assert!(!args.iter().any(|arg| arg == "-copyts"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "-noaccurate_seek")
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "-copyts")
+        );
         assert_eq!(
             arg_after(&args, "-force_key_frames"),
             Some("expr:gte(t,n_forced*6)")
@@ -3940,7 +3981,8 @@ mod tests {
         });
 
         assert!(
-            args.iter().any(|arg| arg == "-copyts"),
+            args.iter()
+                .any(|arg| arg == "-copyts"),
             "stream-copy HLS must retain source timestamps"
         );
     }

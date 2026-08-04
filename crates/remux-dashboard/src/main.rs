@@ -2,9 +2,10 @@ use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 use remux_sdks::{
     remux::{
-        AuthenticateUserByName, CountryInfo, GetCountries, GetStartupConfiguration,
-        JellyfinAuth, PostStartupComplete, PostStartupConfiguration, PostStartupUser,
-        PublicSystemInfo, StartupConfiguration, StartupUser, Username,
+        AuthenticateUserByName, CountryInfo, GetCountries, GetCurrentUser,
+        GetStartupConfiguration, JellyfinAuth, PostStartupComplete,
+        PostStartupConfiguration, PostStartupUser, PublicSystemInfo,
+        StartupConfiguration, StartupUser, Username,
     },
     ClientError,
 };
@@ -28,11 +29,20 @@ fn main() {
     dioxus::launch(App);
 }
 
+#[derive(Clone, PartialEq)]
+enum AuthState {
+    Checking,
+    Admin,
+    Unauthorized,
+    LoggedOut,
+}
+
 #[component]
 fn App() -> Element {
     let mut wizard_needed: Signal<Option<bool>> = use_signal(|| None);
-    let mut logged_in = use_signal(|| get_stored_server().is_some());
-    use_context_provider(|| logged_in);
+    let mut auth_state = use_signal(|| AuthState::Checking);
+    let logged_in = use_memo(move || *auth_state.read() == AuthState::Admin);
+    use_context_provider(move || Signal::new(*logged_in.read()));
 
     // Initialise theming: applies the persisted mode to <html>, provides the
     // ThemePrefs context, and drives the live accent/scale <style> below.
@@ -53,6 +63,41 @@ fn App() -> Element {
     use_effect(move || {
         spawn(async move {
             let origin = get_origin();
+
+            if let Some(server) = get_stored_server() {
+                let device_id = get_or_create_device_id();
+                let auth = JellyfinAuth::new(&device_id).with_token(
+                    server
+                        .access_token
+                        .clone(),
+                );
+                if let Ok(client) = remux_sdks::remux::client(&server.manual_address) {
+                    match client
+                        .with_auth(auth)
+                        .execute(GetCurrentUser)
+                        .await
+                    {
+                        Ok(u)
+                            if u.policy
+                                .is_administrator =>
+                        {
+                            auth_state.set(AuthState::Admin);
+                        }
+                        Ok(_) | Err(ClientError::Unauthorized) => {
+                            auth_state.set(AuthState::Unauthorized);
+                        }
+                        Err(_) => {
+                            // Network error / server still starting — don't touch credentials.
+                            auth_state.set(AuthState::LoggedOut);
+                        }
+                    }
+                } else {
+                    auth_state.set(AuthState::LoggedOut);
+                }
+            } else {
+                auth_state.set(AuthState::LoggedOut);
+            }
+
             let needed = match remux_sdks::remux::client(&origin) {
                 Ok(c) => c
                     .execute(PublicSystemInfo::default())
@@ -92,10 +137,36 @@ fn App() -> Element {
                 }
             },
             Some(false) => rsx! {
-                if *logged_in.read() {
-                    Router::<Route> {}
-                } else {
-                    Login { on_login: move |_| logged_in.set(true) }
+                match *auth_state.read() {
+                    AuthState::Checking => rsx! {
+                        div { class: "login-page",
+                            div { class: "login-card",
+                                div { class: "login-header",
+                                    a { href: "/", class: "login-brand-label", "Remux" }
+                                    p { class: "connecting", "Starting up…" }
+                                }
+                            }
+                        }
+                    },
+                    AuthState::Admin => rsx! { Router::<Route> {} },
+                    AuthState::Unauthorized => rsx! {
+                        div { class: "login-page",
+                            div { class: "login-card",
+                                div { class: "login-header",
+                                    a { href: "/", class: "login-brand-label", "Remux" }
+                                    h1 { class: "login-title", "Admin Dashboard" }
+                                }
+                                div { class: "login-body",
+                                    div { class: "alert-error", "Admin access required." }
+                                }
+                            }
+                        }
+                    },
+                    AuthState::LoggedOut => rsx! {
+                        Login {
+                            on_login: move |_| auth_state.set(AuthState::Admin),
+                        }
+                    },
                 }
             },
         }}
@@ -191,6 +262,14 @@ fn Login(on_login: EventHandler) -> Element {
                             })
                             .filter(|n| !n.is_empty())
                             .unwrap_or_else(|| "Remux".to_string());
+                        if !user
+                            .policy
+                            .is_administrator
+                        {
+                            error.set(Some("Admin access required.".into()));
+                            loading.set(false);
+                            return;
+                        }
                         store_credentials(StoredServer {
                             id: result.server_id,
                             name,

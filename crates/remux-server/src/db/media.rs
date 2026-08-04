@@ -124,6 +124,28 @@ pub enum MediaStatus {
     Unknown,
 }
 
+/// Deezer record type: what kind of release an Album row is. `NULL` = unknown
+/// (e.g. albums imported from sources without a record type). Stored in the
+/// `media.album_kind` column; the Albums view filters out Single/Ep.
+#[derive(
+    strum_macros::EnumString,
+    strum_macros::Display,
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    sqlx::Type,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+pub enum AlbumKind {
+    Album,
+    Single,
+    Ep,
+}
+
 #[derive(
     Default,
     strum_macros::EnumString,
@@ -900,6 +922,10 @@ pub struct ExternalIds {
     /// addon's `/meta/{type}/{id}.json` and `/stream/{type}/{id}.json` routes
     /// require this exact string — losing it causes later lookups to 404.
     pub custom_stremio_type: Option<String>,
+    /// Flat album name for tracks that have no parent row (e.g. playlist imports).
+    pub album_title: Option<String>,
+    /// Flat artist name for tracks that have no grandparent row (e.g. playlist imports).
+    pub artist_name: Option<String>,
 }
 
 impl ExternalIds {
@@ -1170,6 +1196,10 @@ pub struct MediaFilter {
     pub sort_order: Vec<api::SortOrder>,
     /// For TvProgram queries: order by the parent channel's sort_order / channel_number.
     pub sort_by_channel_order: bool,
+    /// Restrict Album rows to these release kinds (e.g. only real albums for the
+    /// Albums view). `None` = no restriction; albums without a stored kind are
+    /// always included.
+    pub album_kinds: Option<Vec<AlbumKind>>,
     /// Structured filter from a smart collection (groups of rules).
     pub filter_rules: Option<remux_sdks::remux::CollectionFilter>,
     /// Structured filter from user policy (applied separately, never on containers).
@@ -1281,6 +1311,7 @@ pub struct Media {
     #[sqlx(skip)]
     pub images: MediaImages,
     pub status: Option<MediaStatus>,
+    pub album_kind: Option<AlbumKind>,
     pub idx: Option<i64>,
     pub parent_idx: Option<i64>,
     pub parent_id: Option<Uuid>,
@@ -1393,6 +1424,125 @@ impl Media {
             || self
                 .locked_fields
                 .contains(field)
+    }
+
+    /// Best-effort artist name for a music item: the loaded grandparent row
+    /// (`self.grandparent`, set by [`Self::preload_parents`]), then the flat
+    /// `external_ids.artist_name` (playlist imports have no artist row), then
+    /// the legacy `"by {artist}"` description convention.
+    pub fn artist_name(&self) -> Option<&str> {
+        self.artist_name_from(
+            self.grandparent
+                .as_deref()
+                .map(|g| {
+                    g.title
+                        .as_str()
+                }),
+        )
+    }
+
+    /// Whether this is an Album row that is really a single or EP (Deezer
+    /// `album_kind`). Such rows are kept under Tracks, not shown in the Albums
+    /// view or album search results.
+    pub fn is_single_or_ep_album(&self) -> bool {
+        matches!(self.kind, MediaKind::Album)
+            && matches!(
+                self.album_kind,
+                Some(AlbumKind::Single) | Some(AlbumKind::Ep)
+            )
+    }
+
+    /// Best-effort album name for a music item: the loaded parent row
+    /// (`self.parent`, set by [`Self::preload_parents`]), then the flat
+    /// `external_ids.album_title` (playlist imports have no album row).
+    pub fn album_name(&self) -> Option<&str> {
+        self.album_name_from(
+            self.parent
+                .as_deref()
+                .map(|p| {
+                    p.title
+                        .as_str()
+                }),
+        )
+    }
+
+    /// Shared artist-name chain. `parent_title` is the title of the artist row
+    /// when one is available; callers that resolve it outside `self.grandparent`
+    /// (eclipse fetches the row itself, the lyrics API batch-loads several)
+    /// pass it here instead.
+    pub(crate) fn artist_name_from<'a>(
+        &'a self,
+        parent_title: Option<&'a str>,
+    ) -> Option<&'a str> {
+        parent_title
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                self.external_ids
+                    .artist_name
+                    .as_deref()
+            })
+            .or_else(|| {
+                self.description
+                    .as_deref()
+                    .and_then(|d| d.strip_prefix("by "))
+            })
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Shared album-name chain; `parent_title` is the loaded album row title.
+    pub(crate) fn album_name_from<'a>(
+        &'a self,
+        parent_title: Option<&'a str>,
+    ) -> Option<&'a str> {
+        parent_title
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                self.external_ids
+                    .album_title
+                    .as_deref()
+            })
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Canonical "Artist Title" search query for track lookups; falls back to
+    /// the bare title when no artist is known. Requires parents preloaded via
+    /// [`Self::preload_parents`] (or the flat fallback names on the track).
+    pub fn track_search_query(&self) -> String {
+        self.track_search_query_from(
+            self.grandparent
+                .as_deref()
+                .map(|g| {
+                    g.title
+                        .as_str()
+                }),
+        )
+    }
+
+    /// Same as [`Self::track_search_query`] but takes the artist row title when
+    /// the caller resolved it externally (eclipse fetches the row itself).
+    pub fn track_search_query_from(&self, artist_title: Option<&str>) -> String {
+        match self.artist_name_from(artist_title) {
+            Some(artist) => format!("{} {}", artist, self.title),
+            None => self
+                .title
+                .clone(),
+        }
+    }
+
+    /// Deezer search query that pins the artist and kind so a title-only match
+    /// can't resolve to the wrong artist's track/album.
+    pub fn deezer_search_query(&self, kind: &str) -> String {
+        match self.artist_name() {
+            Some(artist) => format!(
+                "artist:\"{}\" {kind}:\"{}\"",
+                artist.replace('"', ""),
+                self.title
+                    .replace('"', ""),
+            ),
+            None => self
+                .title
+                .clone(),
+        }
     }
 
     /// Batch-load parent and grandparent `Media` records (with images) for tracks,
@@ -1615,12 +1765,7 @@ impl Media {
             }
             MediaKind::Track => {
                 let artist = self
-                    .grandparent
-                    .as_deref()
-                    .map(|g| {
-                        g.title
-                            .as_str()
-                    })
+                    .artist_name()
                     .unwrap_or_default();
                 if artist.is_empty() {
                     self.title
@@ -1840,9 +1985,9 @@ impl Media {
             live_start, live_end, tvg_id, channel_number, enabled, sort_order, custom_name, digital_released_at, status, refreshed_at, grandparent_id,
             collection_smart_filter, country, program_kind, collection_latest_auto_unplayed, collection_latest_sort_digital,
             collection_source, collection_default_sort, collection_default_sort_order,
-            original_language, is_locked, locked_fields
+            original_language, is_locked, locked_fields, album_kind
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47)
         ON CONFLICT (id) DO UPDATE SET
             title = excluded.title,
             kind = excluded.kind,
@@ -1886,7 +2031,8 @@ impl Media {
             program_kind = excluded.program_kind,
             original_language = COALESCE(excluded.original_language, media.original_language),
             is_locked = excluded.is_locked,
-            locked_fields = excluded.locked_fields
+            locked_fields = excluded.locked_fields,
+            album_kind = COALESCE(excluded.album_kind, media.album_kind)
         "#,
         )
         .bind(self.id)
@@ -1935,6 +2081,7 @@ impl Media {
         .bind(&self.original_language)
         .bind(self.is_locked)
         .bind(sqlx::types::Json(&self.locked_fields))
+        .bind(&self.album_kind)
         .execute(db)
         .await?;
 
@@ -1987,7 +2134,7 @@ impl Media {
                 external_ids, external_ratings, created_at, updated_at, certification, certification_age, parent_idx,
                 live_start, live_end, tvg_id, channel_number, enabled, sort_order, custom_name, digital_released_at, status, grandparent_id, country, program_kind, collection_latest_auto_unplayed, collection_latest_sort_digital,
                 collection_source, collection_default_sort, collection_default_sort_order,
-                original_language, is_locked, locked_fields
+                original_language, is_locked, locked_fields, album_kind
             )",
         );
             for item in chunk {
@@ -2044,7 +2191,8 @@ impl Media {
                     .push_bind(sqlx::types::Json(&item.collection_default_sort_order))
                     .push_bind(&item.original_language)
                     .push_bind(&item.is_locked)
-                    .push_bind(sqlx::types::Json(&item.locked_fields));
+                    .push_bind(sqlx::types::Json(&item.locked_fields))
+                    .push_bind(&item.album_kind);
             });
 
             query_builder.push(" ON CONFLICT DO NOTHING");
@@ -2101,7 +2249,7 @@ impl Media {
                 external_ids, external_ratings, created_at, updated_at, certification, certification_age, parent_idx,
                 live_start, live_end, tvg_id, channel_number, enabled, sort_order, custom_name, digital_released_at, status, refreshed_at, grandparent_id, country, program_kind, collection_latest_auto_unplayed, collection_latest_sort_digital,
                 collection_source, collection_default_sort, collection_default_sort_order,
-                original_language, is_locked, locked_fields
+                original_language, is_locked, locked_fields, album_kind
             )",
         );
 
@@ -2157,7 +2305,8 @@ impl Media {
                     .push_bind(sqlx::types::Json(&item.collection_default_sort_order))
                     .push_bind(&item.original_language)
                     .push_bind(&item.is_locked)
-                    .push_bind(sqlx::types::Json(&item.locked_fields));
+                    .push_bind(sqlx::types::Json(&item.locked_fields))
+                    .push_bind(&item.album_kind);
             });
 
             query_builder.push(
@@ -2198,7 +2347,8 @@ impl Media {
                 original_language = COALESCE(excluded.original_language, media.original_language),
                 -- preserve user-set locks; never let a provider refresh overwrite them
                 is_locked = CASE WHEN media.id IS NOT NULL THEN media.is_locked ELSE excluded.is_locked END,
-                locked_fields = CASE WHEN media.id IS NOT NULL THEN media.locked_fields ELSE excluded.locked_fields END",
+                locked_fields = CASE WHEN media.id IS NOT NULL THEN media.locked_fields ELSE excluded.locked_fields END,
+                album_kind = COALESCE(excluded.album_kind, media.album_kind)",
             );
 
             query_builder
@@ -3166,6 +3316,18 @@ impl Media {
                     qb.push_in("kind", &kind);
                 }
             }
+            if let Some(kinds) = &filter.album_kinds {
+                if !kinds.is_empty() {
+                    // Only the requested release kinds; albums without a stored
+                    // kind (NULL) are treated as albums and always included.
+                    qb.push(" AND (album_kind IS NULL OR album_kind IN (");
+                    let mut sep = qb.separated(", ");
+                    for k in kinds {
+                        sep.push_bind(k);
+                    }
+                    qb.push("))");
+                }
+            }
             if let Some(id) = &filter.id {
                 qb.push_in("id", &id);
             }
@@ -3559,6 +3721,12 @@ impl Media {
                         api::SortOrder::Ascending => "ASC",
                         api::SortOrder::Descending => "DESC",
                     };
+                    // BLOB literal for correlated user_media_state lookups in
+                    // ORDER BY (user-data sorts: PlayCount, IsPlayed, ...).
+                    let user_hex = filter
+                        .user_id
+                        .as_ref()
+                        .map(|u| format!("X'{}'", u.simple()));
                     let col = match sort {
                         api::ItemSortBy::SortName | api::ItemSortBy::Name => {
                             format!("title COLLATE NOCASE {}", dir)
@@ -3585,6 +3753,72 @@ impl Media {
                         api::ItemSortBy::CommunityRating => {
                             format!("COALESCE(rating_audience, rating_critic) {}", dir)
                         }
+                        api::ItemSortBy::CriticRating => {
+                            format!("COALESCE(rating_critic, 0) {}", dir)
+                        }
+                        api::ItemSortBy::AiredEpisodeOrder => {
+                            format!(
+                                "COALESCE(parent_idx, 999999) {dir}, COALESCE(idx, 999999) {dir}"
+                            )
+                        }
+                        api::ItemSortBy::OfficialRating => {
+                            format!("COALESCE(certification_age, 999999) {}", dir)
+                        }
+                        api::ItemSortBy::Artist => {
+                            // Artist name: grandparent row for tracks, parent row for
+                            // albums, own title for artist rows.
+                            format!(
+                                "CASE WHEN kind = 'track' THEN \
+                                   COALESCE((SELECT g.title FROM media g WHERE g.id = media.grandparent_id), '') \
+                                 WHEN kind = 'album' THEN \
+                                   COALESCE((SELECT p.title FROM media p WHERE p.id = media.parent_id), '') \
+                                 ELSE COALESCE(title, '') END COLLATE NOCASE {}",
+                                dir
+                            )
+                        }
+                        api::ItemSortBy::AlbumArtist => {
+                            // Album artist: the artist of the album (parent row for
+                            // albums, grandparent for tracks).
+                            format!(
+                                "CASE WHEN kind = 'track' THEN \
+                                   COALESCE((SELECT g.title FROM media g WHERE g.id = media.grandparent_id), '') \
+                                 WHEN kind = 'album' THEN \
+                                   COALESCE((SELECT p.title FROM media p WHERE p.id = media.parent_id), '') \
+                                 ELSE COALESCE(title, '') END COLLATE NOCASE {}",
+                                dir
+                            )
+                        }
+                        api::ItemSortBy::Album => {
+                            // Album title: parent row for tracks, own title for albums.
+                            format!(
+                                "CASE WHEN kind = 'track' THEN \
+                                   COALESCE((SELECT p.title FROM media p WHERE p.id = media.parent_id), '') \
+                                 ELSE COALESCE(title, '') END COLLATE NOCASE {}",
+                                dir
+                            )
+                        }
+                        api::ItemSortBy::SeriesSortName => {
+                            // Series name: grandparent row for episodes, parent row
+                            // for seasons, own title for everything else.
+                            format!(
+                                "CASE WHEN kind = 'episode' THEN \
+                                   COALESCE((SELECT g.title FROM media g WHERE g.id = media.grandparent_id), '') \
+                                 WHEN kind = 'season' THEN \
+                                   COALESCE((SELECT p.title FROM media p WHERE p.id = media.parent_id), '') \
+                                 ELSE COALESCE(title, '') END COLLATE NOCASE {}",
+                                dir
+                            )
+                        }
+                        api::ItemSortBy::DateLastContentAdded => {
+                            // For series/seasons: the most recent season/episode
+                            // creation date; for other items, their own date.
+                            format!(
+                                "COALESCE((SELECT MAX(c.created_at) FROM media c \
+                                   WHERE (c.parent_id = media.id OR c.grandparent_id = media.id) \
+                                   AND c.kind IN ('season','episode')), media.created_at) {}",
+                                dir
+                            )
+                        }
                         api::ItemSortBy::IndexNumber => {
                             format!("COALESCE(idx, 999999) {}", dir)
                         }
@@ -3598,6 +3832,54 @@ impl Media {
                             if filter.user_id.is_some() {
                                 // dp alias from the UMS-driven records_qb above.
                                 format!("dp.last_played_at {}", dir)
+                            } else {
+                                format!("title COLLATE NOCASE {}", dir)
+                            }
+                        }
+                        api::ItemSortBy::PlayCount => {
+                            if let Some(uid) = &user_hex {
+                                format!(
+                                    "COALESCE((SELECT ums.play_count FROM user_media_state ums \
+                                     WHERE ums.user_id = {uid} AND ums.media_id = media.id), 0) {}",
+                                    dir
+                                )
+                            } else {
+                                format!("title COLLATE NOCASE {}", dir)
+                            }
+                        }
+                        api::ItemSortBy::IsPlayed => {
+                            if let Some(uid) = &user_hex {
+                                // Played items first (ASC); NULL play state counts as unplayed.
+                                format!(
+                                    "CASE WHEN COALESCE((SELECT ums.play_count FROM user_media_state ums \
+                                     WHERE ums.user_id = {uid} AND ums.media_id = media.id), 0) > 0 \
+                                     THEN 0 ELSE 1 END {}",
+                                    dir
+                                )
+                            } else {
+                                format!("title COLLATE NOCASE {}", dir)
+                            }
+                        }
+                        api::ItemSortBy::IsUnplayed => {
+                            if let Some(uid) = &user_hex {
+                                // Unplayed items first (ASC).
+                                format!(
+                                    "CASE WHEN COALESCE((SELECT ums.play_count FROM user_media_state ums \
+                                     WHERE ums.user_id = {uid} AND ums.media_id = media.id), 0) > 0 \
+                                     THEN 1 ELSE 0 END {}",
+                                    dir
+                                )
+                            } else {
+                                format!("title COLLATE NOCASE {}", dir)
+                            }
+                        }
+                        api::ItemSortBy::IsFavoriteOrLiked => {
+                            if let Some(uid) = &user_hex {
+                                format!(
+                                    "COALESCE((SELECT ums.favorite FROM user_media_state ums \
+                                     WHERE ums.user_id = {uid} AND ums.media_id = media.id), 0) {}",
+                                    dir
+                                )
                             } else {
                                 format!("title COLLATE NOCASE {}", dir)
                             }
@@ -5220,10 +5502,18 @@ impl Media {
                 .as_ref()
         });
 
+        // Album queries never want singles/EPs (Jellyfin MusicAlbum type): whenever
+        // the request asks for Album rows, restrict to real albums. Untyped albums
+        // (NULL album_kind) still show.
+        let album_kinds = kinds
+            .contains(&MediaKind::Album)
+            .then(|| vec![AlbumKind::Album]);
+
         let mut result = Self::get_by_filter(
             db,
             &MediaFilter {
                 kind: Some(kinds),
+                album_kinds,
                 enabled: has_tv_channel.then_some(true),
                 promoted: filter.promoted,
                 limit: filter
@@ -5787,6 +6077,7 @@ impl Media {
             .play_count
             .max(1);
         state.played_at = Some(now);
+        state.playback_position = 0;
         state
             .save(db)
             .await?;
@@ -7878,6 +8169,137 @@ mod tests {
         );
     }
 
+    fn track(
+        artist_name: Option<&str>,
+        album_title: Option<&str>,
+        description: Option<&str>,
+    ) -> Media {
+        Media {
+            title: "Hello".to_string(),
+            description: description.map(String::from),
+            external_ids: ExternalIds {
+                artist_name: artist_name.map(String::from),
+                album_title: album_title.map(String::from),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn artist_name_prefers_grandparent_row() {
+        let mut media = track(Some("Stale"), None, None);
+        media.grandparent = Some(Media::stub(Uuid::new_v4(), "Adele"));
+        assert_eq!(media.artist_name(), Some("Adele"));
+    }
+
+    #[test]
+    fn artist_name_falls_back_to_flat_for_playlist_imports() {
+        let media = track(Some("Adele"), None, None);
+        assert_eq!(media.artist_name(), Some("Adele"));
+    }
+
+    #[test]
+    fn artist_name_falls_back_to_description_prefix() {
+        let media = track(None, None, Some("by Adele"));
+        assert_eq!(media.artist_name(), Some("Adele"));
+    }
+
+    #[test]
+    fn artist_name_prefers_flat_over_description() {
+        let media = track(Some("Adele"), None, Some("by Someone Else"));
+        assert_eq!(media.artist_name(), Some("Adele"));
+    }
+
+    #[test]
+    fn artist_name_ignores_empty_names() {
+        let media = track(Some(""), None, Some("by "));
+        assert_eq!(media.artist_name(), None);
+    }
+
+    #[test]
+    fn artist_name_from_external_parent_title() {
+        let media = track(Some("Stale"), None, None);
+        assert_eq!(media.artist_name_from(Some("Adele")), Some("Adele"));
+        assert_eq!(media.artist_name_from(None), Some("Stale"));
+    }
+
+    #[test]
+    fn album_name_prefers_parent_row() {
+        let mut media = track(None, Some("Stale"), None);
+        media.parent = Some(Media::stub(Uuid::new_v4(), "21"));
+        assert_eq!(media.album_name(), Some("21"));
+    }
+
+    #[test]
+    fn album_name_falls_back_to_flat_for_playlist_imports() {
+        let media = track(None, Some("21"), None);
+        assert_eq!(media.album_name(), Some("21"));
+    }
+
+    #[test]
+    fn album_name_ignores_empty_titles() {
+        let media = track(None, Some(""), None);
+        assert_eq!(media.album_name(), None);
+    }
+
+    #[test]
+    fn full_title_uses_flat_artist_for_playlist_tracks() {
+        let mut media = track(Some("Adele"), None, None);
+        media.kind = MediaKind::Track;
+        assert_eq!(media.full_title(), "Adele - Hello");
+    }
+
+    #[test]
+    fn track_search_query_uses_artist_and_title() {
+        let media = track(Some("Adele"), None, None);
+        assert_eq!(media.track_search_query(), "Adele Hello");
+    }
+
+    #[test]
+    fn track_search_query_prefers_grandparent_row() {
+        let mut media = track(Some("Stale"), None, None);
+        media.grandparent = Some(Media::stub(Uuid::new_v4(), "Adele"));
+        assert_eq!(media.track_search_query(), "Adele Hello");
+    }
+
+    #[test]
+    fn track_search_query_title_only_without_artist() {
+        let media = track(None, None, None);
+        assert_eq!(media.track_search_query(), "Hello");
+    }
+
+    #[test]
+    fn track_search_query_from_external_artist_title() {
+        let media = track(Some("Stale"), None, None);
+        assert_eq!(media.track_search_query_from(Some("Adele")), "Adele Hello");
+        assert_eq!(media.track_search_query_from(None), "Stale Hello");
+    }
+
+    #[test]
+    fn deezer_search_query_pins_artist_and_kind() {
+        let media = track(Some("Adele"), None, None);
+        assert_eq!(
+            media.deezer_search_query("track"),
+            "artist:\"Adele\" track:\"Hello\""
+        );
+    }
+
+    #[test]
+    fn deezer_search_query_strips_quotes() {
+        let media = track(Some("The \"Artist\""), None, None);
+        assert_eq!(
+            media.deezer_search_query("album"),
+            "artist:\"The Artist\" album:\"Hello\""
+        );
+    }
+
+    #[test]
+    fn deezer_search_query_title_only_without_artist() {
+        let media = track(None, None, None);
+        assert_eq!(media.deezer_search_query("track"), "Hello");
+    }
+
     #[test]
     fn similarity_empty_profile_falls_back_to_quality() {
         let clause = Media::build_similarity_sort_clause(
@@ -8501,6 +8923,641 @@ mod tests {
             "future episode must remain hidden; got: {:?}",
             titles
         );
+    }
+
+    // ── Sort arms ────────────────────────────────────────────────────────────
+
+    async fn sort_titles(
+        db: &sqlx::SqlitePool,
+        kind: MediaKind,
+        sort_by: api::ItemSortBy,
+        order: api::SortOrder,
+    ) -> Vec<String> {
+        let result = Media::get_by_filter(
+            db,
+            &MediaFilter {
+                kind: Some(vec![kind]),
+                sort_by: vec![sort_by],
+                sort_order: vec![order],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        result
+            .records
+            .into_iter()
+            .map(|m| m.title)
+            .collect()
+    }
+
+    /// Same as `sort_titles` but with a user id so user-data sort arms fire.
+    async fn sort_titles_for_user(
+        db: &sqlx::SqlitePool,
+        kind: MediaKind,
+        sort_by: api::ItemSortBy,
+        order: api::SortOrder,
+        user_id: uuid::Uuid,
+    ) -> Vec<String> {
+        let result = Media::get_by_filter(
+            db,
+            &MediaFilter {
+                kind: Some(vec![kind]),
+                sort_by: vec![sort_by],
+                sort_order: vec![order],
+                user_id: Some(user_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        result
+            .records
+            .into_iter()
+            .map(|m| m.title)
+            .collect()
+    }
+
+    async fn insert_user_state(
+        db: &sqlx::SqlitePool,
+        user_id: uuid::Uuid,
+        media_id: uuid::Uuid,
+        play_count: i64,
+        favorite: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO user_media_state \
+             (user_id, media_id, favorite, play_count, played_at, playback_position) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        )
+        .bind(user_id)
+        .bind(media_id)
+        .bind(favorite)
+        .bind(play_count)
+        .bind(
+            play_count
+                .gt(&0)
+                .then(|| chrono::Utc::now().naive_utc()),
+        )
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    fn media_row(kind: MediaKind, title: &str, imdb: &str) -> Media {
+        let ext = ExternalIds {
+            imdb: Some(NonEmptyString::try_new(imdb.to_string()).unwrap()),
+            ..Default::default()
+        };
+        let id = uuid::Uuid::from(&MediaIdRaw {
+            kind: kind.clone(),
+            external_ids: ext.clone(),
+            season: None,
+            episode: None,
+        });
+        Media {
+            id,
+            title: title.to_string(),
+            kind,
+            external_ids: ext,
+            ..Default::default()
+        }
+    }
+
+    /// CriticRating sorts by rating_critic (descending).
+    #[tokio::test]
+    async fn sort_by_critic_rating() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let mut low = media_row(MediaKind::Movie, "Low", "tt1001");
+        low.rating_critic = Some(10.0);
+        let mut mid = media_row(MediaKind::Movie, "Mid", "tt1002");
+        mid.rating_critic = Some(50.0);
+        let mut high = media_row(MediaKind::Movie, "High", "tt1003");
+        high.rating_critic = Some(90.0);
+        low.save(db)
+            .await
+            .unwrap();
+        mid.save(db)
+            .await
+            .unwrap();
+        high.save(db)
+            .await
+            .unwrap();
+
+        let titles = sort_titles(
+            db,
+            MediaKind::Movie,
+            api::ItemSortBy::CriticRating,
+            api::SortOrder::Descending,
+        )
+        .await;
+        assert_eq!(titles, vec!["High", "Mid", "Low"]);
+    }
+
+    /// OfficialRating sorts by certification_age (descending).
+    #[tokio::test]
+    async fn sort_by_official_rating() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let mut low = media_row(MediaKind::Movie, "PG13", "tt2001");
+        low.certification_age = Some(13);
+        let mut mid = media_row(MediaKind::Movie, "PG16", "tt2002");
+        mid.certification_age = Some(16);
+        let mut high = media_row(MediaKind::Movie, "R18", "tt2003");
+        high.certification_age = Some(18);
+        low.save(db)
+            .await
+            .unwrap();
+        mid.save(db)
+            .await
+            .unwrap();
+        high.save(db)
+            .await
+            .unwrap();
+
+        let titles = sort_titles(
+            db,
+            MediaKind::Movie,
+            api::ItemSortBy::OfficialRating,
+            api::SortOrder::Descending,
+        )
+        .await;
+        assert_eq!(titles, vec!["R18", "PG16", "PG13"]);
+    }
+
+    /// AiredEpisodeOrder sorts by season, then episode number.
+    #[tokio::test]
+    async fn sort_by_aired_episode_order() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        for (t, s, e) in [
+            ("S1E2", 1, 2),
+            ("S1E1", 1, 1),
+            ("S2E1", 2, 1),
+            ("S0E5", 0, 5),
+        ] {
+            // series_imdb must be set before the stable UUID is derived so each
+            // episode gets a distinct id (canonical() uses series_imdb + numbers).
+            let mut ext = ExternalIds {
+                series_imdb: Some(
+                    NonEmptyString::try_new("tt3999".to_string()).unwrap(),
+                ),
+                ..Default::default()
+            };
+            let id = uuid::Uuid::from(&MediaIdRaw {
+                kind: MediaKind::Episode,
+                external_ids: ext.clone(),
+                season: Some(s),
+                episode: Some(e),
+            });
+            let mut ep = Media {
+                id,
+                title: t.to_string(),
+                kind: MediaKind::Episode,
+                external_ids: ext,
+                ..Default::default()
+            };
+            ep.parent_idx = Some(s);
+            ep.idx = Some(e);
+            ep.save(db)
+                .await
+                .unwrap();
+        }
+
+        let titles = sort_titles(
+            db,
+            MediaKind::Episode,
+            api::ItemSortBy::AiredEpisodeOrder,
+            api::SortOrder::Ascending,
+        )
+        .await;
+        assert_eq!(titles, vec!["S0E5", "S1E1", "S1E2", "S2E1"]);
+    }
+
+    /// Artist sorts by the grandparent (artist) row title; Album by the parent
+    /// (album) row title.
+    #[tokio::test]
+    async fn sort_by_artist_and_album() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+
+        // Build with the deezer ids set BEFORE deriving the stable UUID, so each
+        // row gets a distinct id (canonical() for music uses only the deezer id).
+        let music = |kind: MediaKind, title: &str, imdb: &str, deezer: i64| {
+            let mut ext = ExternalIds {
+                imdb: Some(NonEmptyString::try_new(imdb.to_string()).unwrap()),
+                ..Default::default()
+            };
+            match kind {
+                MediaKind::Artist => ext.deezer_artist = Some(deezer),
+                MediaKind::Album => ext.deezer_album = Some(deezer),
+                MediaKind::Track => ext.deezer_track = Some(deezer),
+                _ => {}
+            }
+            let id = uuid::Uuid::from(&MediaIdRaw {
+                kind: kind.clone(),
+                external_ids: ext.clone(),
+                season: None,
+                episode: None,
+            });
+            Media {
+                id,
+                title: title.to_string(),
+                kind,
+                external_ids: ext,
+                ..Default::default()
+            }
+        };
+
+        let mut artist_a = music(MediaKind::Artist, "Adele", "tt4001", 1);
+        artist_a
+            .save(db)
+            .await
+            .unwrap();
+        let mut artist_z = music(MediaKind::Artist, "Zed", "tt4002", 2);
+        artist_z
+            .save(db)
+            .await
+            .unwrap();
+
+        let mut album_21 = music(MediaKind::Album, "21", "tt4003", 3);
+        album_21.parent_id = Some(artist_a.id);
+        album_21
+            .save(db)
+            .await
+            .unwrap();
+        let mut album_z = music(MediaKind::Album, "AlbumZ", "tt4004", 4);
+        album_z.parent_id = Some(artist_z.id);
+        album_z
+            .save(db)
+            .await
+            .unwrap();
+
+        let mut t1 = music(MediaKind::Track, "Hello", "tt4005", 5);
+        t1.parent_id = Some(album_21.id);
+        t1.grandparent_id = Some(artist_a.id);
+        t1.save(db)
+            .await
+            .unwrap();
+        let mut t2 = music(MediaKind::Track, "Zed Song", "tt4006", 6);
+        t2.parent_id = Some(album_z.id);
+        t2.grandparent_id = Some(artist_z.id);
+        t2.save(db)
+            .await
+            .unwrap();
+
+        let by_artist = sort_titles(
+            db,
+            MediaKind::Track,
+            api::ItemSortBy::Artist,
+            api::SortOrder::Ascending,
+        )
+        .await;
+        assert_eq!(by_artist, vec!["Hello", "Zed Song"]);
+
+        let by_album = sort_titles(
+            db,
+            MediaKind::Track,
+            api::ItemSortBy::Album,
+            api::SortOrder::Ascending,
+        )
+        .await;
+        assert_eq!(by_album, vec!["Hello", "Zed Song"]);
+    }
+
+    /// PlayCount / IsPlayed / IsUnplayed / IsFavoriteOrLiked sort via correlated
+    /// user_media_state lookups and never exclude unplayed items.
+    #[tokio::test]
+    async fn sort_by_user_data_state() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let uid = uuid::Uuid::new_v4();
+
+        let mut played = media_row(MediaKind::Movie, "Played", "tt6001");
+        played
+            .save(db)
+            .await
+            .unwrap();
+        let mut unplayed = media_row(MediaKind::Movie, "Unplayed", "tt6002");
+        unplayed
+            .save(db)
+            .await
+            .unwrap();
+        let mut favorite = media_row(MediaKind::Movie, "Favorite", "tt6003");
+        favorite
+            .save(db)
+            .await
+            .unwrap();
+
+        insert_user_state(db, uid, played.id, 3, false).await;
+        insert_user_state(db, uid, favorite.id, 0, true).await;
+        // unplayed has NO state row — must still appear.
+
+        let by_count = sort_titles_for_user(
+            db,
+            MediaKind::Movie,
+            api::ItemSortBy::PlayCount,
+            api::SortOrder::Descending,
+            uid,
+        )
+        .await;
+        assert_eq!(by_count[0], "Played");
+        assert_eq!(by_count.len(), 3);
+
+        let played_first = sort_titles_for_user(
+            db,
+            MediaKind::Movie,
+            api::ItemSortBy::IsPlayed,
+            api::SortOrder::Ascending,
+            uid,
+        )
+        .await;
+        assert_eq!(played_first[0], "Played");
+        assert!(
+            played_first
+                .iter()
+                .any(|t| t == "Unplayed")
+        );
+
+        let unplayed_first = sort_titles_for_user(
+            db,
+            MediaKind::Movie,
+            api::ItemSortBy::IsUnplayed,
+            api::SortOrder::Ascending,
+            uid,
+        )
+        .await;
+        assert_eq!(unplayed_first[0], "Unplayed");
+        assert!(
+            unplayed_first
+                .iter()
+                .any(|t| t == "Played")
+        );
+
+        let favs = sort_titles_for_user(
+            db,
+            MediaKind::Movie,
+            api::ItemSortBy::IsFavoriteOrLiked,
+            api::SortOrder::Descending,
+            uid,
+        )
+        .await;
+        assert_eq!(favs[0], "Favorite");
+    }
+
+    /// SeriesSortName sorts episodes by their series (grandparent) title.
+    #[tokio::test]
+    async fn sort_by_series_sort_name() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+
+        let mut series_a = media_row(MediaKind::Series, "Alpha Show", "tt7001");
+        series_a
+            .save(db)
+            .await
+            .unwrap();
+        let mut series_z = media_row(MediaKind::Series, "Zulu Show", "tt7002");
+        series_z
+            .save(db)
+            .await
+            .unwrap();
+
+        let mk_episode =
+            |title: &str, imdb: &str, series_imdb: &str, gp: uuid::Uuid| {
+                let mut ext = ExternalIds {
+                    series_imdb: Some(
+                        NonEmptyString::try_new(series_imdb.to_string()).unwrap(),
+                    ),
+                    ..Default::default()
+                };
+                let id = uuid::Uuid::from(&MediaIdRaw {
+                    kind: MediaKind::Episode,
+                    external_ids: ext.clone(),
+                    season: Some(1),
+                    episode: Some(1),
+                });
+                let mut ep = Media {
+                    id,
+                    title: title.to_string(),
+                    kind: MediaKind::Episode,
+                    external_ids: ext,
+                    ..Default::default()
+                };
+                ep.grandparent_id = Some(gp);
+                ep.parent_idx = Some(1);
+                ep.idx = Some(1);
+                ep
+            };
+        let mut ep_a = mk_episode("Alpha Ep", "tt7003", "tt7001", series_a.id);
+        ep_a.save(db)
+            .await
+            .unwrap();
+        let mut ep_z = mk_episode("Zulu Ep", "tt7004", "tt7002", series_z.id);
+        ep_z.save(db)
+            .await
+            .unwrap();
+
+        let titles = sort_titles(
+            db,
+            MediaKind::Episode,
+            api::ItemSortBy::SeriesSortName,
+            api::SortOrder::Ascending,
+        )
+        .await;
+        assert_eq!(titles, vec!["Alpha Ep", "Zulu Ep"]);
+    }
+
+    /// DateLastContentAdded sorts series by their most recently added episode.
+    #[tokio::test]
+    async fn sort_by_date_last_content_added() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let now = chrono::Utc::now().naive_utc();
+
+        let mut series_old = media_row(MediaKind::Series, "Old Series", "tt8001");
+        series_old.created_at = now - chrono::Duration::days(100);
+        series_old
+            .save(db)
+            .await
+            .unwrap();
+        let mut series_new = media_row(MediaKind::Series, "New Series", "tt8002");
+        series_new.created_at = now - chrono::Duration::days(100);
+        series_new
+            .save(db)
+            .await
+            .unwrap();
+
+        let mk_episode = |title: &str,
+                          series_imdb: &str,
+                          gp: uuid::Uuid,
+                          created: chrono::NaiveDateTime| {
+            let mut ext = ExternalIds {
+                series_imdb: Some(
+                    NonEmptyString::try_new(series_imdb.to_string()).unwrap(),
+                ),
+                ..Default::default()
+            };
+            let id = uuid::Uuid::from(&MediaIdRaw {
+                kind: MediaKind::Episode,
+                external_ids: ext.clone(),
+                season: Some(1),
+                episode: Some(1),
+            });
+            let mut ep = Media {
+                id,
+                title: title.to_string(),
+                kind: MediaKind::Episode,
+                external_ids: ext,
+                created_at: created,
+                ..Default::default()
+            };
+            ep.grandparent_id = Some(gp);
+            ep.parent_idx = Some(1);
+            ep.idx = Some(1);
+            ep
+        };
+        let mut ep_old = mk_episode(
+            "Old Ep",
+            "tt8001",
+            series_old.id,
+            now - chrono::Duration::days(50),
+        );
+        ep_old
+            .save(db)
+            .await
+            .unwrap();
+        let mut ep_new = mk_episode(
+            "New Ep",
+            "tt8002",
+            series_new.id,
+            now - chrono::Duration::days(1),
+        );
+        ep_new
+            .save(db)
+            .await
+            .unwrap();
+
+        let titles = sort_titles(
+            db,
+            MediaKind::Series,
+            api::ItemSortBy::DateLastContentAdded,
+            api::SortOrder::Descending,
+        )
+        .await;
+        assert_eq!(titles, vec!["New Series", "Old Series"]);
+    }
+
+    /// The Albums view excludes Deezer singles/EPs but keeps albums (including
+    /// albums without a stored type).
+    #[tokio::test]
+    async fn album_kinds_filters_release_kinds() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+
+        let album_row =
+            |title: &str, imdb: &str, deezer: i64, kind: Option<AlbumKind>| {
+                let mut ext = ExternalIds {
+                    imdb: Some(NonEmptyString::try_new(imdb.to_string()).unwrap()),
+                    deezer_album: Some(deezer),
+                    ..Default::default()
+                };
+                let id = uuid::Uuid::from(&MediaIdRaw {
+                    kind: MediaKind::Album,
+                    external_ids: ext.clone(),
+                    season: None,
+                    episode: None,
+                });
+                Media {
+                    id,
+                    title: title.to_string(),
+                    kind: MediaKind::Album,
+                    album_kind: kind,
+                    external_ids: ext,
+                    ..Default::default()
+                }
+            };
+
+        let mut album = album_row("Real Album", "tt9001", 1, Some(AlbumKind::Album));
+        album
+            .save(db)
+            .await
+            .unwrap();
+        let mut single = album_row("Single", "tt9002", 2, Some(AlbumKind::Single));
+        single
+            .save(db)
+            .await
+            .unwrap();
+        let mut ep = album_row("EP", "tt9003", 3, Some(AlbumKind::Ep));
+        ep.save(db)
+            .await
+            .unwrap();
+        let mut no_type = album_row("No Type", "tt9004", 4, None);
+        no_type
+            .save(db)
+            .await
+            .unwrap();
+
+        let fetch_titles = |album_kinds: Option<Vec<AlbumKind>>| async move {
+            let result = Media::get_by_filter(
+                db,
+                &MediaFilter {
+                    kind: Some(vec![MediaKind::Album]),
+                    album_kinds,
+                    sort_by: vec![api::ItemSortBy::SortName],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            result
+                .records
+                .into_iter()
+                .map(|m| m.title)
+                .collect::<Vec<_>>()
+        };
+
+        let all = fetch_titles(None).await;
+        assert_eq!(
+            all.len(),
+            4,
+            "without the filter every album is returned; got {all:?}"
+        );
+
+        let filtered = fetch_titles(Some(vec![AlbumKind::Album])).await;
+        assert_eq!(filtered, vec!["No Type", "Real Album"]);
     }
 }
 

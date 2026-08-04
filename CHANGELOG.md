@@ -1,3 +1,88 @@
+# [0.22.0](https://github.com/lostb1t/remux/compare/v0.21.0...v0.22.0) (2026-08-04)
+
+
+### Bug Fixes
+
+* correct gregorian day constant in dashboard uptime parser ([#168](https://github.com/lostb1t/remux/issues/168)) ([87d8305](https://github.com/lostb1t/remux/commit/87d8305e224e1159f8542cf22f85db24d1524217))
+* fall back to container bitrate for video_bitrate when stream level is absent, hide uri from log spans ([eee8558](https://github.com/lostb1t/remux/commit/eee8558f1f8b2eb235a4ed0d2fac4d4148bd2f4e))
+* include Audio, MusicAlbum and MusicArtist in default search types ([9bccaf7](https://github.com/lostb1t/remux/commit/9bccaf7d7c83a28920b9da23d95d1b0f0dafe7e8)), closes [#157](https://github.com/lostb1t/remux/issues/157)
+* match jellyfin-ffmpeg assets by platform suffix and extension only ([62541fb](https://github.com/lostb1t/remux/commit/62541fbef6102e12d2d26f85d4529d91d8efbf5d))
+* move codec enums to remux-sdks, add typed accessors, fix IsTextSubtitleStream for text subtitle streams ([937b5bd](https://github.com/lostb1t/remux/commit/937b5bd996818c4950bf12909786b5bc73032fd4))
+* re-key legacy user_media_state to current media UUID on IMDB content fallback ([607a338](https://github.com/lostb1t/remux/commit/607a338443c015ce10f10524ee0f373214d3afe4))
+* serve synthetic VOD playlist for fMP4 sessions to enable full seek bar, bump TARGETDURATION ceiling ([b13cff5](https://github.com/lostb1t/remux/commit/b13cff5d51bf21a29e24f27fb7174a923ab0609d))
+* server-side admin gate for dashboard ([#162](https://github.com/lostb1t/remux/issues/162)) ([0c00338](https://github.com/lostb1t/remux/commit/0c00338b2293145baa4db09680c3f3bec2093eba))
+* show artist and album name for deezer playlist tracks ([#163](https://github.com/lostb1t/remux/issues/163)) ([#164](https://github.com/lostb1t/remux/issues/164)) ([7425e8d](https://github.com/lostb1t/remux/commit/7425e8d875a1309ca6dfcfaa4c919ce837119cd3))
+* strip Windows UNC prefix from embedded asset paths in build.rs ([1f4346e](https://github.com/lostb1t/remux/commit/1f4346ee03bbeffc34470c02d0aa88152ad45258))
+* suppress console window on Windows ([f17b6a5](https://github.com/lostb1t/remux/commit/f17b6a521b3815bdc0b24f2c35630bcfed2b9424))
+* SW decode + tonemapx for VideoToolbox HDR transcodes ([574952a](https://github.com/lostb1t/remux/commit/574952a487eb570d01d573e1352c0cbde25673e3))
+* use TargetUser for GET /items/{id}, omit zero PlayedPercentage, fix Key field ([3af3bf0](https://github.com/lostb1t/remux/commit/3af3bf0dcb60a60cd2a84b267785b75abfcc107f))
+
+
+### Features
+
+* apply subtitle/audio language preference defaults in Items endpoint ([692ead7](https://github.com/lostb1t/remux/commit/692ead76f0c04c6cf3c877f89f79a83a7d500aea))
+
+# [0.21.0](https://github.com/lostb1t/remux/compare/v0.20.2...v0.21.0) (2026-08-02)
+
+
+### Bug Fixes
+
+* ad-hoc codesign macOS app bundle before DMG packaging ([579270f](https://github.com/lostb1t/remux/commit/579270ffa2cfe0022d7eb4e014723f1c8f3eb0c3))
+
+
+### Features
+
+* add healthcheck endpoint ([#155](https://github.com/lostb1t/remux/issues/155)) ([e960772](https://github.com/lostb1t/remux/commit/e960772e4193e575d3dcc99262253577974a2a1e))
+
+## [0.20.2](https://github.com/lostb1t/remux/compare/v0.20.1...v0.20.2) (2026-08-02)
+
+
+### Bug Fixes
+
+* restore WEB_PATH and DASHBOARD_PATH env var support for filesystem paths ([fa04cb6](https://github.com/lostb1t/remux/commit/fa04cb6f9ac2b6d01241da4cffe52ac3a9d99f0e))
+
+## [0.20.1](https://github.com/lostb1t/remux/compare/v0.20.0...v0.20.1) (2026-08-02)
+
+
+### Bug Fixes
+
+* upload desktop artifacts with stable names for latest/download links ([a940bad](https://github.com/lostb1t/remux/commit/a940badcbe5b7954c83b7c81f21cd60167a783f3))
+
+# [0.20.0](https://github.com/lostb1t/remux/compare/v0.19.0...v0.20.0) (2026-08-02)
+
+
+### Bug Fixes
+
+* **iptv:** filter resolved catalogs by media_kind in catalogs_for_kinds ([6bd41da](https://github.com/lostb1t/remux/commit/6bd41daac68fa27205dc656fffdb12ab7648c24a))
+* **probe:** skip short-duration check for audio-only streams; skip remuxdb for non-movie/episode kinds ([546c268](https://github.com/lostb1t/remux/commit/546c26836faa393bfc303173ea9af6fdb4ec1816))
+* **streams:** resolve addon streams on demand in stream/HLS path ([9fdbb03](https://github.com/lostb1t/remux/commit/9fdbb038e3d39669289a6407c42256bf2f433e56))
+
+
+### Features
+
+* add remux-desktop system tray app with cross-platform builds and runtime ffmpeg download ([#160](https://github.com/lostb1t/remux/issues/160)) ([8afeb6c](https://github.com/lostb1t/remux/commit/8afeb6c645796ad53431acbcc127957dbe901a5f))
+* re-sort Next Up by effective key to surface newly released episodes ([#134](https://github.com/lostb1t/remux/issues/134)) ([85b3491](https://github.com/lostb1t/remux/commit/85b3491459b28b3b4c9114dbec6045bbdc437520))
+
+# [0.19.0](https://github.com/lostb1t/remux/compare/v0.18.1...v0.19.0) (2026-07-31)
+
+
+### Bug Fixes
+
+* **addons:** surface clear errors when addon manifest is unreachable or 404 ([8328499](https://github.com/lostb1t/remux/commit/8328499c0c1e4393aad6d70e2f351fd191d33de7))
+* **quickconnect:** respect userId param in authorize endpoint ([d8ea13b](https://github.com/lostb1t/remux/commit/d8ea13b1969a24fd0b7fb5ae0cb554dba31aeac7))
+* **resume:** re-watched items missing from continue watching, closes [#150](https://github.com/lostb1t/remux/issues/150) ([c1260c4](https://github.com/lostb1t/remux/commit/c1260c45cedbcf1d20e6f559eb0a4262f454dbe8))
+* **stream_groups:** resolve group UUIDs to items via per-user store mapping ([29340d6](https://github.com/lostb1t/remux/commit/29340d6bbcafc76846a856980bbacb07b78e4817))
+* stremio custom type anime catalogs ([#137](https://github.com/lostb1t/remux/issues/137)) ([7b77b55](https://github.com/lostb1t/remux/commit/7b77b55df782b5fbd74c875a97870d2ddd1e6f0e))
+* **tests:** add missing TranscodeSession fields in engine test fixture ([77cb477](https://github.com/lostb1t/remux/commit/77cb4773e52d748c46e929f2f142413c09144b6d))
+* **transcode:** apply HDR colour treatment in CPU overlay subtitle filter_complex ([4014f6e](https://github.com/lostb1t/remux/commit/4014f6e65b968ccd515509c9e70b00c799ed70c5))
+* **transcode:** use overlay_qsv for QSV subtitle burn-in instead of SW decode ([691a2cc](https://github.com/lostb1t/remux/commit/691a2cc2e82c200c38c6092a4d58f9b4f88cb5fe))
+
+
+### Features
+
+* **admin:** restrict dashboard access to admin users only, closes [#152](https://github.com/lostb1t/remux/issues/152) ([9eb06f3](https://github.com/lostb1t/remux/commit/9eb06f350b4fa73479123f1a4f2d4f84f18529ee))
+* **sessions:** expose bitrate, framerate, and hw accel in TranscodingInfo, closes [#153](https://github.com/lostb1t/remux/issues/153) ([e2cbd44](https://github.com/lostb1t/remux/commit/e2cbd4414a3bfee8c62bf0da02acf3d2af9e618f))
+
 ## [0.18.1](https://github.com/lostb1t/remux/compare/v0.18.0...v0.18.1) (2026-07-27)
 
 

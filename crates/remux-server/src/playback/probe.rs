@@ -414,13 +414,67 @@ fn chapters_to_media_info(chapters: &[FfprobeChapter]) -> Vec<api::MediaChapterI
                 title: chapter
                     .tags
                     .get("title")
-                    .or_else(|| chapter.tags.get("TITLE"))
+                    .or_else(|| {
+                        chapter
+                            .tags
+                            .get("TITLE")
+                    })
                     .cloned(),
                 start_position_ticks,
                 end_position_ticks,
             })
         })
         .collect()
+}
+
+/// When a single video stream has no per-stream bitrate but all audio streams do,
+/// estimate it as container total minus summed audio bitrates (mirrors Jellyfin).
+fn apply_video_bitrate_fallback(
+    streams: &mut Vec<api::MediaStream>,
+    total_bitrate: Option<i64>,
+) {
+    let Some(total) = total_bitrate else { return };
+    let video_indices: Vec<usize> = streams
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            matches!(s.type_, Some(api::MediaStreamType::Video))
+                && s.bit_rate
+                    .is_none()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if video_indices.len() != 1 {
+        return;
+    }
+    // Mirror Jellyfin: subtract all non-video, non-external streams (not just audio).
+    // audioBitratesKnown check: all audio streams must have a known bitrate.
+    let non_video: Vec<&api::MediaStream> = streams
+        .iter()
+        .filter(|s| {
+            !matches!(s.type_, Some(api::MediaStreamType::Video)) && !s.is_external
+        })
+        .collect();
+    let audio_all_known = non_video
+        .iter()
+        .filter(|s| matches!(s.type_, Some(api::MediaStreamType::Audio)))
+        .all(|s| {
+            s.bit_rate
+                .is_some()
+        });
+    if audio_all_known {
+        let other_sum: i64 = non_video
+            .iter()
+            .map(|s| {
+                s.bit_rate
+                    .unwrap_or(0)
+            })
+            .sum();
+        let estimated = total - other_sum;
+        if estimated > 0 {
+            streams[video_indices[0]].bit_rate = Some(estimated);
+        }
+    }
 }
 
 /// Probe a media URL with ffprobe and return a Jellyfin `MediaSourceInfo`
@@ -655,6 +709,8 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                     .to_string();
                 // Match Jellyfin: default flag comes from the stream disposition,
                 // not stream ordering.
+                // Only the container's real disposition flag counts as a default;
+                // no first-of-type synthesis (an unflagged track has no default).
                 let is_default = s
                     .disposition
                     .default
@@ -749,10 +805,6 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                     .as_ref()
                     .map(|c| c.to_string())
                     .unwrap_or(raw_codec);
-                let is_text = parsed_codec
-                    .as_ref()
-                    .map(SubtitleCodec::is_text)
-                    .unwrap_or(false);
                 let is_image = parsed_codec
                     .as_ref()
                     .map(SubtitleCodec::is_image)
@@ -762,7 +814,12 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                 } else {
                     None
                 };
-                let is_default = sub_idx == 0;
+                // Only the container's real disposition flag counts as a default;
+                // no first-of-type synthesis (an unflagged track has no default).
+                let is_default = s
+                    .disposition
+                    .default
+                    != 0;
                 let is_forced = s
                     .disposition
                     .forced
@@ -788,7 +845,7 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                     title: None, // don't use raw stream title; build purely from attributes
                 };
 
-                streams.push(api::MediaStream {
+                let mut stream = api::MediaStream {
                     type_: Some(api::MediaStreamType::Subtitle),
                     index: s.index,
                     codec: Some(codec.clone()),
@@ -808,25 +865,25 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                     display_title: display_title_subtitle(&meta),
                     language: language.map(str::to_string),
                     title,
-                    is_text_subtitle_stream: is_text,
                     supports_external_stream: true,
                     delivery_method,
                     ..Default::default()
-                });
+                };
+                stream.is_text_subtitle_stream = stream.is_text_subtitle_stream();
+                streams.push(stream);
                 sub_idx += 1;
             }
             _ => {}
         }
     }
 
-    let default_audio_stream_index = streams
-        .iter()
-        .find(|s| matches!(s.type_, Some(api::MediaStreamType::Audio)))
-        .map(|s| s.index);
-    let default_subtitle_stream_index = streams
-        .iter()
-        .find(|s| matches!(s.type_, Some(api::MediaStreamType::Subtitle)))
-        .map(|s| s.index);
+    apply_video_bitrate_fallback(&mut streams, overall_bitrate);
+
+    // NOTE: `default_audio_stream_index` / `default_subtitle_stream_index` are
+    // deliberately NOT computed here. They are derived, per-request API values
+    // (see `MediaSourceInfo::resolve_default_streams`) and must not be persisted
+    // in probe data. The per-stream `is_default` flags above are the container
+    // facts that derivation builds on.
 
     let segments = chapters_to_segments(&probe.chapters);
     let chapters = chapters_to_media_info(&probe.chapters);
@@ -843,8 +900,6 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
             bitrate: overall_bitrate,
             size: overall_size,
             chapters,
-            default_audio_stream_index,
-            default_subtitle_stream_index,
             ..Default::default()
         },
         segments,
@@ -905,7 +960,9 @@ pub(crate) async fn probe_stream(
                 .is_some()
         {
             debug!(id = %stream.id, "probe cache hit");
-            return Ok((api::MediaSourceInfo::from(stream.clone()), stream.clone()));
+            let mut info = api::MediaSourceInfo::from(stream.clone());
+            apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+            return Ok((info, stream.clone()));
         }
         debug!(id = %stream.id, "probe cache stale (no playable stream), re-probing");
     }
@@ -1058,19 +1115,31 @@ where
 
         match probe_result {
             Ok(Ok(Ok((mut probed, segments)))) => {
-                if probed.chapters.is_empty()
+                if probed
+                    .chapters
+                    .is_empty()
                     && let Some(cached) = stream2
                         .probe_data
                         .as_ref()
-                    && !cached.chapters.is_empty()
+                    && !cached
+                        .chapters
+                        .is_empty()
                 {
-                    probed.chapters = cached.chapters.clone();
+                    probed.chapters = cached
+                        .chapters
+                        .clone();
                     probed.virtual_chapters = false;
                     probed.chapters_inherited = cached.chapters_inherited;
-                    probed.chapter_source_content_hash =
-                        cached.chapter_source_content_hash.clone();
-                    if probed.segments.is_none() {
-                        probed.segments = cached.segments.clone();
+                    probed.chapter_source_content_hash = cached
+                        .chapter_source_content_hash
+                        .clone();
+                    if probed
+                        .segments
+                        .is_none()
+                    {
+                        probed.segments = cached
+                            .segments
+                            .clone();
                     }
                 }
                 // Reject *video* streams whose probed duration is suspiciously
@@ -1083,6 +1152,11 @@ where
                 // discarded every usable stream → 500 → Finamp `-1008`, and it
                 // is not caught by a kind check because the probe runs against
                 // the resolved Stream row, not the original Track.
+                // Reject streams whose probed duration is suspiciously short
+                // relative to the known metadata runtime (or absolutely < 3 min
+                // when unknown) — these are typically error/copyright-strike
+                // placeholder videos, not real content. Skip for audio-only
+                // streams since short songs are legitimate.
                 if probed
                     .video_stream()
                     .is_some()

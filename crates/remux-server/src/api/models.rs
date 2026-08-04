@@ -333,11 +333,12 @@ pub fn db_state_to_dto(
             .unwrap_or(0),
         play_count: state.play_count as i32,
         is_favorite: state.favorite,
-        played_percentage,
+        // Jellyfin omits PlayedPercentage when it is 0
+        played_percentage: played_percentage.filter(|&p| p > 0.0),
         unplayed_item_count: media.unplayed_item_count,
-        key: state
-            .media_raw
-            .unwrap_or_default(),
+        key: media
+            .id
+            .to_string(),
         item_id: media.id,
         ..Default::default()
     }
@@ -735,6 +736,12 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                         p.title
                             .clone()
                     })
+                    .or_else(|| {
+                        media
+                            .external_ids
+                            .album_title
+                            .clone()
+                    })
             })
             .flatten(),
         album_id: (media.kind == db::MediaKind::Track)
@@ -760,6 +767,12 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                         gp.title
                             .clone()
                     })
+                    .or_else(|| {
+                        media
+                            .external_ids
+                            .artist_name
+                            .clone()
+                    })
             })
             .flatten(),
         // Jellyfin initializes these arrays for music DTOs, including sparse
@@ -778,6 +791,18 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                         }),
                 )
                 .map(|(id, name)| vec![NameIdPair { id, name }])
+                .or_else(|| {
+                    media
+                        .external_ids
+                        .artist_name
+                        .as_ref()
+                        .map(|name| {
+                            vec![NameIdPair {
+                                id: uuid::Uuid::nil(),
+                                name: name.clone(),
+                            }]
+                        })
+                })
                 .unwrap_or_default()
         }),
         artists: is_music_metadata_item(&media.kind).then(|| {
@@ -789,6 +814,13 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                         gp.title
                             .clone(),
                     ]
+                })
+                .or_else(|| {
+                    media
+                        .external_ids
+                        .artist_name
+                        .as_ref()
+                        .map(|n| vec![n.clone()])
                 })
                 .unwrap_or_default()
         }),
@@ -805,6 +837,18 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                         }),
                 )
                 .map(|(id, name)| vec![NameIdPair { id, name }])
+                .or_else(|| {
+                    media
+                        .external_ids
+                        .artist_name
+                        .as_ref()
+                        .map(|name| {
+                            vec![NameIdPair {
+                                id: uuid::Uuid::nil(),
+                                name: name.clone(),
+                            }]
+                        })
+                })
                 .unwrap_or_default()
         }),
         tags: media
@@ -1107,6 +1151,11 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                 );
             }
         }
+        item.bitrate = item
+            .media_sources
+            .as_ref()
+            .and_then(|s| s.first())
+            .and_then(|s| s.bitrate);
         if media.kind != db::MediaKind::Track {
             item.video_type = Some(VideoType::VideoFile);
         }

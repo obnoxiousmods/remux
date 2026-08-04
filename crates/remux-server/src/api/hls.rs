@@ -13,12 +13,16 @@ use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+use remux_sdks::remux::HardwareAccelerationType;
+
 use crate::{
     AppState, IntoApiError, OptionExt, ResultExt, api, common,
     common::{TickUnit, ToRunTimeTicks},
     db,
     db::auth,
-    playback::session::{HlsSegmentFile, HlsSegmentFormat, TranscodeSession, TranscodeState},
+    playback::session::{
+        HlsSegmentFile, HlsSegmentFormat, TranscodeSession, TranscodeState,
+    },
 };
 
 /// Serializes the lookup-or-create-transcode sequence per play_session_id so
@@ -139,9 +143,10 @@ fn can_claim_hls_session(
     request_ticks: Option<i64>,
     request_audio_index: Option<i32>,
 ) -> bool {
-    let ticks_match = session_requested_ticks == request_ticks
-        .unwrap_or(0)
-        .max(0);
+    let ticks_match = session_requested_ticks
+        == request_ticks
+            .unwrap_or(0)
+            .max(0);
     let audio_matches = match (session_audio_index, request_audio_index) {
         (Some(running), Some(requested)) => running == requested,
         _ => true,
@@ -180,13 +185,20 @@ fn pts_offset_secs(pts_time: f64) -> f64 {
     } else {
         pts_time
     };
-    if unwrapped.abs() > 120.0 { 0.0 } else { unwrapped }
+    if unwrapped.abs() > 120.0 {
+        0.0
+    } else {
+        unwrapped
+    }
 }
 
 /// Lowest-index segment file currently on disk — the first file ffmpeg
 /// produced for this generation (segment-driven restarts bump -start_number,
 /// so it is not necessarily segment_00000).
-fn first_segment_path(dir: &std::path::Path, use_fmp4: bool) -> Option<std::path::PathBuf> {
+fn first_segment_path(
+    dir: &std::path::Path,
+    use_fmp4: bool,
+) -> Option<std::path::PathBuf> {
     let ext = if use_fmp4 { "m4s" } else { "ts" };
     let mut best: Option<(u32, std::path::PathBuf)> = None;
     for entry in std::fs::read_dir(dir)
@@ -198,7 +210,10 @@ fn first_segment_path(dir: &std::path::Path, use_fmp4: bool) -> Option<std::path
         let Some(idx) = name
             .strip_prefix("segment_")
             .and_then(|n| n.strip_suffix(&format!(".{ext}")))
-            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(|n| {
+                n.parse::<u32>()
+                    .ok()
+            })
         else {
             continue;
         };
@@ -220,10 +235,17 @@ fn parse_ffprobe_first_track_pts(stdout: &str) -> Option<f64> {
     let mut first_video: Option<f64> = None;
     for line in stdout.lines() {
         let mut parts = line.split(',');
-        let kind = parts.next().unwrap_or("").trim();
+        let kind = parts
+            .next()
+            .unwrap_or("")
+            .trim();
         let pts = parts
             .next()
-            .map(|raw| raw.trim().parse::<f64>().ok())
+            .map(|raw| {
+                raw.trim()
+                    .parse::<f64>()
+                    .ok()
+            })
             .flatten();
         let Some(pts) = pts else { continue };
         match kind {
@@ -384,7 +406,9 @@ async fn create_hls_session(
             // seconds could acknowledge ticks ffmpeg never used (baked-in
             // subtitle desync).
             let can_claim = {
-                let current = existing.read().await;
+                let current = existing
+                    .read()
+                    .await;
                 can_claim_hls_session(
                     current.requested_start_ticks,
                     current.audio_stream_index,
@@ -416,7 +440,11 @@ async fn create_hls_session(
             .read()
             .await
             .prewarm
-            .store(q.prewarm.unwrap_or(false), Ordering::Relaxed);
+            .store(
+                q.prewarm
+                    .unwrap_or(false),
+                Ordering::Relaxed,
+            );
         existing
     } else {
         // Fetch media info to get the stream URL
@@ -508,7 +536,13 @@ async fn create_hls_session(
         state
             .ctx
             .sessions
-            .reap_competing_startups(&auth.device.id, &input_url, &play_session_id)
+            .reap_competing_startups(
+                &auth
+                    .device
+                    .id,
+                &input_url,
+                &play_session_id,
+            )
             .await;
 
         let output_dir =
@@ -656,6 +690,33 @@ async fn create_hls_session(
         });
         let burn_subtitle =
             q.subtitle_method == Some(api::SubtitleDeliveryMethod::Encode);
+        let session_video_bitrate = if video_codec == "copy" {
+            None
+        } else {
+            resolved_media
+                .probe_data
+                .as_ref()
+                .and_then(|p| p.video_bitrate())
+                .map(|b| {
+                    let source = b as u32;
+                    let target = q
+                        .video_bit_rate
+                        .map_or(source, |v| source.min(v as u32));
+                    q.max_streaming_bitrate
+                        .map_or(target, |c| target.min(c as u32))
+                })
+        };
+        let session_hw_accel = if video_codec == "copy" {
+            None
+        } else {
+            match encoding_opts_hls
+                .hardware_acceleration_type
+                .unwrap_or_default()
+            {
+                HardwareAccelerationType::None => None,
+                hw => Some(hw.to_string()),
+            }
+        };
         let session = TranscodeSession::new(
             play_session_id.clone(),
             id,
@@ -678,7 +739,8 @@ async fn create_hls_session(
                 .unwrap_or_default(),
             runtime_ticks,
             runtime_is_probed,
-            q.prewarm.unwrap_or(false),
+            q.prewarm
+                .unwrap_or(false),
             is_live,
             source_video_codec,
             source_audio_codec,
@@ -688,6 +750,8 @@ async fn create_hls_session(
             source_video_width,
             source_video_height,
             source_frame_rate,
+            session_video_bitrate,
+            session_hw_accel,
         );
 
         // Record the exact seek this ffmpeg process will perform before the
@@ -731,8 +795,10 @@ async fn create_hls_session(
             max_height: q
                 .max_height
                 .map(|v| v as u32),
-            video_bitrate: source_video_stream
-                .and_then(|s| s.bit_rate)
+            video_bitrate: resolved_media
+                .probe_data
+                .as_ref()
+                .and_then(|p| p.video_bitrate())
                 .map(|b| {
                     let source = b as u32;
                     let target = q
@@ -917,7 +983,9 @@ pub async fn master_hls_video(
         )
         .header(
             "X-Remux-Prewarm-Lease-Seconds",
-            if q.prewarm.unwrap_or(false) {
+            if q.prewarm
+                .unwrap_or(false)
+            {
                 PREWARM_LEASE_SECS.to_string()
             } else {
                 "0".to_string()
@@ -967,9 +1035,15 @@ pub async fn hls_playback_start(
         if s.requested_start_ticks > 0
             && s.video_codec == "copy"
             && !s.is_live
-            && s.actual_start_ticks.is_none()
+            && s.actual_start_ticks
+                .is_none()
         {
-            Some((s.requested_start_ticks, s.output_dir.clone(), s.use_fmp4()))
+            Some((
+                s.requested_start_ticks,
+                s.output_dir
+                    .clone(),
+                s.use_fmp4(),
+            ))
         } else {
             None
         }
@@ -1010,7 +1084,8 @@ pub async fn hls_playback_start(
             "requestedStartTicks": requested_start_ticks,
             "actualStartTicks": actual_start_ticks,
         }
-    })).into_response())
+    }))
+    .into_response())
 }
 
 /// Safari/iOS live TV endpoint: creates the transcode session and returns the
@@ -1063,6 +1138,14 @@ fn resolve_live_audio_codec(is_live: bool, requested: &str) -> String {
     }
 }
 
+fn should_serve_ffmpeg_variant_playlist(
+    is_live: bool,
+    _use_fmp4: bool,
+    _start_time_secs: u32,
+) -> bool {
+    is_live
+}
+
 async fn variant_hls_video_inner(
     state: AppState,
     q: api::HlsVideoQuery,
@@ -1076,11 +1159,7 @@ async fn variant_hls_video_inner(
         .sessions
         .get_transcode(&play_session_id)
     else {
-        return Ok(hls_state_response(
-            StatusCode::GONE,
-            "session-gone",
-            None,
-        ));
+        return Ok(hls_state_response(StatusCode::GONE, "session-gone", None));
     };
 
     // Keep the session alive.
@@ -1143,18 +1222,20 @@ async fn variant_hls_video_inner(
                 ?session_state,
                 "HLS child playlist not ready before startup deadline"
             );
-            return Ok(if matches!(
-                session_state,
-                TranscodeState::Complete | TranscodeState::Error(_)
-            ) {
-                hls_state_response(StatusCode::GONE, "transcode-ended", None)
-            } else {
-                hls_state_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "playlist-not-ready",
-                    Some("1"),
-                )
-            });
+            return Ok(
+                if matches!(
+                    session_state,
+                    TranscodeState::Complete | TranscodeState::Error(_)
+                ) {
+                    hls_state_response(StatusCode::GONE, "transcode-ended", None)
+                } else {
+                    hls_state_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "playlist-not-ready",
+                        Some("1"),
+                    )
+                },
+            );
         }
 
         info!(
@@ -1190,10 +1271,7 @@ async fn variant_hls_video_inner(
                 if !line.starts_with('#')
                     && (line.ends_with(".ts") || line.ends_with(".m4s"))
                 {
-                    format!(
-                        "{}?PlaySessionId={}{}",
-                        line, psid, generation_suffix
-                    )
+                    format!("{}?PlaySessionId={}{}", line, psid, generation_suffix)
                 } else if line.starts_with("#EXT-X-MAP:")
                     && !line.contains("PlaySessionId")
                 {
@@ -1225,7 +1303,7 @@ async fn variant_hls_video_inner(
 }
 
 #[cfg(test)]
-mod tests {
+mod local_tests {
     use http::StatusCode;
 
     use super::{
@@ -1260,9 +1338,10 @@ mod tests {
                 .to_string(),
             Some(3_200_000_000),
         );
-        assert!(playlist.contains(
-            "main.m3u8?PlaySessionId=session&StartTimeTicks=3200000000"
-        ));
+        assert!(
+            playlist
+                .contains("main.m3u8?PlaySessionId=session&StartTimeTicks=3200000000")
+        );
     }
 
     #[test]
@@ -1298,29 +1377,73 @@ mod tests {
         let gone = hls_state_response(StatusCode::GONE, "session-gone", None);
         assert_eq!(gone.status(), StatusCode::GONE);
         assert_eq!(gone.headers()["X-Remux-Hls-State"], "session-gone");
-        assert!(!gone.headers().contains_key("Retry-After"));
+        assert!(
+            !gone
+                .headers()
+                .contains_key("Retry-After")
+        );
     }
 
     #[test]
     fn session_claim_requires_exact_tick_match() {
         // Exact match: claim allowed, prewarm or not — playlist retries are
         // idempotent and must never restart the transcode.
-        assert!(super::can_claim_hls_session(1_000_000_000, Some(2), Some(1_000_000_000), Some(2)));
+        assert!(super::can_claim_hls_session(
+            1_000_000_000,
+            Some(2),
+            Some(1_000_000_000),
+            Some(2)
+        ));
         // A sub-second difference must NOT claim — ffmpeg was started with
         // different ticks than the acknowledgement would report; this is a
         // genuine seek and restarts the session.
-        assert!(!super::can_claim_hls_session(1_000_000_000, Some(2), Some(1_000_000_001), Some(2)));
-        assert!(!super::can_claim_hls_session(1_000_400_000, None, Some(1_000_900_000), None));
+        assert!(!super::can_claim_hls_session(
+            1_000_000_000,
+            Some(2),
+            Some(1_000_000_001),
+            Some(2)
+        ));
+        assert!(!super::can_claim_hls_session(
+            1_000_400_000,
+            None,
+            Some(1_000_900_000),
+            None
+        ));
         // No seek in the request: claim only matches a from-start session.
         assert!(super::can_claim_hls_session(0, None, None, None));
-        assert!(!super::can_claim_hls_session(1_000_000_000, None, None, None));
+        assert!(!super::can_claim_hls_session(
+            1_000_000_000,
+            None,
+            None,
+            None
+        ));
         // A different explicit audio index is a genuine track change, never a
         // claim: the running ffmpeg keeps the old track mapped otherwise.
-        assert!(!super::can_claim_hls_session(1_000_000_000, Some(1), Some(1_000_000_000), Some(2)));
-        assert!(super::can_claim_hls_session(1_000_000_000, Some(2), Some(1_000_000_000), Some(2)));
+        assert!(!super::can_claim_hls_session(
+            1_000_000_000,
+            Some(1),
+            Some(1_000_000_000),
+            Some(2)
+        ));
+        assert!(super::can_claim_hls_session(
+            1_000_000_000,
+            Some(2),
+            Some(1_000_000_000),
+            Some(2)
+        ));
         // No opinion on either side never blocks a claim.
-        assert!(super::can_claim_hls_session(1_000_000_000, None, Some(1_000_000_000), Some(2)));
-        assert!(super::can_claim_hls_session(1_000_000_000, Some(1), Some(1_000_000_000), None));
+        assert!(super::can_claim_hls_session(
+            1_000_000_000,
+            None,
+            Some(1_000_000_000),
+            Some(2)
+        ));
+        assert!(super::can_claim_hls_session(
+            1_000_000_000,
+            Some(1),
+            Some(1_000_000_000),
+            None
+        ));
     }
 
     #[test]
@@ -1378,10 +1501,8 @@ mod tests {
 
     #[test]
     fn first_segment_picks_lowest_index_of_expected_format() {
-        let dir = std::env::temp_dir().join(format!(
-            "remux-hls-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("remux-hls-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         for name in ["segment_00007.ts", "segment_00003.ts", "segment_00012.m4s"] {
             std::fs::write(dir.join(name), b"x").unwrap();
@@ -1887,8 +2008,37 @@ async fn hls_segment_inner(
     // fMP4 segments (.m4s) use video/mp4; MPEG-TS segments use video/mp2t.
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header("Content-Type", segment.format().content_type())
+        .header(
+            "Content-Type",
+            segment
+                .format()
+                .content_type(),
+        )
         .header("Cache-Control", "public, max-age=86400")
         .body(body)
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn live_channel_forces_aac_over_copy() {
+        assert_eq!(super::resolve_live_audio_codec(true, "copy"), "aac");
+        assert_eq!(super::resolve_live_audio_codec(false, "copy"), "copy");
+        assert_eq!(super::resolve_live_audio_codec(true, "aac"), "aac");
+        assert_eq!(super::resolve_live_audio_codec(true, "ac3"), "ac3");
+    }
+
+    #[test]
+    fn resumed_ts_hls_uses_ffmpeg_variant_playlist() {
+        assert!(!super::should_serve_ffmpeg_variant_playlist(
+            false, false, 0
+        ));
+        assert!(!super::should_serve_ffmpeg_variant_playlist(
+            false, false, 1
+        ));
+        // fMP4 now also uses synthetic VOD playlist — full seek bar from the start.
+        assert!(!super::should_serve_ffmpeg_variant_playlist(false, true, 0));
+        assert!(super::should_serve_ffmpeg_variant_playlist(true, false, 0));
+    }
 }

@@ -6,7 +6,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    common, db, db::auth,
+    common, db,
+    db::auth,
     playback::session::{HlsSegmentFile, TranscodeSession, TranscodeState},
 };
 use remux_sdks::remux::{PlayMethod, PlaybackInfo, QueueItem};
@@ -410,7 +411,7 @@ impl PlaybackSessionManager {
                 position_ticks,
                 audio_idx,
                 subtitle_idx,
-                None, // no watched-threshold check on progress
+                media.runtime,
             )
             .await?;
         }
@@ -722,18 +723,34 @@ impl PlaybackSessionManager {
     /// channel self-DoSes. Reaping the device's earlier same-channel startups
     /// before the new ffmpeg connects keeps exactly one reader per channel.
     /// `keep` is the new session and is never reaped.
-    pub async fn reap_competing_startups(&self, device_id: &str, input_url: &str, keep: &str) {
-        let candidates: Vec<(String, Arc<tokio::sync::RwLock<TranscodeSession>>)> = self
-            .sessions
-            .iter()
-            .filter(|e| e.key() != keep && e.value().device_id == device_id)
-            .filter_map(|e| {
-                e.value()
-                    .transcode
-                    .clone()
-                    .map(|ts| (e.key().clone(), ts))
-            })
-            .collect();
+    pub async fn reap_competing_startups(
+        &self,
+        device_id: &str,
+        input_url: &str,
+        keep: &str,
+    ) {
+        let candidates: Vec<(String, Arc<tokio::sync::RwLock<TranscodeSession>>)> =
+            self.sessions
+                .iter()
+                .filter(|e| {
+                    e.key() != keep
+                        && e.value()
+                            .device_id
+                            == device_id
+                })
+                .filter_map(|e| {
+                    e.value()
+                        .transcode
+                        .clone()
+                        .map(|ts| {
+                            (
+                                e.key()
+                                    .clone(),
+                                ts,
+                            )
+                        })
+                })
+                .collect();
         let mut victims = Vec::new();
         for (psid, ts) in candidates {
             let competing = {
@@ -870,7 +887,13 @@ impl PlaybackSessionManager {
                         e.value()
                             .transcode
                             .clone()
-                            .map(|ts| (e.key().clone(), ts))
+                            .map(|ts| {
+                                (
+                                    e.key()
+                                        .clone(),
+                                    ts,
+                                )
+                            })
                     })
                     .collect();
                 for (id, ts) in startup_candidates {
@@ -878,7 +901,9 @@ impl PlaybackSessionManager {
                         let s = ts
                             .read()
                             .await;
-                        let age = s.created_at.elapsed();
+                        let age = s
+                            .created_at
+                            .elapsed();
                         (
                             age > startup_grace
                                 && matches!(
@@ -886,7 +911,8 @@ impl PlaybackSessionManager {
                                     TranscodeState::Starting | TranscodeState::Running
                                 )
                                 && !transcode_has_output(&s.output_dir),
-                            s.prewarm.load(std::sync::atomic::Ordering::Relaxed)
+                            s.prewarm
+                                .load(std::sync::atomic::Ordering::Relaxed)
                                 && age > std::time::Duration::from_secs(90),
                         )
                     };
@@ -911,7 +937,8 @@ mod tests {
 
     #[test]
     fn transcode_has_output_requires_a_segment() {
-        let dir = std::env::temp_dir().join(format!("remux-has-output-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("remux-has-output-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         // Missing directory -> no output.
@@ -944,7 +971,13 @@ fn transcode_has_output(output_dir: &std::path::Path) -> bool {
         return false;
     };
     for entry in entries.flatten() {
-        if HlsSegmentFile::parse(&entry.file_name().to_string_lossy()).is_some() {
+        if HlsSegmentFile::parse(
+            &entry
+                .file_name()
+                .to_string_lossy(),
+        )
+        .is_some()
+        {
             return true;
         }
     }

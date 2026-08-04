@@ -341,19 +341,14 @@ pub async fn init_app(
         .layer(on_error(log_api_error))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
-                .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
-                    let uri = request.uri();
-                    let path = uri.path();
-                    let uri = match uri.query() {
-                        Some(q) => format!("{path}?{q}"),
-                        None => path.to_string(),
-                    };
-                    tracing::info_span!(
-                        "request",
-                        user = tracing::field::Empty,
-                        method = %request.method(),
-                        uri = %uri,
-                    )
+                .make_span_with(|_request: &axum::http::Request<axum::body::Body>| {
+                    // let uri = _request.uri();
+                    // let path = uri.path();
+                    // let uri_str = match uri.query() {
+                    //     Some(q) => format!("{path}?{q}"),
+                    //     None => path.to_string(),
+                    // };
+                    tracing::info_span!("request", user = tracing::field::Empty)
                 })
                 .on_request(|request: &axum::http::Request<axum::body::Body>, _span: &tracing::Span| {
                     debug!(target: "remux_server::request", method = %request.method(), "→");
@@ -767,12 +762,17 @@ pub fn setup_logging(
         .with_file(false)
         .compact();
 
-    // Optional rolling file layer. `Option<Layer>` is itself a `Layer` (a no-op
-    // when `None`), so we can always `.with(file_layer)`.
+    // Optional rolling file layer. Keep upstream's desktop-friendly filename
+    // convention while retaining a non-blocking writer guard for safe flushes.
     let (file_layer, guard) = match log_dir {
         Some(dir) => match std::fs::create_dir_all(dir) {
             Ok(()) => {
-                let appender = tracing_appender::rolling::daily(dir, "remux.log");
+                let appender = tracing_appender::rolling::Builder::new()
+                    .rotation(tracing_appender::rolling::Rotation::DAILY)
+                    .filename_prefix("remux-")
+                    .filename_suffix(".log")
+                    .build(dir)
+                    .expect("failed to create log appender");
                 let (writer, guard) = tracing_appender::non_blocking(appender);
                 let layer = fmt::layer()
                     .with_ansi(false)

@@ -167,6 +167,8 @@ pub async fn get_danmu_raw(
     StatusCode::NOT_FOUND
 }
 
+/// Search results: singles/EPs belong under Tracks, not surfaced as Albums
+/// (Deezer `album_kind`). Applies to both live addon results and library hits.
 pub async fn get_items(
     state: AppState,
     session: auth::AuthSession,
@@ -358,6 +360,7 @@ pub async fn get_items(
                     Ok(results) => {
                         let items: Vec<_> = results
                             .into_iter()
+                            .filter(|m| !m.is_single_or_ep_album())
                             .map(|m| api::db_media_to_item(m, hide_sources))
                             .filter(|item| {
                                 q.media_types
@@ -412,6 +415,7 @@ pub async fn get_items(
                         all_items.extend(
                             r.records
                                 .into_iter()
+                                .filter(|m| !m.is_single_or_ep_album())
                                 .map(|m| api::db_media_to_item(m, hide_sources)),
                         );
                     }
@@ -1559,6 +1563,16 @@ pub async fn item(
     id: Uuid,
     fields: Option<&[api::ItemFields]>,
 ) -> Result<Option<api::BaseItemDto>> {
+    item_for_user(state, session, id, fields, None).await
+}
+
+async fn item_for_user(
+    state: AppState,
+    session: auth::AuthSession,
+    id: Uuid,
+    fields: Option<&[api::ItemFields]>,
+    target_user_id: Option<Uuid>,
+) -> Result<Option<api::BaseItemDto>> {
     let want_streams = fields
         .map(|f| f.contains(&api::ItemFields::MediaSources))
         .unwrap_or(true);
@@ -1579,9 +1593,11 @@ pub async fn item(
                 &state
                     .ctx
                     .store,
-                session
-                    .user
-                    .id,
+                target_user_id.unwrap_or(
+                    session
+                        .user
+                        .id,
+                ),
                 m.id,
             )
             .context_not_found("stream group not yet associated with an item")?
@@ -1598,9 +1614,11 @@ pub async fn item(
             include_user_state: true,
             include_child_count: true,
             user_id: Some(
-                session
-                    .user
-                    .id,
+                target_user_id.unwrap_or(
+                    session
+                        .user
+                        .id,
+                ),
             ),
             ..Default::default()
         },
@@ -1814,8 +1832,15 @@ pub async fn item(
                     .as_ref()
             })
             .map(|p| {
-                p.media_streams
-                    .clone()
+                let mut streams = p
+                    .media_streams
+                    .clone();
+                for s in &mut streams {
+                    if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
+                        s.is_text_subtitle_stream = s.is_text_subtitle_stream();
+                    }
+                }
+                streams
             })
             .unwrap_or_else(|| {
                 vec![api::MediaStream {
@@ -1921,6 +1946,36 @@ pub async fn item(
         base_item.can_download = Some(false);
     }
 
+    if want_streams {
+        // Language defaults must apply even when the user has never saved a
+        // configuration (configuration is NULL for brand-new users) — the server's
+        // global metadata language is the fallback for subtitle selection.
+        let cfg = session
+            .user
+            .configuration
+            .as_ref()
+            .map(|c| {
+                c.0.clone()
+            })
+            .unwrap_or_default();
+        if let Some(ref mut sources) = base_item.media_sources {
+            // Default audio/subtitle stream indexes are per-request API values
+            // (never persisted) — derive them here for the detail page.
+            for source in sources.iter_mut() {
+                source.resolve_default_streams(
+                    &cfg,
+                    server_config
+                        .preferred_metadata_language
+                        .as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
     apply_permissions(&mut base_item, &session.user);
     Ok(Some(base_item))
 }
@@ -1936,16 +1991,18 @@ pub async fn items_livetv(_session: auth::AuthSession) -> Result<impl IntoRespon
 pub async fn items_get(
     State(state): State<AppState>,
     session: auth::AuthSession,
+    auth::TargetUser(target): auth::TargetUser,
     Path(id): Path<Uuid>,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
     return Ok(Json(
-        item(
+        item_for_user(
             state,
             session,
             id,
             q.fields
                 .as_deref(),
+            Some(target.id),
         )
         .await?
         .context_not_found("item not found")?,
@@ -4289,6 +4346,117 @@ mod tests {
                     .any(|i| i["Name"] == "Season 1"))
                 .unwrap_or(false),
             "Season 1 must appear when browsing via a db::Media alias in the store"
+        );
+    }
+
+    /// Build a Movie row carrying probe data with French (index 2) and English
+    /// (index 3) subtitle tracks. A fresh `streams_refreshed_at` makes
+    /// `refresh_streams` short-circuit, so the detail page serves the probe data
+    /// directly — mirroring `playback::tests::insert_subtitle_source`.
+    async fn insert_subtitle_movie(ctx: &crate::AppContext) -> db::Media {
+        let now = Utc::now().naive_utc();
+        let probe = crate::api::MediaSourceInfo {
+            container: Some("mp4".to_string()),
+            bitrate: Some(8_000_000),
+            run_time_ticks: Some(100_000_000),
+            media_streams: vec![
+                crate::api::MediaStream {
+                    codec: Some("h264".to_string()),
+                    type_: Some(crate::api::MediaStreamType::Video),
+                    index: 0,
+                    width: Some(1920),
+                    height: Some(1080),
+                    ..Default::default()
+                },
+                crate::api::MediaStream {
+                    codec: Some("aac".to_string()),
+                    type_: Some(crate::api::MediaStreamType::Audio),
+                    index: 1,
+                    ..Default::default()
+                },
+                crate::api::MediaStream {
+                    codec: Some("subrip".to_string()),
+                    type_: Some(crate::api::MediaStreamType::Subtitle),
+                    index: 2,
+                    language: Some("fra".to_string()),
+                    is_text_subtitle_stream: true,
+                    ..Default::default()
+                },
+                crate::api::MediaStream {
+                    codec: Some("subrip".to_string()),
+                    type_: Some(crate::api::MediaStreamType::Subtitle),
+                    index: 3,
+                    language: Some("eng".to_string()),
+                    is_text_subtitle_stream: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let (id, ext) =
+            make_content_ids(db::MediaKind::Movie, "tt-sub-fallback-detail");
+        let mut media = db::Media {
+            id,
+            title: "Subtitle Fallback Detail Test".to_string(),
+            kind: db::MediaKind::Movie,
+            external_ids: ext,
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local(
+                    "test-fixture-subs-detail.mkv".into(),
+                ),
+                ..Default::default()
+            }),
+            probe_data: Some(probe),
+            streams_refreshed_at: Some(now),
+            created_at: now,
+            updated_at: now,
+            released_at: Some(now - chrono::Duration::days(365)),
+            ..Default::default()
+        };
+        media
+            .save(&ctx.db)
+            .await
+            .expect("insert_subtitle_movie failed");
+        media
+    }
+
+    /// The Items endpoint (detail page) must apply the server's global
+    /// preferred_metadata_language as a subtitle fallback when the user has no
+    /// subtitle language preference.
+    #[tokio::test]
+    async fn test_items_detail_applies_server_metadata_language_subtitle_fallback() {
+        use crate::{api::ServerConfiguration, db::Settings};
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let media = insert_subtitle_movie(ctx).await;
+
+        Settings::set_config(
+            &ctx.db,
+            &ServerConfiguration {
+                preferred_metadata_language: Some("fr".to_string()),
+                ..ServerConfiguration::default()
+            },
+        )
+        .await
+        .expect("set server config");
+
+        let resp = server
+            .get(&format!("/items/{}", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("Fields", "MediaSources")])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"][0]["DefaultSubtitleStreamIndex"].as_i64(),
+            Some(2),
+            "detail page should fall back to server preferred_metadata_language 'fr' (French subtitle, index 2) when the user has no subtitle language preference"
         );
     }
 }

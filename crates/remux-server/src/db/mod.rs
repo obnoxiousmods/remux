@@ -54,8 +54,16 @@ pub async fn connect(
     // readers. Measured: 13 concurrent `/items` requests against a 5-connection
     // pool inflated per-request latency from 57 ms to 552 ms purely from
     // waiting for a connection. Sized via `Config::db_max_connections`.
+    // In-memory SQLite databases are per-connection; a pool with >1 connection
+    // gives each connection its own independent database, making inserts on one
+    // connection invisible to queries on another. Cap to 1 for :memory: URLs.
+    let max_conns = if url.contains(":memory:") {
+        1
+    } else {
+        max_connections
+    };
     Ok(SqlitePoolOptions::new()
-        .max_connections(max_connections)
+        .max_connections(max_conns)
         .connect_with(opts)
         .await?)
 }

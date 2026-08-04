@@ -230,10 +230,16 @@ impl StreamInfo {
     /// Fill an absent explicit expiry from common absolute UNIX timestamp
     /// query parameters used by signed media URLs.
     pub fn infer_valid_until(&mut self) {
-        if self.valid_until.is_some() {
+        if self
+            .valid_until
+            .is_some()
+        {
             return;
         }
-        let Some(raw_url) = self.descriptor.as_http_url() else {
+        let Some(raw_url) = self
+            .descriptor
+            .as_http_url()
+        else {
             return;
         };
         let Ok(url) = url::Url::parse(raw_url) else {
@@ -243,13 +249,12 @@ impl StreamInfo {
             .query_pairs()
             .find_map(|(key, value)| {
                 let key = key.to_ascii_lowercase();
-                if !matches!(
-                    key.as_str(),
-                    "expires" | "expire" | "expiry" | "exp"
-                ) {
+                if !matches!(key.as_str(), "expires" | "expire" | "expiry" | "exp") {
                     return None;
                 }
-                let raw = value.parse::<i64>().ok()?;
+                let raw = value
+                    .parse::<i64>()
+                    .ok()?;
                 // A few providers serialize epoch milliseconds.
                 let seconds = if raw > 100_000_000_000 {
                     raw / 1_000
@@ -268,12 +273,14 @@ impl StreamInfo {
             | StreamDescriptor::Rtsp { .. }
             | StreamDescriptor::Torrent { .. }
             | StreamDescriptor::Opendal { .. } => true,
-            StreamDescriptor::Http { .. } => self.valid_until.is_some_and(|expiry| {
-                expiry
-                    .signed_duration_since(chrono::Utc::now())
-                    .to_std()
-                    .is_ok_and(|remaining| remaining >= duration)
-            }),
+            StreamDescriptor::Http { .. } => self
+                .valid_until
+                .is_some_and(|expiry| {
+                    expiry
+                        .signed_duration_since(chrono::Utc::now())
+                        .to_std()
+                        .is_ok_and(|remaining| remaining >= duration)
+                }),
         }
     }
 }
@@ -286,6 +293,18 @@ impl StreamInfo {
 pub trait StreamSource: Send + Sync {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response>;
 }
+
+static STREAM_PROXY_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .user_agent("remux-server/1.0")
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(20)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .build()
+            .expect("failed to build stream proxy client")
+    });
 
 pub struct HttpSource {
     pub url: String,
@@ -702,7 +721,7 @@ impl HttpSource {
 #[async_trait]
 impl StreamSource for HttpSource {
     async fn serve(&self, _state: &AppState, headers: &HeaderMap) -> Result<Response> {
-        let client = reqwest::Client::new();
+        let client = STREAM_PROXY_CLIENT.clone();
         if let Some(base) = tidal_segment_zero_url(&self.url) {
             return self
                 .serve_segmented_mp4(&client, headers, base)
@@ -1094,5 +1113,50 @@ mod tests {
         assert_eq!(&body[..], b"cDEF");
 
         server.abort();
+    }
+
+    use super::STREAM_PROXY_CLIENT;
+
+    #[test]
+    fn stream_proxy_client_builds_without_panic() {
+        let _ = &*STREAM_PROXY_CLIENT;
+    }
+
+    #[tokio::test]
+    async fn stream_proxy_client_forwards_range_and_returns_206() {
+        let server = httpmock::MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/file.mkv")
+                .header("Range", "bytes=0-1023");
+            then.status(206)
+                .header("Content-Range", "bytes 0-1023/1048576")
+                .header("Accept-Ranges", "bytes")
+                .body(b"payload".to_vec());
+        });
+
+        let resp = STREAM_PROXY_CLIENT
+            .clone()
+            .get(format!("{}/file.mkv", server.base_url()))
+            .header("Range", "bytes=0-1023")
+            .send()
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(
+            resp.status()
+                .as_u16(),
+            206
+        );
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .unwrap(),
+            "bytes 0-1023/1048576"
+        );
+        resp.text()
+            .await
+            .expect("body should drain");
     }
 }

@@ -1525,6 +1525,17 @@ impl AddonService {
                     continue;
                 }
             };
+            let resolved: Vec<_> = resolved
+                .into_iter()
+                .filter(|c| {
+                    c.media_kind
+                        .as_ref()
+                        .map_or(false, |k| kinds.contains(k))
+                })
+                .collect();
+            if resolved.is_empty() {
+                continue;
+            }
             out.push((runtime, resolved));
         }
         out
@@ -2305,11 +2316,12 @@ pub(crate) async fn fetch_probe_versions(
     )
     .await;
     if let Some(versions) = fetched.as_ref() {
-        ctx.store.save(
-            cache_key,
-            versions.clone(),
-            std::time::Duration::from_secs(24 * 60 * 60),
-        );
+        ctx.store
+            .save(
+                cache_key,
+                versions.clone(),
+                std::time::Duration::from_secs(24 * 60 * 60),
+            );
     }
     fetched
 }
@@ -2382,13 +2394,19 @@ pub(crate) fn match_probe_version<'a>(
                         source
                             .torrent_info_hash
                             .as_deref()
-                            .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(hash))
+                            .is_some_and(|candidate| {
+                                candidate
+                                    .trim()
+                                    .eq_ignore_ascii_case(hash)
+                            })
                             && source.torrent_file_idx == Some(file_idx)
                     })
             })
             .collect();
         if exact_matches.len() == 1 {
-            return exact_matches.first().copied();
+            return exact_matches
+                .first()
+                .copied();
         }
     }
 
@@ -2411,7 +2429,10 @@ pub(crate) fn match_probe_version<'a>(
                                 || source
                                     .indexer
                                     .as_deref()
-                                    .zip(si.usenet_indexer.as_deref())
+                                    .zip(
+                                        si.usenet_indexer
+                                            .as_deref(),
+                                    )
                                     .is_some_and(|(left, right)| {
                                         left.eq_ignore_ascii_case(right)
                                     }))
@@ -2419,7 +2440,9 @@ pub(crate) fn match_probe_version<'a>(
             })
             .collect();
         if matches.len() == 1 {
-            return matches.first().copied();
+            return matches
+                .first()
+                .copied();
         }
     }
 
@@ -2429,17 +2452,38 @@ pub(crate) fn match_probe_version<'a>(
 fn inherit_missing_item_chapters(sources: &mut [db::Media]) -> usize {
     let donor = sources
         .iter()
-        .filter_map(|source| source.probe_data.as_ref())
-        .filter(|probe| !probe.virtual_chapters && !probe.chapters.is_empty())
-        .max_by_key(|probe| probe.chapters.len())
+        .filter_map(|source| {
+            source
+                .probe_data
+                .as_ref()
+        })
+        .filter(|probe| {
+            !probe.virtual_chapters
+                && !probe
+                    .chapters
+                    .is_empty()
+        })
+        .max_by_key(|probe| {
+            probe
+                .chapters
+                .len()
+        })
         .map(|probe| {
             (
-                probe.chapters.clone(),
-                probe.segments.clone(),
+                probe
+                    .chapters
+                    .clone(),
+                probe
+                    .segments
+                    .clone(),
                 probe
                     .chapter_source_content_hash
                     .clone()
-                    .or_else(|| probe.content_hash.clone()),
+                    .or_else(|| {
+                        probe
+                            .content_hash
+                            .clone()
+                    }),
             )
         });
     let Some((chapters, segments, donor_content_hash)) = donor else {
@@ -2451,14 +2495,20 @@ fn inherit_missing_item_chapters(sources: &mut [db::Media]) -> usize {
         let probe = source
             .probe_data
             .get_or_insert_with(Default::default);
-        if !probe.chapters.is_empty() {
+        if !probe
+            .chapters
+            .is_empty()
+        {
             continue;
         }
         probe.chapters = chapters.clone();
         probe.virtual_chapters = false;
         probe.chapters_inherited = true;
         probe.chapter_source_content_hash = donor_content_hash.clone();
-        if probe.segments.is_none() {
+        if probe
+            .segments
+            .is_none()
+        {
             probe.segments = segments.clone();
         }
         inherited += 1;
@@ -2634,11 +2684,12 @@ impl AddonService {
         };
         info!(streams = deduped.len(), ?sources, elapsed = ?instant.elapsed(), "streams synced");
         if deduped.is_empty() {
-            ctx.store.save(
-                negative_cache_key,
-                true,
-                Duration::from_secs(NEGATIVE_REFRESH_TTL_SECS),
-            );
+            ctx.store
+                .save(
+                    negative_cache_key,
+                    true,
+                    Duration::from_secs(NEGATIVE_REFRESH_TTL_SECS),
+                );
             return Ok(());
         }
 
@@ -2690,7 +2741,10 @@ impl AddonService {
             let Some(raw_probe) = raw_probe else {
                 continue;
             };
-            if raw_probe.trim().eq_ignore_ascii_case("null") {
+            if raw_probe
+                .trim()
+                .eq_ignore_ascii_case("null")
+            {
                 continue;
             }
             match serde_json::from_str::<api::MediaSourceInfo>(&raw_probe) {
@@ -2707,7 +2761,10 @@ impl AddonService {
             }
         }
         for source in &mut sources {
-            if source.probe_data.is_none() {
+            if source
+                .probe_data
+                .is_none()
+            {
                 source.probe_data = existing_probes
                     .get(&source.id)
                     .cloned();
@@ -2998,7 +3055,11 @@ mod tests {
         }
     }
 
-    fn remuxdb_version(filename: &str, info_hash: &str, file_idx: i32) -> remuxdb::MediaInfo {
+    fn remuxdb_version(
+        filename: &str,
+        info_hash: &str,
+        file_idx: i32,
+    ) -> remuxdb::MediaInfo {
         remuxdb::MediaInfo {
             content_hash: None,
             container: Some("mkv".to_string()),
@@ -3033,7 +3094,11 @@ mod tests {
         }
     }
 
-    fn unprobed_source(filename: &str, info_hash: Option<&str>, file_idx: Option<i32>) -> db::Media {
+    fn unprobed_source(
+        filename: &str,
+        info_hash: Option<&str>,
+        file_idx: Option<i32>,
+    ) -> db::Media {
         db::Media {
             stream_info: Some(crate::stream::StreamInfo {
                 filename: Some(filename.to_string()),
@@ -3058,13 +3123,18 @@ mod tests {
             .probe_data
             .as_ref()
             .expect("probe data applied");
-        assert!(probe
-            .media_streams
-            .iter()
-            .any(|stream| {
-                stream.language.as_deref() == Some("eng")
-                    && stream.channels == Some(6)
-            }));
+        assert!(
+            probe
+                .media_streams
+                .iter()
+                .any(|stream| {
+                    stream
+                        .language
+                        .as_deref()
+                        == Some("eng")
+                        && stream.channels == Some(6)
+                })
+        );
 
         // Existing probe data is never overwritten.
         assert_eq!(apply_probe_versions(&versions, &mut sources), 0);
@@ -3076,16 +3146,20 @@ mod tests {
         ];
         let mut sources = vec![unprobed_source(filename, Some(info_hash), Some(3))];
         assert_eq!(apply_probe_versions(&ambiguous, &mut sources), 0);
-        assert!(sources[0]
-            .probe_data
-            .is_none());
+        assert!(
+            sources[0]
+                .probe_data
+                .is_none()
+        );
 
         // A matching filename without a strong source identity never hydrates.
         let mut sources = vec![unprobed_source(filename, None, None)];
         assert_eq!(apply_probe_versions(&versions, &mut sources), 0);
-        assert!(sources[0]
-            .probe_data
-            .is_none());
+        assert!(
+            sources[0]
+                .probe_data
+                .is_none()
+        );
     }
 
     // Simulates the refresh_meta accumulation: patch multiple addon results

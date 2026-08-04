@@ -12,14 +12,12 @@ fn main() {
 
     let dashboard_dir =
         workspace_root.join("target/dx/remux-dashboard/release/web/public");
+    println!("cargo:rerun-if-changed={}", dashboard_dir.display());
     if dashboard_dir.exists() {
         let path = dashboard_dir
             .canonicalize()
             .unwrap();
-        let path_str = path
-            .to_str()
-            .unwrap()
-            .replace('\\', "/");
+        let path_str = canonicalize_for_include(&path);
         std::fs::write(
             out_dir.join("dashboard_embed.rs"),
             format!(r#"static DASHBOARD: include_dir::Dir<'static> = include_dir::include_dir!("{path_str}");"#),
@@ -32,15 +30,21 @@ fn main() {
         );
     }
 
-    let jellyfin_web_dir = workspace_root.join("jellyfin-web/dist");
+    // Accept either jellyfin-web/dist (local npm build) or jellyfin-web/ (CI artifact layout).
+    let jellyfin_web_dir = ["jellyfin-web/dist", "jellyfin-web"]
+        .iter()
+        .map(|p| workspace_root.join(p))
+        .find(|p| {
+            p.join("index.html")
+                .exists()
+        })
+        .unwrap_or_else(|| workspace_root.join("jellyfin-web/dist"));
+    println!("cargo:rerun-if-changed={}", jellyfin_web_dir.display());
     if jellyfin_web_dir.exists() {
         let path = jellyfin_web_dir
             .canonicalize()
             .unwrap();
-        let path_str = path
-            .to_str()
-            .unwrap()
-            .replace('\\', "/");
+        let path_str = canonicalize_for_include(&path);
         std::fs::write(
             out_dir.join("jellyfin_web_embed.rs"),
             format!(r#"static JELLYFIN_WEB: include_dir::Dir<'static> = include_dir::include_dir!("{path_str}");"#),
@@ -52,4 +56,18 @@ fn main() {
             "cargo:warning=jellyfin-web not built — run `cargo make jellyfin-web` first"
         );
     }
+}
+
+/// Convert a canonicalized path to a forward-slash string suitable for `include_dir!`.
+/// On Windows, `canonicalize` returns a UNC path like `\\?\C:\...` which becomes
+/// `//?/C:/...` after naive backslash replacement — not a valid path for the macro.
+/// Strip the UNC prefix so we get a plain `C:/...` path instead.
+fn canonicalize_for_include(path: &std::path::Path) -> String {
+    let s = path
+        .to_str()
+        .unwrap()
+        .replace('\\', "/");
+    // Strip Windows extended-length path prefix \\?\ (→ //?/ after replacement).
+    s.trim_start_matches("//?/")
+        .to_string()
 }

@@ -72,7 +72,9 @@ impl Task for CleanTranscodeFolderTask {
                 // starting session rather than an orphan. Reaping it mid-startup
                 // kills the transcode and (previously) got misread as a hardware
                 // encoder failure. Leave recent dirs for the next run.
-                if dir_age_secs(&entry.path()).is_some_and(|age| age < ORPHAN_GRACE_SECS) {
+                if dir_age_secs(&entry.path())
+                    .is_some_and(|age| age < ORPHAN_GRACE_SECS)
+                {
                     continue;
                 }
                 // Kill any orphaned ffmpeg process before removing the dir.

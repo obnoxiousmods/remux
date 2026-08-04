@@ -713,28 +713,59 @@ pub struct TelemetryRecommendationEventRequest {
 }
 
 fn valid_recommendation_event(event: &TelemetryRecommendationEventRequest) -> bool {
-    let action_has_item = matches!(event.event.as_str(), "item-opened" | "play-requested");
+    let action_has_item = matches!(
+        event
+            .event
+            .as_str(),
+        "item-opened" | "play-requested"
+    );
     matches!(
-        event.event.as_str(),
+        event
+            .event
+            .as_str(),
         "shelf-impression" | "item-opened" | "play-requested"
-    ) && matches!(event.media_kind.as_str(), "Movie" | "Series")
-        && matches!(
-            event.recommendation_type.as_str(),
-            "SimilarToRecentlyPlayed"
-                | "SimilarToLikedItem"
-                | "HasDirectorFromRecentlyPlayed"
-                | "HasActorFromRecentlyPlayed"
-                | "HasLikedDirector"
-                | "HasLikedActor"
-                | "MatchesUserTaste"
-                | "Popular"
-                | "RecentlyAdded"
-        )
-        && !event.session_key.trim().is_empty()
-        && event.session_key.len() <= 160
-        && !event.category_id.trim().is_empty()
-        && event.category_id.len() <= 160
-        && (!action_has_item || event.item_id.as_deref().is_some_and(|id| !id.trim().is_empty()))
+    ) && matches!(
+        event
+            .media_kind
+            .as_str(),
+        "Movie" | "Series"
+    ) && matches!(
+        event
+            .recommendation_type
+            .as_str(),
+        "SimilarToRecentlyPlayed"
+            | "SimilarToLikedItem"
+            | "HasDirectorFromRecentlyPlayed"
+            | "HasActorFromRecentlyPlayed"
+            | "HasLikedDirector"
+            | "HasLikedActor"
+            | "MatchesUserTaste"
+            | "Popular"
+            | "RecentlyAdded"
+    ) && !event
+        .session_key
+        .trim()
+        .is_empty()
+        && event
+            .session_key
+            .len()
+            <= 160
+        && !event
+            .category_id
+            .trim()
+            .is_empty()
+        && event
+            .category_id
+            .len()
+            <= 160
+        && (!action_has_item
+            || event
+                .item_id
+                .as_deref()
+                .is_some_and(|id| {
+                    !id.trim()
+                        .is_empty()
+                }))
 }
 
 #[post("/remux/telemetry/recommendation")]
@@ -743,7 +774,11 @@ pub async fn telemetry_recommendation_event(
     session: auth::AuthSession,
     Json(event): Json<TelemetryRecommendationEventRequest>,
 ) -> Result<impl IntoResponse> {
-    if !state.ctx.config.telemetry_enabled {
+    if !state
+        .ctx
+        .config
+        .telemetry_enabled
+    {
         return Ok(StatusCode::NO_CONTENT);
     }
     if !valid_recommendation_event(&event) {

@@ -177,7 +177,8 @@ impl From<db::Media> for api::MediaSourceInfo {
                 descriptor
                     .and_then(|d| d.as_http_url())
                     .and_then(infer_container_from_url)
-            });
+            })
+            .unwrap_or_else(|| fallback_container_for_media_kind(source.kind));
 
         let remux = Some(api::MediaSourceRemuxInfo {
             provider_info: source
@@ -242,18 +243,8 @@ impl From<db::Media> for api::MediaSourceInfo {
             .runtime
             .and_then(|r| r.to_ticks(common::TickUnit::Seconds));
         let run_time_ticks = probe_ticks.or(meta_ticks);
-        let probe_bitrate = source
-            .probe_data
-            .as_ref()
-            .and_then(|p| p.bitrate);
-        let probe_size = source
-            .probe_data
-            .as_ref()
-            .and_then(|p| p.size);
         let (
             mut media_streams,
-            default_audio_stream_index,
-            default_subtitle_stream_index,
             chapters,
             virtual_chapters,
             chapters_inherited,
@@ -262,11 +253,15 @@ impl From<db::Media> for api::MediaSourceInfo {
             segments,
         ) = source
             .probe_data
-            .map(|p| {
+            .map(|mut p| {
+                for stream in &mut p.media_streams {
+                    if matches!(stream.type_, Some(api::MediaStreamType::Subtitle)) {
+                        stream.is_text_subtitle_stream =
+                            stream.is_text_subtitle_stream();
+                    }
+                }
                 (
                     p.media_streams,
-                    p.default_audio_stream_index,
-                    p.default_subtitle_stream_index,
                     p.chapters,
                     p.virtual_chapters,
                     p.chapters_inherited,
@@ -356,8 +351,6 @@ impl From<db::Media> for api::MediaSourceInfo {
             formats: vec![],
             required_http_headers: HashMap::new(),
             run_time_ticks,
-            bitrate: probe_bitrate,
-            size: probe_size,
             media_streams,
             chapters,
             virtual_chapters,
@@ -365,8 +358,9 @@ impl From<db::Media> for api::MediaSourceInfo {
             chapter_source_content_hash,
             content_hash,
             segments,
-            default_audio_stream_index,
-            default_subtitle_stream_index,
+            // `default_audio_stream_index` / `default_subtitle_stream_index` are
+            // derived per request via `MediaSourceInfo::resolve_default_streams`;
+            // stored probe data never carries them.
             ..Default::default()
         }
     }
