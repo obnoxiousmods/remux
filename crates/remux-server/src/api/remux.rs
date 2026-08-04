@@ -710,6 +710,10 @@ pub struct TelemetryRecommendationEventRequest {
     pub item_id: Option<String>,
     pub item_position: Option<u32>,
     pub shuffle_seed: u64,
+    pub feed_id: Option<String>,
+    pub algorithm_version: Option<u32>,
+    pub profile_mode: Option<String>,
+    pub personalization: Option<String>,
 }
 
 fn valid_recommendation_event(event: &TelemetryRecommendationEventRequest) -> bool {
@@ -766,6 +770,28 @@ fn valid_recommendation_event(event: &TelemetryRecommendationEventRequest) -> bo
                     !id.trim()
                         .is_empty()
                 }))
+        && event
+            .feed_id
+            .as_deref()
+            .is_none_or(|value| {
+                !value
+                    .trim()
+                    .is_empty()
+                    && value.len() <= 160
+            })
+        && event
+            .algorithm_version
+            .is_none_or(|value| value > 0 && value <= 1_000)
+        && event
+            .profile_mode
+            .as_deref()
+            .is_none_or(|value| {
+                matches!(value, "cold_start" | "blended" | "personalized")
+            })
+        && event
+            .personalization
+            .as_deref()
+            .is_none_or(|value| matches!(value, "generic" | "personalized"))
 }
 
 #[post("/remux/telemetry/recommendation")]
@@ -786,8 +812,8 @@ pub async fn telemetry_recommendation_event(
     }
     sqlx::query(
         "INSERT INTO telemetry_recommendation_events \
-         (session_key, event, category_id, recommendation_type, baseline_item_id, baseline_item_name, media_kind, shelf_position, item_id, item_position, shuffle_seed, user_id, device_id, device_name, client_name, client_version) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (session_key, event, category_id, recommendation_type, baseline_item_id, baseline_item_name, media_kind, shelf_position, item_id, item_position, shuffle_seed, feed_id, algorithm_version, profile_mode, personalization, user_id, device_id, device_name, client_name, client_version) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(event.session_key.trim())
     .bind(&event.event)
@@ -800,6 +826,10 @@ pub async fn telemetry_recommendation_event(
     .bind(event.item_id.map(|value| value.chars().take(160).collect::<String>()))
     .bind(event.item_position)
     .bind(event.shuffle_seed.to_string())
+    .bind(event.feed_id.map(|value| value.chars().take(160).collect::<String>()))
+    .bind(event.algorithm_version)
+    .bind(event.profile_mode)
+    .bind(event.personalization)
     .bind(session.user.id.to_string())
     .bind(&session.device.id)
     .bind(&session.device.name)
@@ -1174,6 +1204,10 @@ mod tests {
             item_id: None,
             item_position: None,
             shuffle_seed: 42,
+            feed_id: Some("feed".to_string()),
+            algorithm_version: Some(1),
+            profile_mode: Some("blended".to_string()),
+            personalization: Some("personalized".to_string()),
         };
         assert!(valid_recommendation_event(&event));
         event.event = "play-requested".to_string();

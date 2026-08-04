@@ -10,6 +10,7 @@ use moka::sync::Cache;
 use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::StdRng};
 use remux_macros::{get, query};
+use serde::Serialize;
 use sqlx::QueryBuilder;
 use uuid::Uuid;
 
@@ -24,6 +25,79 @@ pub struct GetMovieRecommendationsQuery {
     pub item_limit: Option<u32>,
     pub shuffle: Option<bool>,
     pub shuffle_seed: Option<u64>,
+}
+
+#[query]
+#[derive(Debug, Default)]
+pub struct GetHomeRecommendationsQuery {
+    pub user_id: Option<Uuid>,
+    pub row_limit: Option<u32>,
+    pub item_limit: Option<u32>,
+    pub seed: Option<u64>,
+    pub include_movies: Option<bool>,
+    pub include_series: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeRecommendationProfileMode {
+    ColdStart,
+    Blended,
+    Personalized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeRecommendationPersonalization {
+    Generic,
+    Personalized,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct HomeRecommendationRow {
+    pub category_id: Uuid,
+    pub title: String,
+    pub recommendation_type: api::RecommendationType,
+    pub personalization: HomeRecommendationPersonalization,
+    pub media_kind: String,
+    pub baseline_item_name: Option<String>,
+    pub baseline_item_id: Option<Uuid>,
+    pub rank: usize,
+    pub items: Vec<api::BaseItemDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct HomeRecommendationsResponse {
+    pub algorithm_version: u32,
+    pub feed_id: Uuid,
+    pub seed: u64,
+    pub profile_mode: HomeRecommendationProfileMode,
+    pub confidence: f64,
+    pub rows: Vec<HomeRecommendationRow>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HomeRecommendationCacheKey {
+    user_id: Uuid,
+    row_limit: usize,
+    item_limit: u32,
+    seed: u64,
+    include_movies: bool,
+    include_series: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HomeRecommendationCandidate {
+    category_id: Uuid,
+    title: String,
+    recommendation_type: api::RecommendationType,
+    personalization: HomeRecommendationPersonalization,
+    media_kind: String,
+    baseline_item_name: Option<String>,
+    baseline_item_id: Option<Uuid>,
+    items: Vec<api::BaseItemDto>,
 }
 
 const DEFAULT_RECOMMENDATION_CATEGORY_LIMIT: u32 = 5;
@@ -64,8 +138,18 @@ static RECOMMENDATION_CACHE: LazyLock<
         .build()
 });
 
+static HOME_RECOMMENDATION_CACHE: LazyLock<
+    Cache<HomeRecommendationCacheKey, HomeRecommendationsResponse>,
+> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(256)
+        .time_to_live(Duration::from_secs(300))
+        .build()
+});
+
 pub(crate) fn invalidate_recommendation_cache() {
     RECOMMENDATION_CACHE.invalidate_all();
+    HOME_RECOMMENDATION_CACHE.invalidate_all();
 }
 
 #[get("/movies/recommendations")]
@@ -112,6 +196,623 @@ pub async fn movies_recommendations(
         "built recommendations",
     );
     Ok(Json(categories))
+}
+
+#[get("/remux/home/recommendations")]
+pub async fn home_recommendations(
+    State(state): State<AppState>,
+    session: AuthSession,
+    Query(q): Query<GetHomeRecommendationsQuery>,
+) -> Result<impl IntoResponse> {
+    let user_id = q
+        .user_id
+        .unwrap_or(
+            session
+                .user
+                .id,
+        );
+    super::users::require_self_or_admin(user_id, &session)?;
+    let row_limit = q
+        .row_limit
+        .unwrap_or(12)
+        .clamp(1, 12) as usize;
+    let item_limit = q
+        .item_limit
+        .unwrap_or(12)
+        .clamp(5, 12);
+    let seed = q
+        .seed
+        .unwrap_or(0);
+    let include_movies = q
+        .include_movies
+        .unwrap_or(true);
+    let include_series = q
+        .include_series
+        .unwrap_or(true);
+    let cache_key = HomeRecommendationCacheKey {
+        user_id,
+        row_limit,
+        item_limit,
+        seed,
+        include_movies,
+        include_series,
+    };
+    if let Some(cached) = HOME_RECOMMENDATION_CACHE.get(&cache_key) {
+        return Ok(Json(cached));
+    }
+
+    let started = Instant::now();
+    let db = &state
+        .ctx
+        .db;
+    let movie_seed = seed ^ 0x4d4f_5649;
+    let series_seed = seed ^ 0x5345_5249;
+    let (profile_score, movie_rows, series_rows, movie_generic, series_generic) = tokio::try_join!(
+        home_recommendation_profile_score(db, user_id),
+        async {
+            if include_movies {
+                build_recommendations(
+                    db,
+                    user_id,
+                    None,
+                    db::MediaKind::Movie,
+                    row_limit,
+                    item_limit,
+                    true,
+                    movie_seed,
+                )
+                .await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        async {
+            if include_series {
+                build_recommendations(
+                    db,
+                    user_id,
+                    None,
+                    db::MediaKind::Series,
+                    row_limit,
+                    item_limit,
+                    true,
+                    series_seed,
+                )
+                .await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        async {
+            if include_movies {
+                build_generic_home_candidates(
+                    db,
+                    user_id,
+                    db::MediaKind::Movie,
+                    row_limit,
+                    item_limit,
+                )
+                .await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        async {
+            if include_series {
+                build_generic_home_candidates(
+                    db,
+                    user_id,
+                    db::MediaKind::Series,
+                    row_limit,
+                    item_limit,
+                )
+                .await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+    )?;
+
+    let confidence = (profile_score / 15.0).clamp(0.0, 1.0);
+    let profile_mode = home_profile_mode(profile_score);
+    let personalized_target =
+        personalized_home_row_target(profile_mode, confidence, row_limit);
+    let movie_rows = recommendation_dtos_to_home_candidates(movie_rows, "Movie");
+    let series_rows = recommendation_dtos_to_home_candidates(series_rows, "Series");
+    let all_existing = interleave_home_candidates(movie_rows, series_rows);
+    let (personalized, existing_generic): (Vec<_>, Vec<_>) = all_existing
+        .into_iter()
+        .partition(|row| {
+            row.personalization == HomeRecommendationPersonalization::Personalized
+        });
+    let generic = interleave_home_candidates(movie_generic, series_generic)
+        .into_iter()
+        .chain(existing_generic)
+        .collect();
+    let scheduled =
+        schedule_home_candidates(personalized, generic, personalized_target, row_limit);
+    let rows = finalize_home_rows(scheduled, row_limit, item_limit as usize);
+    let feed_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!("remux-home-v1:{user_id}:{seed}").as_bytes(),
+    );
+    let response = HomeRecommendationsResponse {
+        algorithm_version: 1,
+        feed_id,
+        seed,
+        profile_mode,
+        confidence,
+        rows,
+    };
+    tracing::debug!(
+        target: "remux_server::recommendations",
+        user_id = %user_id,
+        profile_score,
+        confidence,
+        profile_mode = ?profile_mode,
+        row_count = response.rows.len(),
+        item_count = response.rows.iter().map(|row| row.items.len()).sum::<usize>(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "built unified home recommendations",
+    );
+    HOME_RECOMMENDATION_CACHE.insert(cache_key, response.clone());
+    Ok(Json(response))
+}
+
+fn home_profile_mode(score: f64) -> HomeRecommendationProfileMode {
+    if score < 3.0 {
+        HomeRecommendationProfileMode::ColdStart
+    } else if score < 15.0 {
+        HomeRecommendationProfileMode::Blended
+    } else {
+        HomeRecommendationProfileMode::Personalized
+    }
+}
+
+fn personalized_home_row_target(
+    mode: HomeRecommendationProfileMode,
+    confidence: f64,
+    row_limit: usize,
+) -> usize {
+    match mode {
+        HomeRecommendationProfileMode::ColdStart => 0,
+        HomeRecommendationProfileMode::Blended => ((confidence * 10.0).round()
+            as usize)
+            .clamp(2, 9)
+            .min(row_limit.saturating_sub(2)),
+        HomeRecommendationProfileMode::Personalized => row_limit.saturating_sub(2),
+    }
+}
+
+async fn home_recommendation_profile_score(
+    db: &sqlx::SqlitePool,
+    user_id: Uuid,
+) -> Result<f64> {
+    let score = sqlx::query_scalar::<_, f64>(
+        r#"WITH raw_signals(title_id, weight) AS (
+             SELECT COALESCE(m.grandparent_id, m.id, hex(wh.media_id)),
+                    MAX(CASE
+                      WHEN wh.completed = 1 THEN 1.0
+                      WHEN wh.runtime_seconds > 0
+                       AND wh.position_ticks >= wh.runtime_seconds * 2000000 THEN 0.5
+                      ELSE 0.0 END)
+             FROM watch_history wh
+             LEFT JOIN media m ON m.id = wh.media_id
+             WHERE wh.user_id = ?
+             GROUP BY COALESCE(m.grandparent_id, m.id, hex(wh.media_id))
+             UNION ALL
+             SELECT COALESCE(m.grandparent_id, m.id, hex(ums.media_id)),
+                    MAX(CASE
+                      WHEN ums.favorite > 0 THEN 2.0
+                      WHEN ums.play_count > 0 THEN 1.0
+                      WHEN ums.playback_position > 0 THEN 0.5
+                      ELSE 0.0 END)
+             FROM user_media_state ums
+             LEFT JOIN media m ON m.id = ums.media_id
+             WHERE ums.user_id = ?
+             GROUP BY COALESCE(m.grandparent_id, m.id, hex(ums.media_id))
+           ), per_title AS (
+             SELECT title_id, MAX(weight) AS weight
+             FROM raw_signals
+             GROUP BY title_id
+           )
+           SELECT COALESCE(SUM(weight), 0.0) FROM per_title"#,
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .fetch_one(db)
+    .await?;
+    Ok(score)
+}
+
+fn recommendation_dtos_to_home_candidates(
+    categories: Vec<api::RecommendationDto>,
+    media_kind: &str,
+) -> Vec<HomeRecommendationCandidate> {
+    categories
+        .into_iter()
+        .enumerate()
+        .map(|(index, category)| {
+            let personalization = match category.recommendation_type {
+                api::RecommendationType::Popular
+                | api::RecommendationType::RecentlyAdded => {
+                    HomeRecommendationPersonalization::Generic
+                }
+                _ => HomeRecommendationPersonalization::Personalized,
+            };
+            let category_id = category
+                .category_id
+                .unwrap_or_else(|| {
+                    Uuid::new_v5(
+                        &Uuid::NAMESPACE_OID,
+                        format!(
+                            "home:{media_kind}:{:?}:{}:{index}",
+                            category.recommendation_type,
+                            category
+                                .baseline_item_name
+                                .as_deref()
+                                .unwrap_or("")
+                        )
+                        .as_bytes(),
+                    )
+                });
+            let title = home_recommendation_title(
+                &category.recommendation_type,
+                category
+                    .baseline_item_name
+                    .as_deref(),
+                media_kind,
+            );
+            HomeRecommendationCandidate {
+                category_id,
+                title,
+                recommendation_type: category.recommendation_type,
+                personalization,
+                media_kind: media_kind.to_string(),
+                baseline_item_name: category.baseline_item_name,
+                baseline_item_id: category.baseline_item_id,
+                items: category.items,
+            }
+        })
+        .collect()
+}
+
+fn home_recommendation_title(
+    recommendation_type: &api::RecommendationType,
+    baseline: Option<&str>,
+    media_kind: &str,
+) -> String {
+    let noun = if media_kind == "Series" {
+        "TV Shows"
+    } else {
+        "Movies"
+    };
+    match recommendation_type {
+        api::RecommendationType::SimilarToRecentlyPlayed => baseline
+            .map(|value| format!("Because You Watched {value}"))
+            .unwrap_or_else(|| format!("More {noun} for You")),
+        api::RecommendationType::SimilarToLikedItem => baseline
+            .map(|value| format!("Because You Liked {value}"))
+            .unwrap_or_else(|| format!("Favorites Like Yours")),
+        api::RecommendationType::HasDirectorFromRecentlyPlayed
+        | api::RecommendationType::HasLikedDirector => baseline
+            .map(|value| format!("From Director {value}"))
+            .unwrap_or_else(|| "Acclaimed Directors".to_string()),
+        api::RecommendationType::HasActorFromRecentlyPlayed
+        | api::RecommendationType::HasLikedActor => baseline
+            .map(|value| format!("Featuring {value}"))
+            .unwrap_or_else(|| "Familiar Faces".to_string()),
+        api::RecommendationType::Popular => format!("Popular {noun}"),
+        api::RecommendationType::RecentlyAdded => format!("Recently Added {noun}"),
+        api::RecommendationType::MatchesUserTaste => baseline
+            .map(|value| format!("{} for You", humanize_home_tag(value)))
+            .unwrap_or_else(|| format!("Recommended {noun}")),
+    }
+}
+
+fn humanize_home_tag(value: &str) -> String {
+    value
+        .split(|character: char| {
+            character == '-' || character == '_' || character.is_whitespace()
+        })
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            match characters.next() {
+                Some(first) => {
+                    first
+                        .to_uppercase()
+                        .collect::<String>()
+                        + characters.as_str()
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn build_generic_home_candidates(
+    db: &sqlx::SqlitePool,
+    user_id: Uuid,
+    kind: db::MediaKind,
+    row_limit: usize,
+    item_limit: u32,
+) -> Result<Vec<HomeRecommendationCandidate>> {
+    let fetch_limit = (row_limit as u32)
+        .saturating_mul(item_limit)
+        .saturating_mul(3)
+        .clamp(48, 432);
+    let common_filter = db::MediaFilter {
+        kind: Some(vec![kind.clone()]),
+        user_state: Some(db::UserMediaStateFilter {
+            user_id: Some(user_id),
+            played: Some(false),
+            ..Default::default()
+        }),
+        limit: Some(fetch_limit),
+        total_count: false,
+        ..Default::default()
+    };
+    let popular_filter = db::MediaFilter {
+        sort_by: vec![api::ItemSortBy::CommunityRating],
+        sort_order: vec![api::SortOrder::Descending],
+        ..common_filter.clone()
+    };
+    let recent_filter = db::MediaFilter {
+        sort_by: vec![api::ItemSortBy::DateCreated],
+        sort_order: vec![api::SortOrder::Descending],
+        ..common_filter
+    };
+    let (popular, recent) = tokio::try_join!(
+        db::Media::get_by_filter(db, &popular_filter),
+        db::Media::get_by_filter(db, &recent_filter),
+    )?;
+    let popular = popular.records;
+    let recent = recent.records;
+    let media_kind = match kind {
+        db::MediaKind::Series => "Series",
+        _ => "Movie",
+    };
+    let noun = if media_kind == "Series" {
+        "TV Shows"
+    } else {
+        "Movies"
+    };
+    let mut categories = Vec::new();
+    categories.push(generic_home_candidate(
+        media_kind,
+        format!("Popular {noun}"),
+        "popular",
+        api::RecommendationType::Popular,
+        popular
+            .iter()
+            .take(item_limit as usize)
+            .cloned()
+            .collect(),
+    ));
+    categories.push(generic_home_candidate(
+        media_kind,
+        format!("Recently Added {noun}"),
+        "recently-added",
+        api::RecommendationType::RecentlyAdded,
+        recent
+            .iter()
+            .take(item_limit as usize)
+            .cloned()
+            .collect(),
+    ));
+
+    let mut tag_counts: HashMap<String, usize> = HashMap::new();
+    for media in popular
+        .iter()
+        .chain(recent.iter())
+    {
+        let mut seen = HashSet::new();
+        for tag in &media.tags {
+            if let Some(tag) = clean_recommendation_tag(tag) {
+                if is_strong_taste_row_tag(&tag) && seen.insert(tag.clone()) {
+                    *tag_counts
+                        .entry(tag)
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut ranked_tags: Vec<_> = tag_counts
+        .into_iter()
+        .filter(|(_, count)| *count >= 5)
+        .collect();
+    ranked_tags.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| {
+                left.0
+                    .cmp(&right.0)
+            })
+    });
+    for (tag, _) in ranked_tags
+        .into_iter()
+        .take(row_limit.saturating_sub(2))
+    {
+        let mut seen = HashSet::new();
+        let items: Vec<_> = popular
+            .iter()
+            .chain(recent.iter())
+            .filter(|media| {
+                seen.insert(media.id)
+                    && media
+                        .tags
+                        .iter()
+                        .any(|candidate| {
+                            clean_recommendation_tag(candidate).as_deref()
+                                == Some(tag.as_str())
+                        })
+            })
+            .take(item_limit as usize)
+            .cloned()
+            .collect();
+        if items.len() >= 5 {
+            let title = format!("{} {noun}", humanize_home_tag(&tag));
+            categories.push(generic_home_candidate(
+                media_kind,
+                title,
+                &format!("tag:{tag}"),
+                api::RecommendationType::Popular,
+                items,
+            ));
+        }
+    }
+    Ok(categories)
+}
+
+fn generic_home_candidate(
+    media_kind: &str,
+    title: String,
+    identity: &str,
+    recommendation_type: api::RecommendationType,
+    items: Vec<db::Media>,
+) -> HomeRecommendationCandidate {
+    HomeRecommendationCandidate {
+        category_id: Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("remux-home:{media_kind}:{identity}").as_bytes(),
+        ),
+        title,
+        recommendation_type,
+        personalization: HomeRecommendationPersonalization::Generic,
+        media_kind: media_kind.to_string(),
+        baseline_item_name: None,
+        baseline_item_id: None,
+        items: items
+            .into_iter()
+            .map(|media| api::db_media_to_item(media, false))
+            .collect(),
+    }
+}
+
+fn interleave_home_candidates(
+    left: Vec<HomeRecommendationCandidate>,
+    right: Vec<HomeRecommendationCandidate>,
+) -> Vec<HomeRecommendationCandidate> {
+    let mut result = Vec::with_capacity(left.len() + right.len());
+    let mut left = left.into_iter();
+    let mut right = right.into_iter();
+    loop {
+        let mut added = false;
+        if let Some(row) = left.next() {
+            result.push(row);
+            added = true;
+        }
+        if let Some(row) = right.next() {
+            result.push(row);
+            added = true;
+        }
+        if !added {
+            break;
+        }
+    }
+    result
+}
+
+fn schedule_home_candidates(
+    personalized: Vec<HomeRecommendationCandidate>,
+    generic: Vec<HomeRecommendationCandidate>,
+    personalized_target: usize,
+    row_limit: usize,
+) -> Vec<HomeRecommendationCandidate> {
+    let personalized_slots: HashSet<usize> = if personalized_target == 0 {
+        HashSet::new()
+    } else {
+        (0..personalized_target)
+            .map(|index| index * row_limit / personalized_target)
+            .collect()
+    };
+    let mut personalized = personalized
+        .into_iter()
+        .take(personalized_target);
+    let mut generic = generic.into_iter();
+    let mut scheduled = Vec::new();
+    for position in 0..row_limit {
+        let next = if personalized_slots.contains(&position) {
+            personalized
+                .next()
+                .or_else(|| generic.next())
+        } else {
+            generic
+                .next()
+                .or_else(|| personalized.next())
+        };
+        if let Some(row) = next {
+            scheduled.push(row);
+        }
+    }
+    scheduled.extend(personalized);
+    scheduled.extend(generic);
+    scheduled
+}
+
+fn finalize_home_rows(
+    candidates: Vec<HomeRecommendationCandidate>,
+    row_limit: usize,
+    item_limit: usize,
+) -> Vec<HomeRecommendationRow> {
+    let mut item_counts: HashMap<String, usize> = HashMap::new();
+    let mut previous_row_items = HashSet::new();
+    let mut seen_categories = HashSet::new();
+    let mut rows = Vec::with_capacity(row_limit);
+    for candidate in candidates {
+        if rows.len() >= row_limit || !seen_categories.insert(candidate.category_id) {
+            continue;
+        }
+        let mut row_seen = HashSet::new();
+        let items: Vec<_> = candidate
+            .items
+            .into_iter()
+            .filter(|item| {
+                let id = item
+                    .id
+                    .to_string()
+                    .to_lowercase();
+                row_seen.insert(id.clone())
+                    && !previous_row_items.contains(&id)
+                    && item_counts
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(0)
+                        < 2
+            })
+            .take(item_limit)
+            .collect();
+        if items.len() < 5 {
+            continue;
+        }
+        previous_row_items.clear();
+        for item in &items {
+            let id = item
+                .id
+                .to_string()
+                .to_lowercase();
+            previous_row_items.insert(id.clone());
+            *item_counts
+                .entry(id)
+                .or_insert(0) += 1;
+        }
+        let rank = rows.len();
+        rows.push(HomeRecommendationRow {
+            category_id: candidate.category_id,
+            title: candidate.title,
+            recommendation_type: candidate.recommendation_type,
+            personalization: candidate.personalization,
+            media_kind: candidate.media_kind,
+            baseline_item_name: candidate.baseline_item_name,
+            baseline_item_id: candidate.baseline_item_id,
+            rank,
+            items,
+        });
+    }
+    rows
 }
 
 pub async fn build_recommendations(
@@ -3722,6 +4423,262 @@ mod tests {
         assert_eq!(recommendation_limits(None, None), (5, 8));
         assert_eq!(recommendation_limits(Some(0), Some(0)), (1, 1));
         assert_eq!(recommendation_limits(Some(100), Some(100)), (12, 12));
+    }
+
+    fn home_candidate(
+        label: &str,
+        personalization: HomeRecommendationPersonalization,
+        item_ids: &[Uuid],
+    ) -> HomeRecommendationCandidate {
+        HomeRecommendationCandidate {
+            category_id: Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()),
+            title: label.to_string(),
+            recommendation_type: api::RecommendationType::Popular,
+            personalization,
+            media_kind: "Movie".to_string(),
+            baseline_item_name: None,
+            baseline_item_id: None,
+            items: item_ids
+                .iter()
+                .map(|id| api::BaseItemDto {
+                    id: *id,
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn home_profile_modes_and_allocations_are_progressive() {
+        assert_eq!(
+            home_profile_mode(0.0),
+            HomeRecommendationProfileMode::ColdStart
+        );
+        assert_eq!(
+            home_profile_mode(2.99),
+            HomeRecommendationProfileMode::ColdStart
+        );
+        assert_eq!(
+            home_profile_mode(3.0),
+            HomeRecommendationProfileMode::Blended
+        );
+        assert_eq!(
+            home_profile_mode(15.0),
+            HomeRecommendationProfileMode::Personalized
+        );
+        assert_eq!(
+            personalized_home_row_target(
+                HomeRecommendationProfileMode::ColdStart,
+                0.0,
+                12
+            ),
+            0
+        );
+        assert_eq!(
+            personalized_home_row_target(
+                HomeRecommendationProfileMode::Blended,
+                0.4,
+                12
+            ),
+            4
+        );
+        assert_eq!(
+            personalized_home_row_target(
+                HomeRecommendationProfileMode::Personalized,
+                1.0,
+                12
+            ),
+            10
+        );
+    }
+
+    #[test]
+    fn home_schedule_spreads_personalized_rows_without_session_churn() {
+        let ids: Vec<_> = (0..6)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let personalized: Vec<_> = (0..4)
+            .map(|index| {
+                home_candidate(
+                    &format!("personal-{index}"),
+                    HomeRecommendationPersonalization::Personalized,
+                    &ids,
+                )
+            })
+            .collect();
+        let generic: Vec<_> = (0..8)
+            .map(|index| {
+                home_candidate(
+                    &format!("generic-{index}"),
+                    HomeRecommendationPersonalization::Generic,
+                    &ids,
+                )
+            })
+            .collect();
+        let scheduled = schedule_home_candidates(personalized, generic, 4, 12);
+        let personalized_positions: Vec<_> = scheduled
+            .iter()
+            .take(12)
+            .enumerate()
+            .filter_map(|(index, row)| {
+                (row.personalization == HomeRecommendationPersonalization::Personalized)
+                    .then_some(index)
+            })
+            .collect();
+        assert_eq!(personalized_positions, vec![0, 3, 6, 9]);
+    }
+
+    #[test]
+    fn cold_start_schedule_never_backfills_with_personalized_rows() {
+        let ids: Vec<_> = (0..6)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let personalized = vec![home_candidate(
+            "personal",
+            HomeRecommendationPersonalization::Personalized,
+            &ids,
+        )];
+        let generic = vec![home_candidate(
+            "generic",
+            HomeRecommendationPersonalization::Generic,
+            &ids,
+        )];
+        let scheduled = schedule_home_candidates(personalized, generic, 0, 12);
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(
+            scheduled[0].personalization,
+            HomeRecommendationPersonalization::Generic
+        );
+    }
+
+    #[test]
+    fn home_finalization_prevents_adjacent_repeats_and_caps_rows() {
+        let shared: Vec<_> = (0..6)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let unique: Vec<_> = (0..6)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let mut second_items = shared.clone();
+        second_items.extend(
+            unique
+                .iter()
+                .copied(),
+        );
+        let rows = finalize_home_rows(
+            vec![
+                home_candidate(
+                    "first",
+                    HomeRecommendationPersonalization::Generic,
+                    &shared,
+                ),
+                home_candidate(
+                    "second",
+                    HomeRecommendationPersonalization::Generic,
+                    &second_items,
+                ),
+            ],
+            2,
+            6,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0]
+                .items
+                .len(),
+            6
+        );
+        assert_eq!(
+            rows[1]
+                .items
+                .len(),
+            6
+        );
+        let first_ids: HashSet<_> = rows[0]
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect();
+        assert!(
+            rows[1]
+                .items
+                .iter()
+                .all(|item| !first_ids.contains(&item.id))
+        );
+    }
+
+    #[test]
+    fn home_tag_titles_are_readable() {
+        assert_eq!(humanize_home_tag("science-fiction"), "Science Fiction");
+        assert_eq!(humanize_home_tag("dark_comedy"), "Dark Comedy");
+    }
+
+    #[tokio::test]
+    async fn home_profile_score_deduplicates_titles_and_rolls_episodes_to_series() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE media (id BLOB PRIMARY KEY, grandparent_id BLOB); \
+             CREATE TABLE watch_history (user_id BLOB NOT NULL, media_id BLOB NOT NULL, completed INTEGER NOT NULL, runtime_seconds INTEGER, position_ticks INTEGER NOT NULL); \
+             CREATE TABLE user_media_state (user_id BLOB NOT NULL, media_id BLOB NOT NULL, favorite INTEGER NOT NULL, play_count INTEGER NOT NULL, playback_position INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let user_id = Uuid::new_v4();
+        assert_eq!(
+            home_recommendation_profile_score(&pool, user_id)
+                .await
+                .unwrap(),
+            0.0
+        );
+
+        let movie_id = Uuid::new_v4();
+        let series_id = Uuid::new_v4();
+        let episode_a = Uuid::new_v4();
+        let episode_b = Uuid::new_v4();
+        for (id, parent) in [
+            (movie_id, None),
+            (series_id, None),
+            (episode_a, Some(series_id)),
+            (episode_b, Some(series_id)),
+        ] {
+            sqlx::query("INSERT INTO media (id, grandparent_id) VALUES (?, ?)")
+                .bind(id)
+                .bind(parent)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO watch_history VALUES (?, ?, 1, 100, 1000000000)")
+            .bind(user_id)
+            .bind(movie_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_media_state VALUES (?, ?, 1, 1, 0)")
+            .bind(user_id)
+            .bind(movie_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for episode in [episode_a, episode_b] {
+            sqlx::query("INSERT INTO user_media_state VALUES (?, ?, 0, 1, 0)")
+                .bind(user_id)
+                .bind(episode)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            home_recommendation_profile_score(&pool, user_id)
+                .await
+                .unwrap(),
+            3.0
+        );
     }
 
     #[test]
