@@ -2667,6 +2667,16 @@ pub(crate) fn build_progressive_args(
     args
 }
 
+fn redact_ffmpeg_input_args(args: &[String]) -> Vec<String> {
+    let mut redacted = args.to_vec();
+    for index in 1..redacted.len() {
+        if redacted[index - 1] == "-i" {
+            redacted[index] = "<input-redacted>".to_string();
+        }
+    }
+    redacted
+}
+
 /// Start a progressive transcode that returns a readable byte stream.
 pub fn start_progressive_transcode(
     params: ProgressiveTranscodeParams,
@@ -2674,7 +2684,10 @@ pub fn start_progressive_transcode(
     impl futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>,
 > {
     let args = build_progressive_args(&params);
-    debug!("ffmpeg progressive args: {:?}", args);
+    debug!(
+        "ffmpeg progressive args: {:?}",
+        redact_ffmpeg_input_args(&args)
+    );
 
     let env_overrides =
         ffmpeg_env_overrides(params.hardware_acceleration_type, &params.vaapi_driver);
@@ -4272,6 +4285,26 @@ mod tests {
         assert_eq!(arg_after(&args, "-b:a"), Some("128000"));
         assert_eq!(arg_after(&args, "-ac"), Some("2"));
         assert_eq!(arg_after(&args, "-f"), Some("ogg"));
+    }
+
+    #[test]
+    fn progressive_debug_args_redact_signed_input_url() {
+        let args = vec![
+            "-v".to_string(),
+            "error".to_string(),
+            "-i".to_string(),
+            "https://media.example/file?token=secret".to_string(),
+            "pipe:1".to_string(),
+        ];
+
+        let redacted = redact_ffmpeg_input_args(&args);
+        assert_eq!(redacted[3], "<input-redacted>");
+        assert!(
+            !redacted
+                .join(" ")
+                .contains("secret")
+        );
+        assert_eq!(args[3], "https://media.example/file?token=secret");
     }
 
     #[test]
