@@ -1028,6 +1028,7 @@ async fn videos_stream_inner(
     let params = crate::playback::engine::ProgressiveTranscodeParams {
         input_url: url,
         container: container.clone(),
+        audio_only: false,
         video_codec,
         audio_codec,
         start_time_ticks: q.start_time_ticks,
@@ -1140,56 +1141,188 @@ pub async fn video_additional_parts(
     Ok(Json(api::BaseItemDtoQueryResult::default()))
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UniversalAudioQuery {
+    #[serde(alias = "playSessionId")]
+    play_session_id: Option<String>,
+    #[serde(alias = "mediaSourceId")]
+    media_source_id: Option<Uuid>,
+    #[serde(alias = "transcodingContainer")]
+    transcoding_container: Option<String>,
+    #[serde(alias = "audioCodec")]
+    audio_codec: Option<String>,
+    #[serde(alias = "audioBitRate")]
+    audio_bit_rate: Option<i32>,
+    #[serde(alias = "maxAudioChannels")]
+    max_audio_channels: Option<i32>,
+    #[serde(alias = "startTimeTicks")]
+    start_time_ticks: Option<i64>,
+}
+
+fn audio_download_format(
+    container: Option<&str>,
+    codec: Option<&str>,
+) -> anyhow::Result<(&'static str, &'static str, &'static str)> {
+    let container = container
+        .unwrap_or("mp3")
+        .to_ascii_lowercase();
+    let codec = codec
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| match container.as_str() {
+            "ogg" | "opus" => "opus".to_string(),
+            "m4a" | "aac" => "aac".to_string(),
+            "flac" => "flac".to_string(),
+            "wav" => "pcm_s16le".to_string(),
+            _ => "mp3".to_string(),
+        });
+
+    match (container.as_str(), codec.as_str()) {
+        ("ogg" | "opus", "opus" | "libopus") => Ok(("ogg", "libopus", "audio/ogg")),
+        ("mp3", "mp3" | "libmp3lame") => Ok(("mp3", "libmp3lame", "audio/mpeg")),
+        ("m4a", "aac") => Ok(("m4a", "aac", "audio/mp4")),
+        ("aac", "aac") => Ok(("aac", "aac", "audio/aac")),
+        ("flac", "flac") => Ok(("flac", "flac", "audio/flac")),
+        ("wav", "pcm_s16le") => Ok(("wav", "pcm_s16le", "audio/wav")),
+        _ => anyhow::bail!(
+            "unsupported audio download combination: container={container}, codec={codec}"
+        ),
+    }
+}
+
 #[get("/audio/{id}/universal")]
 pub async fn audio_universal(
     State(state): State<AppState>,
     session: auth::AuthSession,
     Path(id): Path<Uuid>,
-    Query(q): Query<api::HlsVideoQuery>,
+    Query(q): Query<UniversalAudioQuery>,
 ) -> Result<impl IntoResponse> {
-    let mut media = db::Media::get_by_id(
-        &state
-            .ctx
-            .db,
-        &id,
-    )
-    .await?
-    .context_not_found("track not found")?;
-
-    state
-        .ctx
-        .addons
-        .refresh_streams(
-            &mut media,
-            &state.ctx,
-            Some(
-                session
-                    .user
-                    .id,
-            ),
-        )
-        .await
-        .inspect_err(|e| error!("refresh_streams failed: {e:#}"));
-
-    let play_session_id = q
+    let _play_session_id = q
         .play_session_id
         .unwrap_or_else(|| {
             common::get_uuid()
                 .as_simple()
                 .to_string()
         });
+    let (container, audio_codec, content_type) = audio_download_format(
+        q.transcoding_container
+            .as_deref(),
+        q.audio_codec
+            .as_deref(),
+    )
+    .context_bad_request("unsupported audio download format")?;
 
-    let transcoding_url = format!(
-        "/videos/{}/master.m3u8?PlaySessionId={}&MediaSourceId={}&VideoCodec=copy&AudioCodec=aac&ApiKey={}",
+    let media = StreamService::lookup(
+        &state.ctx,
         id,
-        play_session_id,
-        id,
-        session
-            .device
-            .access_token
+        q.media_source_id,
+        Some(
+            session
+                .device
+                .id
+                .as_str(),
+        ),
+        Some(
+            session
+                .user
+                .id,
+        ),
+    )
+    .await?;
+    let descriptor = media
+        .stream_info
+        .as_ref()
+        .context_not_found("media source has no URL")?
+        .descriptor
+        .clone();
+    let input_url = descriptor.server_input(
+        media.id,
+        state
+            .ctx
+            .config
+            .port,
     );
+    let encoding_opts = db::Settings::get_encoding_config(
+        &state
+            .ctx
+            .db,
+    )
+    .await
+    .unwrap_or_default();
+    let source_audio_codec = media
+        .probe_data
+        .as_ref()
+        .and_then(|probe| probe.audio_stream())
+        .and_then(|stream| {
+            stream
+                .codec
+                .clone()
+        });
+    let title = media
+        .title
+        .clone();
 
-    Ok(axum::response::Redirect::temporary(&transcoding_url).into_response())
+    let params = crate::playback::engine::ProgressiveTranscodeParams {
+        input_url,
+        container: container.to_string(),
+        audio_only: true,
+        video_codec: "copy".to_string(),
+        audio_codec: audio_codec.to_string(),
+        start_time_ticks: q.start_time_ticks,
+        max_width: None,
+        max_height: None,
+        video_bitrate: None,
+        audio_bitrate: q
+            .audio_bit_rate
+            .and_then(|value| u32::try_from(value).ok()),
+        audio_channels: q
+            .max_audio_channels
+            .and_then(|value| u32::try_from(value).ok()),
+        audio_stream_index: None,
+        subtitle_stream_index: None,
+        burn_subtitle: false,
+        subtitle_width: None,
+        subtitle_height: None,
+        encoding_preset: encoding_opts.encoding_preset,
+        source_video_codec: None,
+        source_audio_codec,
+        hardware_acceleration_type: remux_sdks::remux::HardwareAccelerationType::None,
+        vaapi_device: encoding_opts
+            .vaapi_device
+            .unwrap_or_else(|| "/dev/dri/renderD128".to_string()),
+        vaapi_driver: encoding_opts
+            .vaapi_driver
+            .unwrap_or_default(),
+        source_video_range_type: None,
+        enable_tonemapping: false,
+        enable_vpp_tonemapping: false,
+        tonemapping_algorithm: "hable".to_string(),
+        tonemapping_desat: 0.0,
+        tonemapping_peak: 0.0,
+        allow_hevc_encoding: false,
+        allow_av1_encoding: false,
+        h264_crf: 23,
+        h265_crf: 28,
+        normalize_audio_loudness: encoding_opts
+            .normalize_audio_loudness
+            .unwrap_or(false),
+    };
+    let body = Body::from_stream(crate::playback::engine::start_progressive_transcode(
+        params,
+    )?);
+    let safe_title = title.replace(['"', '\\', '\r', '\n'], "");
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .header(http::header::ACCEPT_RANGES, "none")
+        .header(http::header::CACHE_CONTROL, "no-cache, no-store")
+        .header(
+            http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{safe_title}.{container}\""),
+        )
+        .body(body)
+        .expect("valid audio download response"))
 }
 
 /// Bitrate test endpoint - returns a body of the requested size for bandwidth measurement.
@@ -1224,6 +1357,19 @@ mod tests {
         AUTH_HEADER, auth_header_with_token, authenticated_server, insert_test_source,
         new_test_server,
     };
+
+    #[test]
+    fn finamp_ogg_opus_download_format_is_progressive_audio() {
+        assert_eq!(
+            super::audio_download_format(Some("ogg"), Some("opus")).unwrap(),
+            ("ogg", "libopus", "audio/ogg")
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_universal_audio_format() {
+        assert!(super::audio_download_format(Some("ogg"), Some("aac")).is_err());
+    }
 
     #[tokio::test]
     async fn test_playback_start() {

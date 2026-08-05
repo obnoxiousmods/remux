@@ -3,6 +3,12 @@ use async_trait::async_trait;
 use axum::{body::Body, http::HeaderMap, response::Response};
 use axum_anyhow::ApiResult as Result;
 use futures_util::{StreamExt, TryStreamExt};
+use http_body_util::{BodyExt, Empty};
+use hyper_rustls::HttpsConnector;
+use hyper_util::{
+    client::legacy::{Client as HyperClient, connect::HttpConnector},
+    rt::TokioExecutor,
+};
 use std::{
     collections::HashMap,
     io,
@@ -249,7 +255,10 @@ impl StreamInfo {
             .query_pairs()
             .find_map(|(key, value)| {
                 let key = key.to_ascii_lowercase();
-                if !matches!(key.as_str(), "expires" | "expire" | "expiry" | "exp") {
+                if !matches!(
+                    key.as_str(),
+                    "expires" | "expire" | "expiry" | "exp" | "etsp"
+                ) {
                     return None;
                 }
                 let raw = value
@@ -305,6 +314,28 @@ static STREAM_PROXY_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .build()
             .expect("failed to build stream proxy client")
     });
+
+type TolerantConnector = HttpsConnector<HttpConnector>;
+type TolerantClient = HyperClient<TolerantConnector, Empty<bytes::Bytes>>;
+
+/// Reqwest does not expose Hyper's HTTP/1 response-header count setting. Some
+/// Akamai music responses intermittently exceed Hyper's default of 100 headers,
+/// so retain reqwest as the fast path and use this bounded client for a single
+/// retry when the response head cannot be read.
+static TOLERANT_STREAM_PROXY_CLIENT: LazyLock<TolerantClient> = LazyLock::new(|| {
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("failed to load native TLS roots")
+        .https_or_http()
+        .enable_http1()
+        .build();
+    let mut builder = HyperClient::builder(TokioExecutor::new());
+    builder
+        .http1_max_headers(256)
+        .pool_max_idle_per_host(20)
+        .pool_idle_timeout(Duration::from_secs(90));
+    builder.build(connector)
+});
 
 pub struct HttpSource {
     pub url: String,
@@ -456,6 +487,159 @@ impl HttpSource {
             request = request.header(name.as_str(), value.as_str());
         }
         request
+    }
+
+    fn sanitized_host(&self) -> String {
+        url::Url::parse(&self.url)
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "invalid-url".to_string())
+    }
+
+    async fn tolerant_request(&self, headers: &HeaderMap) -> Result<Response> {
+        let mut current =
+            url::Url::parse(&self.url).context_bad_request("invalid upstream URL")?;
+        let original_origin = current.origin();
+
+        for redirect_count in 0..=5 {
+            let mut request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(current.as_str())
+                .header(http::header::USER_AGENT, "remux-server/1.0");
+            if let Some(value) = headers.get(http::header::RANGE) {
+                request = request.header(http::header::RANGE, value);
+            }
+            for (name, value) in &self.request_headers {
+                let Ok(name) = http::header::HeaderName::try_from(name.as_str()) else {
+                    continue;
+                };
+                if current.origin() != original_origin
+                    && matches!(
+                        name,
+                        http::header::AUTHORIZATION
+                            | http::header::COOKIE
+                            | http::header::PROXY_AUTHORIZATION
+                    )
+                {
+                    continue;
+                }
+                if let Ok(value) = http::HeaderValue::from_str(value) {
+                    request = request.header(name, value);
+                }
+            }
+            let request = request
+                .body(Empty::<bytes::Bytes>::new())
+                .context_bad_request("failed to build upstream request")?;
+            let upstream = TOLERANT_STREAM_PROXY_CLIENT
+                .request(request)
+                .await
+                .context_bad_gateway("upstream retry failed")?;
+
+            if upstream
+                .status()
+                .is_redirection()
+            {
+                if redirect_count == 5 {
+                    return Err(anyhow::anyhow!("too many upstream redirects"))
+                        .context_bad_gateway("upstream redirect failed");
+                }
+                let Some(location) = upstream
+                    .headers()
+                    .get(http::header::LOCATION)
+                else {
+                    return Ok(Self::proxy_hyper_response(
+                        upstream,
+                        &self.response_headers,
+                    ));
+                };
+                let location = location
+                    .to_str()
+                    .context_bad_gateway("invalid upstream redirect")?;
+                current = current
+                    .join(location)
+                    .context_bad_gateway("invalid upstream redirect URL")?;
+                continue;
+            }
+
+            return Ok(Self::proxy_hyper_response(upstream, &self.response_headers));
+        }
+
+        unreachable!("redirect loop always returns")
+    }
+
+    fn proxy_hyper_response(
+        upstream: http::Response<hyper::body::Incoming>,
+        response_headers: &HashMap<String, String>,
+    ) -> Response {
+        let status = upstream.status();
+        let upstream_headers = upstream
+            .headers()
+            .clone();
+        let body = Body::from_stream(
+            upstream
+                .into_body()
+                .into_data_stream()
+                .map_err(io::Error::other),
+        );
+        let mut response = Response::builder()
+            .status(status)
+            .body(body)
+            .expect("valid upstream response");
+        copy_stream_response_headers(
+            response.headers_mut(),
+            &upstream_headers,
+            response_headers,
+        );
+        response
+    }
+
+    async fn serve_http(&self, headers: &HeaderMap) -> Result<Response> {
+        let client = STREAM_PROXY_CLIENT.clone();
+        let mut request = client.get(&self.url);
+        if let Some(value) = headers.get(http::header::RANGE) {
+            request = request.header(http::header::RANGE, value.clone());
+        }
+        request = self.apply_request_headers(request);
+
+        let upstream = match request
+            .send()
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::warn!(
+                    upstream_host = self.sanitized_host(),
+                    error = %error,
+                    "upstream request failed; retrying with tolerant HTTP/1 parser"
+                );
+                return self
+                    .tolerant_request(headers)
+                    .await;
+            }
+        };
+
+        let status = upstream.status();
+        let upstream_headers = upstream
+            .headers()
+            .clone();
+        let body = Body::from_stream(
+            upstream
+                .bytes_stream()
+                .map_err(io::Error::other),
+        );
+        let mut response = Response::builder()
+            .status(status)
+            .body(body)
+            .expect("valid upstream response");
+        copy_stream_response_headers(
+            response.headers_mut(),
+            &upstream_headers,
+            &self.response_headers,
+        );
+        Ok(response)
     }
 
     async fn segmented_mp4_layout(
@@ -728,57 +912,41 @@ impl StreamSource for HttpSource {
                 .await;
         }
 
-        let mut req = client.get(&self.url);
-        if let Some(v) = headers.get(http::header::RANGE) {
-            req = req.header(http::header::RANGE, v.clone());
-        }
-        req = self.apply_request_headers(req);
-
-        let upstream = req
-            .send()
+        self.serve_http(headers)
             .await
-            .context_bad_request("upstream request failed")?;
+    }
+}
 
-        let status = upstream.status();
-        let upstream_headers = upstream
-            .headers()
-            .clone();
-        let body = Body::from_stream(
-            upstream
-                .bytes_stream()
-                .map_err(io::Error::other),
+fn copy_stream_response_headers(
+    output: &mut HeaderMap,
+    upstream: &HeaderMap,
+    overrides: &HashMap<String, String>,
+) {
+    for (name, value) in upstream {
+        if matches!(
+            name.as_str(),
+            "content-length"
+                | "content-type"
+                | "accept-ranges"
+                | "content-range"
+                | "last-modified"
+        ) {
+            output.insert(name, value.clone());
+        }
+    }
+    if !output.contains_key(http::header::CONTENT_TYPE) {
+        output.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/octet-stream"),
         );
-
-        let mut resp = Response::builder()
-            .status(status)
-            .body(body)
-            .unwrap();
-        let out = resp.headers_mut();
-        for (k, v) in &upstream_headers {
-            match k.as_str() {
-                "content-length" | "content-type" | "accept-ranges"
-                | "content-range" | "last-modified" => {
-                    out.insert(k, v.clone());
-                }
-                _ => {}
-            }
+    }
+    for (name, value) in overrides {
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::try_from(name.as_str()),
+            http::HeaderValue::from_str(value),
+        ) {
+            output.insert(name, value);
         }
-        if !out.contains_key(http::header::CONTENT_TYPE) {
-            out.insert(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/octet-stream"),
-            );
-        }
-        for (name, value) in &self.response_headers {
-            if let (Ok(name), Ok(value)) = (
-                http::header::HeaderName::try_from(name.as_str()),
-                http::HeaderValue::from_str(value),
-            ) {
-                out.insert(name, value);
-            }
-        }
-
-        Ok(resp)
     }
 }
 
@@ -945,7 +1113,7 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StreamInfo, numbered_segment_url, parse_range, segmented_ranges,
+        HttpSource, StreamInfo, numbered_segment_url, parse_range, segmented_ranges,
         tidal_segment_zero_url,
     };
     use axum::{
@@ -956,6 +1124,7 @@ mod tests {
         response::Response,
         routing::any,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn recognizes_only_tidal_segment_zero_urls() {
@@ -993,6 +1162,20 @@ mod tests {
         let mut info = StreamInfo {
             descriptor: super::StreamDescriptor::http(format!(
                 "https://example.invalid/video?Expires={expires}"
+            )),
+            ..Default::default()
+        };
+        info.infer_valid_until();
+        assert!(info.is_valid_for(std::time::Duration::from_secs(120)));
+        assert!(!info.is_valid_for(std::time::Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn infers_qobuz_etsp_signed_url_expiry() {
+        let expires = chrono::Utc::now().timestamp() + 300;
+        let mut info = StreamInfo {
+            descriptor: super::StreamDescriptor::http(format!(
+                "https://streaming-qobuz-std.akamaized.net/file?ETSP={expires}"
             )),
             ..Default::default()
         };
@@ -1158,5 +1341,72 @@ mod tests {
         resp.text()
             .await
             .expect("body should drain");
+    }
+
+    #[tokio::test]
+    async fn retries_response_heads_larger_than_hyper_default() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener
+            .local_addr()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                let mut request = [0_u8; 2048];
+                let read = socket
+                    .read(&mut request)
+                    .await
+                    .unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(
+                    request.contains("Range: bytes=0-1")
+                        || request.contains("range: bytes=0-1")
+                );
+
+                let mut response = String::from(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 0-1/2\r\nAccept-Ranges: bytes\r\n",
+                );
+                for index in 0..128 {
+                    response.push_str(&format!("X-Upstream-{index}: value\r\n"));
+                }
+                response.push_str("Connection: close\r\n\r\nok");
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let source = HttpSource {
+            url: format!("http://{address}/audio.flac"),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::RANGE,
+            "bytes=0-1"
+                .parse()
+                .unwrap(),
+        );
+        let response = source
+            .serve_http(&headers)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 0-1/2");
+        let body = axum::body::to_bytes(response.into_body(), 2)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok");
+        server
+            .await
+            .unwrap();
     }
 }

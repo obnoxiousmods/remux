@@ -2196,7 +2196,10 @@ pub async fn start_transcode(
 #[derive(Debug, Clone)]
 pub struct ProgressiveTranscodeParams {
     pub input_url: String,
-    pub container: String,   // "mp4", "ts", "mkv", "webm"
+    pub container: String, // "mp4", "ts", "mkv", "webm"
+    /// Emit only the selected/default audio stream. Used by Jellyfin's
+    /// `/Audio/{id}/Universal` download endpoint.
+    pub audio_only: bool,
     pub video_codec: String, // "copy", "libx264", "libx265", "libvpx-vp9"
     pub audio_codec: String, // "copy", "aac", "libopus"
     pub start_time_ticks: Option<i64>,
@@ -2300,9 +2303,15 @@ pub(crate) fn build_progressive_args(
             "ts" | "mpegts" => "mpegts",
             "webm" => "webm",
             "mkv" | "matroska" => "matroska",
+            "ogg" | "opus" => "ogg",
+            "mp3" => "mp3",
+            "m4a" => "ipod",
+            "aac" => "adts",
+            "flac" => "flac",
+            "wav" => "wav",
             _ => "mp4",
         };
-        if ffmpeg_video_codec == "copy" && requested == "mp4" {
+        if !params.audio_only && ffmpeg_video_codec == "copy" && requested == "mp4" {
             "matroska"
         } else {
             requested
@@ -2339,7 +2348,9 @@ pub(crate) fn build_progressive_args(
     // QSV+HDR without VPP: SW-decode so CPU filters can run.
     // QSV+burn_subtitle (non-HDR): keeps VAAPI hw-decode — overlay_qsv handles on-GPU.
     // VideoToolbox+HDR: SW-decode so tonemapx can run on CPU (VT encoder accepts yuv420p).
-    if matches!(accel, HardwareAccelerationType::Qsv) && hdr && !do_vpp_tonemap {
+    if params.audio_only {
+        // Audio downloads never need a hardware video device.
+    } else if matches!(accel, HardwareAccelerationType::Qsv) && hdr && !do_vpp_tonemap {
         args.extend(qsv_init_only_args(
             &params.vaapi_device,
             &params.vaapi_driver,
@@ -2394,7 +2405,9 @@ pub(crate) fn build_progressive_args(
         None
     };
 
-    if params.burn_subtitle {
+    if params.audio_only {
+        args.extend(["-map".into(), "0:a:0".into(), "-vn".into()]);
+    } else if params.burn_subtitle {
         if let Some(sub_idx) = params.subtitle_stream_index {
             // Image subtitle (PGS/DVD): bitmap overlay via filter_complex.
             let (out_w, out_h) = (params.max_width, params.max_height);
@@ -2532,8 +2545,10 @@ pub(crate) fn build_progressive_args(
     }
 
     // Video
-    args.extend(["-c:v".into(), ffmpeg_video_codec.clone()]);
-    if ffmpeg_video_codec == "copy" {
+    if params.audio_only {
+        // `-vn` above intentionally suppresses all video output options.
+    } else if ffmpeg_video_codec == "copy" {
+        args.extend(["-c:v".into(), ffmpeg_video_codec.clone()]);
         // Apply hvc1 codec tag for HEVC Apple compatibility
         if params
             .source_video_codec
@@ -2549,10 +2564,12 @@ pub(crate) fn build_progressive_args(
             args.extend(["-tag:v".into(), "hvc1".into()]);
         }
     } else if is_hw {
+        args.extend(["-c:v".into(), ffmpeg_video_codec.clone()]);
         if let Some(bitrate) = params.video_bitrate {
             args.extend(["-b:v".into(), bitrate.to_string()]);
         }
     } else if ffmpeg_video_codec == "libx264" {
+        args.extend(["-c:v".into(), ffmpeg_video_codec.clone()]);
         let preset = params
             .encoding_preset
             .unwrap_or_default()
@@ -2578,6 +2595,7 @@ pub(crate) fn build_progressive_args(
             ]);
         }
     } else if ffmpeg_video_codec == "libx265" {
+        args.extend(["-c:v".into(), ffmpeg_video_codec.clone()]);
         let preset = params
             .encoding_preset
             .unwrap_or_default()
@@ -2600,8 +2618,11 @@ pub(crate) fn build_progressive_args(
                 (bitrate * 2).to_string(),
             ]);
         }
-    } else if let Some(bitrate) = params.video_bitrate {
-        args.extend(["-b:v".into(), bitrate.to_string()]);
+    } else {
+        args.extend(["-c:v".into(), ffmpeg_video_codec.clone()]);
+        if let Some(bitrate) = params.video_bitrate {
+            args.extend(["-b:v".into(), bitrate.to_string()]);
+        }
     }
 
     // Audio
@@ -2634,7 +2655,7 @@ pub(crate) fn build_progressive_args(
 
     // Format-specific flags
     args.extend(["-strict".into(), "unofficial".into()]);
-    if format == "mp4" {
+    if matches!(format, "mp4" | "ipod") {
         args.extend([
             "-movflags".into(),
             "frag_keyframe+empty_moov+default_base_moof".into(),
@@ -3346,6 +3367,7 @@ mod tests {
         ProgressiveTranscodeParams {
             input_url: "http://localhost/test.mkv".into(),
             container: "mp4".into(),
+            audio_only: false,
             video_codec: "copy".into(),
             audio_codec: "aac".into(),
             start_time_ticks: None,
@@ -4230,6 +4252,26 @@ mod tests {
         });
         assert_eq!(arg_after(&args, "-b:a"), Some("256000"));
         assert_eq!(arg_after(&args, "-ac"), Some("6"));
+    }
+
+    #[test]
+    fn progressive_audio_only_ogg_opus_has_no_video_output() {
+        let args = build_progressive_args(&ProgressiveTranscodeParams {
+            container: "ogg".into(),
+            audio_only: true,
+            audio_codec: "libopus".into(),
+            audio_bitrate: Some(128_000),
+            audio_channels: Some(2),
+            ..default_progressive()
+        });
+
+        assert_eq!(arg_after(&args, "-map"), Some("0:a:0"));
+        assert!(args_contains(&args, "-vn"));
+        assert!(!args_contains(&args, "-c:v"));
+        assert_eq!(arg_after(&args, "-c:a"), Some("libopus"));
+        assert_eq!(arg_after(&args, "-b:a"), Some("128000"));
+        assert_eq!(arg_after(&args, "-ac"), Some("2"));
+        assert_eq!(arg_after(&args, "-f"), Some("ogg"));
     }
 
     #[test]
