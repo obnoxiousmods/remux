@@ -55,6 +55,59 @@ pub(crate) struct StreamService {
 }
 
 impl StreamService {
+    async fn reusable_track_source(
+        ctx: &AppContext,
+        media: &mut db::Media,
+        device_key: Option<&str>,
+    ) -> anyhow::Result<Option<db::Media>> {
+        let mut sources = media
+            .streams(&ctx.db)
+            .await?;
+        if let Some(key) = device_key {
+            if let Some(saved_id) = ctx
+                .store
+                .get::<Uuid>(&format!("pstream:{}:{}", media.id, key))
+            {
+                sources.sort_by_key(|source| source.id != saved_id);
+            }
+        }
+
+        for source in &sources {
+            let Some(info) = source
+                .stream_info
+                .as_ref()
+            else {
+                continue;
+            };
+            if let StreamDescriptor::Local(path) = &info.descriptor
+                && tokio::fs::metadata(path)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_file())
+            {
+                return Ok(Some(source.clone()));
+            }
+        }
+
+        let required = std::time::Duration::from_secs(
+            media
+                .runtime
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .unwrap_or(10 * 60)
+                .saturating_add(60),
+        );
+        Ok(sources
+            .into_iter()
+            .find(|source| {
+                source
+                    .stream_info
+                    .as_ref()
+                    .is_some_and(|info| {
+                        matches!(&info.descriptor, StreamDescriptor::Http { .. })
+                            && info.is_valid_for(required)
+                    })
+            }))
+    }
+
     pub fn new(cfg: StreamServiceConfig) -> Self {
         Self {
             ctx: cfg.ctx,
@@ -234,6 +287,23 @@ impl StreamService {
                 // observes the same 60-second TTL as the PlaybackInfo path instead
                 // of reading an empty or expired cached source indefinitely.
                 if requested_id.is_none() || requested_id == Some(item_id) {
+                    if media.kind == db::MediaKind::Track {
+                        if let Some(source) =
+                            Self::reusable_track_source(ctx, &mut media, device_key)
+                                .await?
+                        {
+                            debug!(
+                                item_id = %item_id,
+                                stream_id = %source.id,
+                                "reusing stable cached track source"
+                            );
+                            return Ok(source);
+                        }
+                        // `streams()` populated the in-memory relation cache. A
+                        // refresh may replace those rows, so force the later
+                        // selection to reload the post-refresh source set.
+                        media.sources = None;
+                    }
                     let _ = ctx
                         .addons
                         .refresh_streams(&mut media, ctx, user_id)

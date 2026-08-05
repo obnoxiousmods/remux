@@ -258,6 +258,24 @@ impl StreamAddon for EclipseAddon {
 static WORKER_CONCURRENCY: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 
+/// Space request starts across all tracks. A concurrency cap alone still lets
+/// a large offline playlist sustain enough requests per second to exhaust the
+/// worker's rolling rate limit.
+static WORKER_RATE_GATE: std::sync::LazyLock<tokio::sync::Mutex<tokio::time::Instant>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
+async fn wait_for_worker_slot() {
+    const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
+    let mut next = WORKER_RATE_GATE
+        .lock()
+        .await;
+    let now = tokio::time::Instant::now();
+    if *next > now {
+        tokio::time::sleep_until(*next).await;
+    }
+    *next = tokio::time::Instant::now() + MIN_INTERVAL;
+}
+
 /// GET and decode a JSON document from the resolver worker with bounded
 /// concurrency and transient-failure retries.
 ///
@@ -274,7 +292,8 @@ async fn worker_get_json<T: serde::de::DeserializeOwned>(
         .acquire()
         .await
         .expect("worker concurrency semaphore is never closed");
-    let resp = remux_utils::retry!(attempts: 4, delay: 300, {
+    let resp = remux_utils::retry!(attempts: 5, delay: 1500, {
+        wait_for_worker_slot().await;
         client
             .get(url)
             .send()

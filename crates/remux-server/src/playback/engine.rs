@@ -1131,6 +1131,29 @@ fn qsv_init_only_args(vaapi_device: &str, vaapi_driver: &str) -> Vec<String> {
     ]
 }
 
+fn append_http_input_options(args: &mut Vec<String>, input: &str) {
+    let is_http = url::Url::parse(input)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https"));
+    if !is_http {
+        return;
+    }
+    args.extend([
+        "-reconnect".into(),
+        "1".into(),
+        "-reconnect_at_eof".into(),
+        "1".into(),
+        "-reconnect_streamed".into(),
+        "1".into(),
+        "-reconnect_delay_max".into(),
+        "5".into(),
+        "-timeout".into(),
+        "30000000".into(),
+        "-rw_timeout".into(),
+        "30000000".into(),
+    ]);
+}
+
 /// Build the ffmpeg CLI args for an HLS transcode.
 pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     let accel = params.hardware_acceleration_type;
@@ -1208,19 +1231,8 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         "1000000".into(),
         "-probesize".into(),
         "1000000".into(),
-        "-reconnect".into(),
-        "1".into(),
-        "-reconnect_at_eof".into(),
-        "1".into(),
-        "-reconnect_streamed".into(),
-        "1".into(),
-        "-reconnect_delay_max".into(),
-        "5".into(),
-        "-timeout".into(),
-        "30000000".into(),
-        "-rw_timeout".into(),
-        "30000000".into(),
     ];
+    append_http_input_options(&mut args, &params.input_url);
 
     let burn_subtitle_filter = params.burn_subtitle
         && params
@@ -2325,19 +2337,8 @@ pub(crate) fn build_progressive_args(
         "5000000".into(),
         "-probesize".into(),
         "5000000".into(),
-        "-reconnect".into(),
-        "1".into(),
-        "-reconnect_at_eof".into(),
-        "1".into(),
-        "-reconnect_streamed".into(),
-        "1".into(),
-        "-reconnect_delay_max".into(),
-        "5".into(),
-        "-timeout".into(),
-        "30000000".into(),
-        "-rw_timeout".into(),
-        "30000000".into(),
     ];
+    append_http_input_options(&mut args, &params.input_url);
 
     let burn_subtitle_filter = params.burn_subtitle
         && params
@@ -4316,12 +4317,37 @@ mod tests {
     }
 
     #[test]
+    fn progressive_local_input_omits_http_only_options() {
+        let args = build_progressive_args(&ProgressiveTranscodeParams {
+            input_url: "/music/Artist/Album/track.flac".into(),
+            audio_only: true,
+            container: "ogg".into(),
+            audio_codec: "libopus".into(),
+            ..default_progressive()
+        });
+        assert!(!args_contains(&args, "-reconnect"));
+        assert!(!args_contains(&args, "-timeout"));
+        assert!(!args_contains(&args, "-rw_timeout"));
+    }
+
+    #[test]
     fn hls_reconnect_flags_present() {
         let args = build_hls_args(&default_hls(PathBuf::from("/tmp/hls-test-out")));
         assert!(args_contains(&args, "-reconnect"));
         assert!(args_contains(&args, "-reconnect_at_eof"));
         assert!(args_contains(&args, "-reconnect_streamed"));
         assert!(args_contains(&args, "-rw_timeout"));
+    }
+
+    #[test]
+    fn hls_local_input_omits_http_only_options() {
+        let args = build_hls_args(&TranscodeParams {
+            input_url: "/media/movie.mkv".into(),
+            ..default_hls(PathBuf::from("/tmp/hls-local-input"))
+        });
+        assert!(!args_contains(&args, "-reconnect"));
+        assert!(!args_contains(&args, "-timeout"));
+        assert!(!args_contains(&args, "-rw_timeout"));
     }
 
     // ── Loudness normalisation tests ─────────────────────────────────────────
