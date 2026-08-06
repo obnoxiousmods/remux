@@ -133,6 +133,7 @@ pub async fn report_playback_start(
     session: auth::AuthSession,
     Json(data): Json<api::PlaybackInfo>,
 ) -> Result<impl IntoResponse> {
+    crate::api::subtitles::cancel_subtitle_pre_extraction(data.item_id);
     state
         .ctx
         .sessions

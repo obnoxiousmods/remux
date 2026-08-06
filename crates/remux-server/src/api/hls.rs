@@ -66,12 +66,34 @@ async fn wait_for_variant_playlist(
     path: &std::path::Path,
     timeout: std::time::Duration,
 ) -> String {
-    let output_tx = session
-        .read()
-        .await
-        .output_tx
-        .clone();
-    let mut output_rx = output_tx.subscribe();
+    let (output_tx, state_tx) = {
+        let session = session
+            .read()
+            .await;
+        (
+            session
+                .output_tx
+                .clone(),
+            session
+                .state_tx
+                .clone(),
+        )
+    };
+    wait_for_variant_playlist_signals(
+        output_tx.subscribe(),
+        state_tx.subscribe(),
+        path,
+        timeout,
+    )
+    .await
+}
+
+async fn wait_for_variant_playlist_signals(
+    mut output_rx: tokio::sync::watch::Receiver<u64>,
+    mut state_rx: tokio::sync::watch::Receiver<TranscodeState>,
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> String {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Ok(text) = tokio::fs::read_to_string(path).await {
@@ -79,13 +101,34 @@ async fn wait_for_variant_playlist(
                 return text;
             }
         }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero()
-            || tokio::time::timeout(remaining, output_rx.changed())
-                .await
-                .is_err()
-        {
+
+        // FFmpeg publishes terminal state independently of output-directory
+        // notifications. Once it has failed (or completed without ever
+        // opening a playlist), waiting for another file event can only burn
+        // the entire startup deadline and delay source fallback.
+        if matches!(
+            *state_rx.borrow(),
+            TranscodeState::Complete | TranscodeState::Error(_)
+        ) {
             return String::new();
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return String::new();
+        }
+        tokio::select! {
+            changed = output_rx.changed() => {
+                if changed.is_err() {
+                    return String::new();
+                }
+            }
+            changed = state_rx.changed() => {
+                if changed.is_err() {
+                    return String::new();
+                }
+            }
+            () = tokio::time::sleep(remaining) => return String::new(),
         }
     }
 }
@@ -316,6 +359,11 @@ async fn create_hls_session(
                 .as_simple()
                 .to_string()
         });
+
+    // Playback owns the upstream source. Cancel speculative subtitle cache
+    // warming before any lookup or FFmpeg startup so it cannot consume the
+    // provider's connection/rate-limit budget ahead of first frame.
+    crate::api::subtitles::cancel_subtitle_pre_extraction(id);
 
     debug!("Using play session ID: {}", play_session_id);
 
@@ -1222,20 +1270,21 @@ async fn variant_hls_video_inner(
                 ?session_state,
                 "HLS child playlist not ready before startup deadline"
             );
-            return Ok(
-                if matches!(
-                    session_state,
-                    TranscodeState::Complete | TranscodeState::Error(_)
-                ) {
+            return Ok(match session_state {
+                TranscodeState::Error(_) => {
+                    hls_state_response(StatusCode::GONE, "transcode-error", None)
+                }
+                TranscodeState::Complete => {
                     hls_state_response(StatusCode::GONE, "transcode-ended", None)
-                } else {
+                }
+                TranscodeState::Starting | TranscodeState::Running => {
                     hls_state_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "playlist-not-ready",
                         Some("1"),
                     )
-                },
-            );
+                }
+            });
         }
 
         info!(
@@ -1308,8 +1357,9 @@ mod local_tests {
 
     use super::{
         add_playback_generation_to_master, add_playback_start_acknowledgement,
-        hls_state_response,
+        hls_state_response, wait_for_variant_playlist_signals,
     };
+    use crate::playback::session::TranscodeState;
 
     #[test]
     fn master_playlist_acknowledges_applied_start_ticks() {
@@ -1381,6 +1431,41 @@ mod local_tests {
             !gone
                 .headers()
                 .contains_key("Retry-After")
+        );
+
+        let failed = hls_state_response(StatusCode::GONE, "transcode-error", None);
+        assert_eq!(failed.status(), StatusCode::GONE);
+        assert_eq!(failed.headers()["X-Remux-Hls-State"], "transcode-error");
+    }
+
+    #[tokio::test]
+    async fn variant_playlist_wait_stops_when_transcode_fails() {
+        let (_output_tx, output_rx) = tokio::sync::watch::channel(0_u64);
+        let (state_tx, state_rx) =
+            tokio::sync::watch::channel(TranscodeState::Starting);
+        let missing = std::env::temp_dir().join(format!(
+            "remux-missing-playlist-{}.m3u8",
+            uuid::Uuid::new_v4()
+        ));
+        let started = std::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let _ = state_tx
+                .send(TranscodeState::Error("upstream returned 429".to_string()));
+        });
+
+        let playlist = wait_for_variant_playlist_signals(
+            output_rx,
+            state_rx,
+            &missing,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(playlist.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "terminal state should bypass the startup deadline"
         );
     }
 

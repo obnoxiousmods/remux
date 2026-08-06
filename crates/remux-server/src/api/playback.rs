@@ -399,14 +399,12 @@ async fn items_playbackinfo_inner(
                         .as_ref()
                         .and_then(|probe| probe.size),
                 );
-                tokio::spawn(
-                    crate::api::subtitles::pre_extract_all_subtitles_to_cache(
-                        data_dir,
-                        url,
-                        id,
-                        cache_source_id,
-                        subtitle_plans,
-                    ),
+                crate::api::subtitles::schedule_subtitle_pre_extraction(
+                    data_dir,
+                    url,
+                    id,
+                    cache_source_id,
+                    subtitle_plans,
                 );
             }
         }

@@ -80,10 +80,82 @@ type SubtitleExtractionKey = (Uuid, Uuid);
 static BATCH_EXTRACTING: OnceLock<
     Mutex<HashMap<SubtitleExtractionKey, watch::Receiver<bool>>>,
 > = OnceLock::new();
+static BATCH_CANCELLATIONS: OnceLock<
+    Mutex<HashMap<SubtitleExtractionKey, watch::Sender<bool>>>,
+> = OnceLock::new();
+const SUBTITLE_PREFETCH_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn batch_extraction_map()
 -> &'static Mutex<HashMap<SubtitleExtractionKey, watch::Receiver<bool>>> {
     BATCH_EXTRACTING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn batch_cancellation_map()
+-> &'static Mutex<HashMap<SubtitleExtractionKey, watch::Sender<bool>>> {
+    BATCH_CANCELLATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Schedule speculative subtitle cache warming behind a short playback-start
+/// grace period. HLS startup cancels this work for the item before opening its
+/// upstream source, so background FFmpeg never competes with first frame.
+pub(crate) fn schedule_subtitle_pre_extraction(
+    data_dir: std::path::PathBuf,
+    input_url: String,
+    item_id: Uuid,
+    cache_source_id: Uuid,
+    subtitle_streams: Vec<SubtitleExtractionPlan>,
+) {
+    let extraction_key = (item_id, cache_source_id);
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    {
+        let mut cancellations = batch_cancellation_map()
+            .lock()
+            .unwrap();
+        if cancellations.contains_key(&extraction_key) {
+            debug!(%item_id, %cache_source_id, "subtitle pre-extraction already scheduled");
+            return;
+        }
+        cancellations.insert(extraction_key, cancel_tx);
+    }
+
+    tokio::spawn(async move {
+        let cancelled = tokio::select! {
+            () = tokio::time::sleep(SUBTITLE_PREFETCH_GRACE) => false,
+            changed = cancel_rx.changed() => changed.is_ok() && *cancel_rx.borrow(),
+        };
+        if !cancelled {
+            pre_extract_all_subtitles_to_cache(
+                data_dir,
+                input_url,
+                item_id,
+                cache_source_id,
+                subtitle_streams,
+                cancel_rx,
+            )
+            .await;
+        } else {
+            debug!(%item_id, %cache_source_id, "subtitle pre-extraction cancelled during playback-start grace");
+        }
+        batch_cancellation_map()
+            .lock()
+            .unwrap()
+            .remove(&extraction_key);
+    });
+}
+
+/// Cancel every speculative subtitle extraction for an item. The selected
+/// subtitle endpoint remains on-demand and is unaffected.
+pub(crate) fn cancel_subtitle_pre_extraction(item_id: Uuid) {
+    let cancellations = batch_cancellation_map()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((candidate_item_id, _), _)| *candidate_item_id == item_id)
+        .map(|(_, tx)| tx.clone())
+        .collect::<Vec<_>>();
+    for cancellation in cancellations {
+        let _ = cancellation.send(true);
+    }
 }
 
 pub(crate) fn subtitle_cache_source_id(
@@ -564,15 +636,20 @@ fn subtitle_extraction_error_response(error: &anyhow::Error) -> Response<Body> {
 
 /// Pre-extract all embedded text subtitle streams for a media source in one FFmpeg pass.
 /// ASS/SSA streams also retain a raw styled copy for renderer-capable clients.
-/// Mirrors Jellyfin's approach: one command, multiple outputs, fire-and-forget at PlaybackInfo time.
+/// Mirrors Jellyfin's one-command/multiple-output cache warming, but remains
+/// cancellable so playback startup always owns the upstream connection.
 /// The `subtitles_stream` endpoint falls back to on-demand extraction for any cache misses.
-pub(crate) async fn pre_extract_all_subtitles_to_cache(
+async fn pre_extract_all_subtitles_to_cache(
     data_dir: std::path::PathBuf,
     input_url: String,
     item_id: uuid::Uuid,
     cache_source_id: uuid::Uuid,
     subtitle_streams: Vec<SubtitleExtractionPlan>,
+    mut cancel_rx: watch::Receiver<bool>,
 ) {
+    if *cancel_rx.borrow() {
+        return;
+    }
     let cache_dir = data_dir.join("subtitle-cache");
     let _ = tokio::fs::create_dir_all(&cache_dir).await;
 
@@ -654,13 +731,27 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
         .iter()
         .any(|(_, srt_output, _)| srt_output.is_some())
     {
-        let _capacity = match SUBTITLE_EXTRACTION_CAPACITY
-            .acquire()
-            .await
-        {
-            Ok(permit) => permit,
-            Err(_) => {
+        let capacity = SUBTITLE_EXTRACTION_CAPACITY.acquire();
+        let _capacity = match tokio::select! {
+            result = capacity => Some(result),
+            changed = cancel_rx.changed() => {
+                let _ = changed;
+                None
+            }
+        } {
+            None => {
+                debug!(%item_id, %cache_source_id, "subtitle pre-extraction cancelled while queued");
+                let _ = done_tx.send(true);
+                batch_extraction_map()
+                    .lock()
+                    .unwrap()
+                    .remove(&extraction_key);
+                return;
+            }
+            Some(Ok(permit)) => permit,
+            Some(Err(_)) => {
                 warn!(%item_id, %cache_source_id, "subtitle extraction capacity closed");
+                let _ = done_tx.send(true);
                 batch_extraction_map()
                     .lock()
                     .unwrap()
@@ -699,9 +790,30 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
         cmd.stderr(std::process::Stdio::piped());
 
         let start = std::time::Instant::now();
-        match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-            .await
-        {
+        let extraction =
+            tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output());
+        let outcome = tokio::select! {
+            result = extraction => Some(result),
+            changed = cancel_rx.changed() => {
+                let _ = changed;
+                None
+            }
+        };
+        if outcome.is_none() {
+            for (_, srt_output, _) in &to_extract {
+                if let Some((temp_path, _)) = srt_output {
+                    let _ = tokio::fs::remove_file(temp_path).await;
+                }
+            }
+            debug!(%item_id, %cache_source_id, ?indices, "cancelled subtitle pre-extraction for active playback");
+            let _ = done_tx.send(true);
+            batch_extraction_map()
+                .lock()
+                .unwrap()
+                .remove(&extraction_key);
+            return;
+        }
+        match outcome.expect("checked above") {
             Ok(Ok(output)) => {
                 let elapsed = start
                     .elapsed()
@@ -760,17 +872,31 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
         if raw_ass_path.is_none() {
             continue;
         }
-        if let Err(error) = extract_raw_ass_to_cache(
+        let map_spec = format!("0:{stream_index}");
+        let extraction = extract_raw_ass_to_cache(
             &cache_dir,
             &input_url,
-            &format!("0:{stream_index}"),
+            &map_spec,
             item_id,
             cache_source_id,
             *stream_index,
-        )
-        .await
-        {
-            warn!(%item_id, %cache_source_id, stream_index, %error, "raw ASS subtitle extraction failed");
+        );
+        let result = tokio::select! {
+            result = extraction => Some(result),
+            changed = cancel_rx.changed() => {
+                let _ = changed;
+                None
+            }
+        };
+        match result {
+            Some(Err(error)) => {
+                warn!(%item_id, %cache_source_id, stream_index, %error, "raw ASS subtitle extraction failed");
+            }
+            None => {
+                debug!(%item_id, %cache_source_id, stream_index, "cancelled raw ASS pre-extraction for active playback");
+                break;
+            }
+            Some(Ok(_)) => {}
         }
     }
 
@@ -1492,6 +1618,38 @@ mod language_code_tests {
         assert_eq!(lang_to_two_letter(""), None);
         assert_eq!(lang_to_two_letter("   "), None);
         assert_eq!(lang_to_two_letter("xyz"), None);
+    }
+
+    #[tokio::test]
+    async fn playback_cancels_subtitle_prefetch_during_grace_period() {
+        let item_id = Uuid::new_v4();
+        let cache_source_id = Uuid::new_v4();
+        schedule_subtitle_pre_extraction(
+            std::env::temp_dir(),
+            "https://example.invalid/video.mkv".to_string(),
+            item_id,
+            cache_source_id,
+            Vec::new(),
+        );
+        assert!(
+            batch_cancellation_map()
+                .lock()
+                .unwrap()
+                .contains_key(&(item_id, cache_source_id))
+        );
+
+        cancel_subtitle_pre_extraction(item_id);
+        for _ in 0..20 {
+            if !batch_cancellation_map()
+                .lock()
+                .unwrap()
+                .contains_key(&(item_id, cache_source_id))
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("cancelled subtitle prefetch remained registered");
     }
 }
 
