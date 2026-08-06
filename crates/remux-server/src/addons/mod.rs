@@ -41,6 +41,20 @@ use remux_sdks::remuxdb;
 pub use remux_sdks::remux::AddonPresetRef;
 use remux_sdks::remux::{LyricDto, MediaSegments, RemoteLyricInfoDto};
 
+const STREAM_ADDON_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn wait_for_stream_addon<F>(
+    future: F,
+    timeout: Duration,
+) -> Option<Result<Vec<crate::stream::StreamInfo>>>
+where
+    F: std::future::Future<Output = Result<Vec<crate::stream::StreamInfo>>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .ok()
+}
+
 pub use remux_sdks::{
     remux::{
         AddonCatalogDto, AddonDto, AddonMetadata, AddonOption, AddonOptionType,
@@ -2170,8 +2184,13 @@ impl AddonService {
             .map(|r| async move {
                 let name = &r.row.name;
                 let t = std::time::Instant::now();
-                match r.stream.as_ref().unwrap().get_streams(media, ctx).await {
-                    Ok(mut streams) => {
+                match wait_for_stream_addon(
+                    r.stream.as_ref().unwrap().get_streams(media, ctx),
+                    STREAM_ADDON_FETCH_TIMEOUT,
+                )
+                .await
+                {
+                    Some(Ok(mut streams)) => {
                         let elapsed = t.elapsed();
                         if streams.is_empty() {
                             debug!(addon = %name, ?elapsed, "addon: no streams");
@@ -2185,8 +2204,17 @@ impl AddonService {
                         }
                         streams
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         warn!(addon = %name, error = %e, elapsed = ?t.elapsed(), "stream addon failed");
+                        vec![]
+                    }
+                    None => {
+                        warn!(
+                            addon = %name,
+                            timeout_secs = STREAM_ADDON_FETCH_TIMEOUT.as_secs(),
+                            elapsed = ?t.elapsed(),
+                            "stream addon timed out"
+                        );
                         vec![]
                     }
                 }
@@ -3007,6 +3035,31 @@ pub fn make_media_id(addon_id: Uuid, local_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stream_addon_fetch_is_bounded_without_losing_ready_results() {
+        let ready = wait_for_stream_addon(
+            std::future::ready(Ok(vec![crate::stream::StreamInfo::default()])),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            ready
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let started = Instant::now();
+        let timed_out = wait_for_stream_addon(
+            std::future::pending::<Result<Vec<crate::stream::StreamInfo>>>(),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(timed_out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     fn make_image(path: &str) -> db::MediaImage {
         db::MediaImage {
