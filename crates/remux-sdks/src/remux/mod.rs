@@ -482,7 +482,8 @@ pub struct ServerConfiguration {
     pub enable_subtitles_detail: Option<bool>,
     pub jellyfin_url: Option<String>,
     pub jellyfin_api_key: Option<String>,
-    /// Kinds that use remote (addon) search. None = all remote-capable kinds enabled.
+    /// Kinds that supplement local-library search with remote add-on results.
+    /// None = remote results enabled for all remote-capable kinds; an empty list = local only.
     /// Values are snake_case MediaKind strings: "movie", "series", "track", "album", "artist", "person".
     pub search_remote_enabled: Option<Vec<String>>,
     /// Probe timeout in seconds for HTTP/local streams (default: 20).

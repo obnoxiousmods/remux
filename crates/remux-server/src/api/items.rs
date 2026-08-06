@@ -25,12 +25,53 @@ use crate::{
 use axum_anyhow::ApiResult as Result;
 use chrono::{Datelike, Utc};
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 
 use super::{mock_items, stub_json};
 
 pub struct ItemsQueryResult {
     pub items: Vec<api::BaseItemDto>,
     pub total_count: i64,
+}
+
+fn is_remote_search_enabled(
+    cfg: &api::ServerConfiguration,
+    kind: &db::MediaKind,
+) -> bool {
+    match &cfg.search_remote_enabled {
+        None => !matches!(kind, db::MediaKind::TvChannel),
+        Some(list) => list.contains(&kind.to_string()),
+    }
+}
+
+fn search_source_kinds(
+    requested_kinds: &[db::MediaKind],
+    cfg: &api::ServerConfiguration,
+    user_remote_enabled: bool,
+) -> (Vec<db::MediaKind>, Vec<db::MediaKind>) {
+    let local_kinds = requested_kinds.to_vec();
+    let remote_kinds = if user_remote_enabled {
+        requested_kinds
+            .iter()
+            .filter(|kind| is_remote_search_enabled(cfg, kind))
+            .cloned()
+            .collect()
+    } else {
+        vec![]
+    };
+    (local_kinds, remote_kinds)
+}
+
+fn merge_search_results(
+    local_items: Vec<api::BaseItemDto>,
+    remote_items: Vec<api::BaseItemDto>,
+) -> Vec<api::BaseItemDto> {
+    let mut seen = HashSet::new();
+    local_items
+        .into_iter()
+        .chain(remote_items)
+        .filter(|item| seen.insert(item.id))
+        .collect()
 }
 
 fn apply_permissions(item: &mut api::BaseItemDto, user: &db::User) {
@@ -282,16 +323,6 @@ pub async fn get_items(
                 }
             }
 
-            fn is_remote_enabled(
-                cfg: &api::ServerConfiguration,
-                kind: &db::MediaKind,
-            ) -> bool {
-                match &cfg.search_remote_enabled {
-                    None => !matches!(kind, db::MediaKind::TvChannel),
-                    Some(list) => list.contains(&kind.to_string()),
-                }
-            }
-
             // Requested kinds: explicit from the client, or fall back to the computed
             // defaults (Movie + Series + Episode with exclude_item_types already applied).
             let requested_kinds: Vec<db::MediaKind> = if raw_types.is_empty() {
@@ -311,23 +342,44 @@ pub async fn get_items(
                     .collect()
             };
 
-            let (mut remote_kinds, mut local_kinds): (Vec<_>, Vec<_>) = requested_kinds
-                .into_iter()
-                .partition(|k| is_remote_enabled(&cfg, k));
-
             let user_remote_enabled = session
                 .user
                 .policy
                 .as_ref()
                 .map(|p| p.enable_remote_search)
                 .unwrap_or(true);
-            if !user_remote_enabled {
-                local_kinds.extend(remote_kinds.drain(..));
-            }
+            let (local_kinds, remote_kinds) =
+                search_source_kinds(&requested_kinds, &cfg, user_remote_enabled);
 
             let search_start = std::time::Instant::now();
 
-            // Remote: all in parallel.
+            // Local is always searched. Configured remote sources supplement it,
+            // and all source queries run concurrently.
+            let local_types: Vec<api::MediaType> = local_kinds
+                .iter()
+                .map(|k| {
+                    k.clone()
+                        .into()
+                })
+                .collect();
+            let mut local_q = q.clone();
+            local_q.search_term = Some(s.clone());
+            local_q.include_item_types = Some(local_types);
+            local_q.parent_id = None;
+            local_q.start_index = None;
+            local_q.limit = Some(limit as u32);
+            let local_result = db::Media::get_by_jellyfin_filter(
+                &state
+                    .ctx
+                    .db,
+                &local_q,
+                false,
+                Some(&session.user),
+                Some(&server_config),
+                None,
+                None,
+            );
+
             let remote_futs: Vec<_> = remote_kinds
                 .iter()
                 .map(|k| {
@@ -347,10 +399,29 @@ pub async fn get_items(
                         )
                 })
                 .collect();
-            let remote_results = futures::future::join_all(remote_futs).await;
+            let (local_result, remote_results) =
+                futures::join!(local_result, futures::future::join_all(remote_futs));
 
-            let mut all_items: Vec<api::BaseItemDto> = vec![];
+            let mut local_items: Vec<api::BaseItemDto> = vec![];
+            let mut remote_items: Vec<api::BaseItemDto> = vec![];
             let mut debug_counts: Vec<(String, usize)> = vec![];
+
+            match local_result {
+                Ok(r) => {
+                    debug_counts.push((
+                        "local".to_string(),
+                        r.records
+                            .len(),
+                    ));
+                    local_items.extend(
+                        r.records
+                            .into_iter()
+                            .filter(|m| !m.is_single_or_ep_album())
+                            .map(|m| api::db_media_to_item(m, hide_sources)),
+                    );
+                }
+                Err(e) => warn!(error = %e, "get_items: local search failed"),
+            }
 
             for (kind, result) in remote_kinds
                 .iter()
@@ -369,7 +440,7 @@ pub async fn get_items(
                             })
                             .collect();
                         debug_counts.push((kind.to_string(), items.len()));
-                        all_items.extend(items);
+                        remote_items.extend(items);
                     }
                     Err(e) => {
                         warn!(error = %e, ?kind, "get_items: remote search failed");
@@ -378,50 +449,7 @@ pub async fn get_items(
                 }
             }
 
-            // Local: single DB query for all local kinds combined.
-            if !local_kinds.is_empty() {
-                let local_types: Vec<api::MediaType> = local_kinds
-                    .iter()
-                    .map(|k| {
-                        k.clone()
-                            .into()
-                    })
-                    .collect();
-                let mut local_q = q.clone();
-                local_q.search_term = Some(s.clone());
-                local_q.include_item_types = Some(local_types);
-                local_q.parent_id = None;
-                local_q.start_index = None;
-                local_q.limit = Some(limit as u32);
-                match db::Media::get_by_jellyfin_filter(
-                    &state
-                        .ctx
-                        .db,
-                    &local_q,
-                    false,
-                    Some(&session.user),
-                    Some(&server_config),
-                    None,
-                    None,
-                )
-                .await
-                {
-                    Ok(r) => {
-                        debug_counts.push((
-                            "local".to_string(),
-                            r.records
-                                .len(),
-                        ));
-                        all_items.extend(
-                            r.records
-                                .into_iter()
-                                .filter(|m| !m.is_single_or_ep_album())
-                                .map(|m| api::db_media_to_item(m, hide_sources)),
-                        );
-                    }
-                    Err(e) => warn!(error = %e, "get_items: local search failed"),
-                }
-            }
+            let all_items = merge_search_results(local_items, remote_items);
 
             debug!(
                 query = %s,
@@ -3295,6 +3323,7 @@ pub async fn media_segments(
 
 #[cfg(test)]
 mod tests {
+    use super::{merge_search_results, search_source_kinds};
     use chrono::Utc;
     use http::header::HeaderValue;
     use remux_sdks::remux::{
@@ -3309,6 +3338,83 @@ mod tests {
     };
 
     const COLLECTIONS_PARENT_ID: &str = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+
+    #[test]
+    fn search_sources_default_to_local_plus_remote() {
+        let requested = vec![
+            db::MediaKind::Track,
+            db::MediaKind::Artist,
+            db::MediaKind::TvChannel,
+        ];
+
+        let (local, remote) = search_source_kinds(
+            &requested,
+            &crate::api::ServerConfiguration::default(),
+            true,
+        );
+
+        assert_eq!(local, requested);
+        assert_eq!(remote, vec![db::MediaKind::Track, db::MediaKind::Artist]);
+    }
+
+    #[test]
+    fn search_sources_respect_remote_kind_configuration() {
+        let requested = vec![db::MediaKind::Track, db::MediaKind::Artist];
+        let config = crate::api::ServerConfiguration {
+            search_remote_enabled: Some(vec!["track".to_string()]),
+            ..Default::default()
+        };
+
+        let (local, remote) = search_source_kinds(&requested, &config, true);
+
+        assert_eq!(local, requested);
+        assert_eq!(remote, vec![db::MediaKind::Track]);
+    }
+
+    #[test]
+    fn search_sources_user_policy_can_disable_remote_results() {
+        let requested = vec![db::MediaKind::Track, db::MediaKind::Artist];
+
+        let (local, remote) = search_source_kinds(
+            &requested,
+            &crate::api::ServerConfiguration::default(),
+            false,
+        );
+
+        assert_eq!(local, requested);
+        assert!(remote.is_empty());
+    }
+
+    #[test]
+    fn merged_search_results_are_local_first_and_deduplicated_by_id() {
+        let local_a = Uuid::new_v4();
+        let shared = Uuid::new_v4();
+        let remote_c = Uuid::new_v4();
+        let item = |id, name: &str| crate::api::BaseItemDto {
+            id,
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+
+        let merged = merge_search_results(
+            vec![item(local_a, "Local A"), item(shared, "Local Shared")],
+            vec![item(shared, "Remote Shared"), item(remote_c, "Remote C")],
+        );
+
+        assert_eq!(
+            merged
+                .iter()
+                .map(|result| result.id)
+                .collect::<Vec<_>>(),
+            vec![local_a, shared, remote_c]
+        );
+        assert_eq!(
+            merged[1]
+                .name
+                .as_deref(),
+            Some("Local Shared")
+        );
+    }
 
     async fn get_user_id(server: &axum_test::TestServer, auth: &str) -> String {
         let response: serde_json::Value = server

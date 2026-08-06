@@ -1115,11 +1115,14 @@ pub fn SearchSettingsCard(app_state: AppState) -> Element {
     };
 
     rsx! {
-        Card { title: "Remote Search",
+        Card { title: "Include Remote Results",
             if *loading.read() {
                 LoadingText {}
             } else {
                 form { onsubmit: on_submit, style: "display:flex;flex-direction:column;gap:14px",
+                    p { class: "field-hint",
+                        "The local library is always searched. Enable remote results by media type below."
+                    }
                     div { class: "field",
                         ToggleRow {
                             label: "Movies",
