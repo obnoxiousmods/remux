@@ -356,59 +356,6 @@ async fn items_playbackinfo_inner(
                 });
         }
 
-        // Pre-extract all embedded text subtitle streams in the background, in one
-        // FFmpeg pass. By the time the client requests a subtitle URL, the cache file
-        // is already written (same approach Jellyfin uses).
-        // Use effective_stream so the URL matches the stream whose track layout was probed.
-        let effective_url = effective_stream
-            .stream_info
-            .as_ref()
-            .map(|si| {
-                si.descriptor
-                    .server_input(effective_stream.id, port)
-            });
-        if let Some(ref input_url) = effective_url {
-            let subtitle_plans = source
-                .media_streams
-                .iter()
-                .filter(|s| {
-                    matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                        && !s.is_external
-                        && s.is_text_subtitle_stream
-                })
-                .map(|stream| {
-                    crate::api::subtitles::subtitle_extraction_plan(
-                        stream.index,
-                        stream
-                            .codec
-                            .as_deref(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            if !subtitle_plans.is_empty() {
-                let data_dir = state
-                    .ctx
-                    .config
-                    .data_dir
-                    .clone();
-                let url = input_url.clone();
-                let cache_source_id = crate::api::subtitles::subtitle_cache_source_id(
-                    &effective_stream,
-                    effective_stream
-                        .probe_data
-                        .as_ref()
-                        .and_then(|probe| probe.size),
-                );
-                crate::api::subtitles::schedule_subtitle_pre_extraction(
-                    data_dir,
-                    url,
-                    id,
-                    cache_source_id,
-                    subtitle_plans,
-                );
-            }
-        }
-
         // Resolve default audio/subtitle stream indexes for this source. These are
         // per-request API values (never persisted); resolving before the burn
         // check, transcode decision and subtitle delivery means those consumers
