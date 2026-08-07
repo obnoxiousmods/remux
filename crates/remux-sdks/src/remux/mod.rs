@@ -2678,6 +2678,12 @@ impl MediaSourceInfo {
 #[dto]
 pub struct MediaSourceRemuxInfo {
     pub provider_info: Option<serde_json::Value>,
+    /// True when the server already has cached probe data for this source
+    /// (video stream codec, resolution, bitrate, etc. from a prior ffprobe).
+    /// Pre-probed sources start playback reliably and 3-5× faster than
+    /// unprobed sources. The Jellyflix client should prefer these.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pre_probed: bool,
 }
 
 impl MediaSourceInfo {

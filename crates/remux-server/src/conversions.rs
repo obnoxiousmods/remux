@@ -185,6 +185,10 @@ impl From<db::Media> for api::MediaSourceInfo {
                 .stream_info
                 .as_ref()
                 .and_then(|si| serde_json::to_value(si).ok()),
+            pre_probed: source
+                .probe_data
+                .as_ref()
+                .is_some_and(|p| p.video_stream().is_some() || p.audio_stream().is_some()),
         });
 
         // The file name without extension. Jellyfin labels a MediaSource with the

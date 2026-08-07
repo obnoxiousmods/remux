@@ -526,13 +526,29 @@ async fn create_hls_session(
             resolved_media.kind,
             db::MediaKind::Movie | db::MediaKind::Episode
         ) {
-            let sources = resolved_media
+            let mut sources = resolved_media
                 .streams(
                     &state
                         .ctx
                         .db,
                 )
                 .await?;
+            // Sort probed-first so the same pre-probed source that PlaybackInfo
+            // selected is the one ffmpeg actually opens. Without this, when
+            // media_source_id is the item_id (auto-play), the HLS session
+            // falls through to .next() and picks the first DB-ordered source —
+            // which may be unprobed and dead, despite a working probed source
+            // being available further down the list.
+            sources.sort_by_key(|s| {
+                if s.probe_data
+                    .as_ref()
+                    .is_some_and(|p| p.video_stream().is_some() || p.audio_stream().is_some())
+                {
+                    0u8
+                } else {
+                    1u8
+                }
+            });
             resolved_media = if let Some(wanted) = q.media_source_id {
                 sources
                     .iter()

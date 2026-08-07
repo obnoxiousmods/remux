@@ -21,9 +21,14 @@ static HTTP_CACHE: std::sync::LazyLock<Store> =
 
 static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(8))
-            .read_timeout(std::time::Duration::from_secs(15))
+        let mut builder = reqwest::Client::builder();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            builder = builder
+                .connect_timeout(std::time::Duration::from_secs(8))
+                .read_timeout(std::time::Duration::from_secs(15));
+        }
+        builder
             .build()
             .expect("failed to build shared HTTP client")
     });
