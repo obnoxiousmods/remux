@@ -578,7 +578,14 @@ impl StreamService {
                     si.descriptor
                         .server_input(stream.id, port)
                 });
-            let skip_probe = sel.probe_only_first && has_probed_source;
+            // When `probe_only_first` is true (auto-play: click → play immediately),
+            // skip the probe entirely for unprobed sources. The probe downloads ~1 MB
+            // from the upstream URL via ffprobe — the same URL ffmpeg then connects to
+            // for playback. That double-hit triggers rate limiting (429) on gateways
+            // like stremio.obby.ca, blocking playback entirely. ffmpeg already has
+            // -analyzeduration/-probesize to handle unknown streams.
+            let skip_probe = (sel.probe_only_first && has_probed_source)
+                || (sel.probe_only_first && stream.probe_data.is_none());
             let was_cached = stream
                 .probe_data
                 .as_ref()
