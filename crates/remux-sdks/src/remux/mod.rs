@@ -486,8 +486,8 @@ pub struct ServerConfiguration {
     /// None = remote results enabled for all remote-capable kinds; an empty list = local only.
     /// Values are snake_case MediaKind strings: "movie", "series", "track", "album", "artist", "person".
     pub search_remote_enabled: Option<Vec<String>>,
-    /// Probe timeout in seconds for HTTP/local streams (default: 20).
-    #[default(Some(20_i64))]
+    /// Probe timeout in seconds for HTTP/local streams (default: 8).
+    #[default(Some(8_i64))]
     pub probe_timeout_secs: Option<i64>,
     /// Probe timeout in seconds for P2P (torrent) streams (default: 60).
     #[default(Some(60_i64))]

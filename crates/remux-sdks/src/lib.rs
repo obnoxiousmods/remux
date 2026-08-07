@@ -20,7 +20,13 @@ static HTTP_CACHE: std::sync::LazyLock<Store> =
     std::sync::LazyLock::new(|| Store::new_weighted(32 * 1024 * 1024)); // 32 MB weight cap
 
 static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(reqwest::Client::new);
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(8))
+            .read_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("failed to build shared HTTP client")
+    });
 
 pub fn clear_http_cache() {
     HTTP_CACHE.clear();

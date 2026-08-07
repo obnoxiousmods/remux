@@ -883,7 +883,10 @@ async fn create_hls_session(
                 .await
                 .source_audio_codec
                 .clone(),
-            trusted_probe_data: false,
+            trusted_probe_data: resolved_media
+                .probe_data
+                .as_ref()
+                .is_some_and(|p| p.video_stream().is_some() || p.audio_stream().is_some()),
             source_frame_rate,
             hardware_acceleration_type: encoding_opts
                 .hardware_acceleration_type
@@ -1957,7 +1960,7 @@ async fn hls_segment_inner(
                             .await
                             .source_audio_codec
                             .clone(),
-                        trusted_probe_data: false,
+                        trusted_probe_data: true,
                         source_frame_rate: session
                             .read()
                             .await

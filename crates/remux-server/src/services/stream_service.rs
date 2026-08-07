@@ -498,6 +498,22 @@ impl StreamService {
             (all_streams, true)
         };
 
+        // Sort candidates so streams with cached probe data come first.
+        // A pre-probed stream is a verified working source — trying it first
+        // avoids wasting time on sources that may be dead or take minutes to
+        // probe (common with debrid-based addons like ObnoxiousTV).
+        let mut candidates = candidates;
+        candidates.sort_by_key(|s| {
+            if s.probe_data
+                .as_ref()
+                .is_some_and(|p| p.video_stream().is_some() || p.audio_stream().is_some())
+            {
+                0u8
+            } else {
+                1u8
+            }
+        });
+
         StreamSelection {
             candidates,
             probe_pool,

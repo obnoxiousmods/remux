@@ -486,6 +486,8 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
         .args([
             "-v",
             "error",
+            "-rw_timeout",
+            "10000000", // 10s read timeout to prevent hanging on slow sources
             "-print_format",
             "json",
             "-show_chapters",

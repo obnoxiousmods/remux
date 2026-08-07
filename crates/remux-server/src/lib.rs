@@ -426,7 +426,7 @@ fn default_port() -> u16 {
 }
 
 fn default_hls_first_segment_secs() -> Option<u32> {
-    None
+    Some(2) // Short first segment for faster startup: ~4s faster to first frame
 }
 
 fn default_torrent_http_port() -> u16 {

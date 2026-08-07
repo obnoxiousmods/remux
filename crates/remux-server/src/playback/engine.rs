@@ -1228,9 +1228,9 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         "-v".into(),
         "error".into(),
         "-analyzeduration".into(),
-        "1000000".into(),
+        if params.trusted_probe_data { "200000" } else { "1000000" }.into(),
         "-probesize".into(),
-        "1000000".into(),
+        if params.trusted_probe_data { "200000" } else { "1000000" }.into(),
     ];
     append_http_input_options(&mut args, &params.input_url);
 
@@ -1281,6 +1281,20 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             "tcp".into(),
             "-timeout".into(),
             "5000000".into(),
+        ]);
+    }
+
+    // Apply a socket I/O timeout for remote HTTP(S) sources so ffmpeg does not
+    // hang indefinitely on a connection that accepts TCP but never sends data.
+    // The stream proxy reqwest client already adds its own timeout; this guard
+    // covers direct (non-proxied) URLs and the ffmpeg-level read path.
+    if params
+        .input_url
+        .starts_with("http")
+    {
+        args.extend([
+            "-timeout".into(),
+            "15000000".into(), // 15s socket timeout in microseconds
         ]);
     }
 
@@ -3680,7 +3694,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_metadata_does_not_reduce_ffmpeg_analysis_budget() {
+    fn trusted_probe_data_reduces_ffmpeg_analysis_budget() {
         let dir = PathBuf::from("/tmp/test_trusted_probe");
         let trusted = build_hls_args(&TranscodeParams {
             trusted_probe_data: true,
@@ -3688,8 +3702,10 @@ mod tests {
         });
         let conservative = build_hls_args(&default_hls(dir));
 
-        assert_eq!(arg_after(&trusted, "-analyzeduration"), Some("1000000"));
-        assert_eq!(arg_after(&trusted, "-probesize"), Some("1000000"));
+        // Trusted probe data reduces ffmpeg analysis to 200ms/200KB
+        assert_eq!(arg_after(&trusted, "-analyzeduration"), Some("200000"));
+        assert_eq!(arg_after(&trusted, "-probesize"), Some("200000"));
+        // Without trusted probe data, use full 1s/1MB analysis
         assert_eq!(
             arg_after(&conservative, "-analyzeduration"),
             Some("1000000")
