@@ -98,6 +98,10 @@ pub struct TranscodeSession {
     pub media_source_id: Uuid,
     pub output_dir: PathBuf,
     pub input_url: String,
+    /// When the current source fails with an upstream error (429, connection
+    /// refused, read error in first 60s), try these URLs in order before
+    /// giving up. Populated from sibling stream sources at session creation.
+    pub fallback_urls: Vec<String>,
     pub state: TranscodeState,
     /// Broadcasts state transitions so waiters can react immediately.
     pub state_tx: Arc<watch::Sender<TranscodeState>>,
@@ -214,6 +218,7 @@ impl TranscodeSession {
             media_source_id,
             output_dir,
             input_url,
+            fallback_urls: vec![],
             state: TranscodeState::Starting,
             state_tx: Arc::new(state_tx),
             output_tx: Arc::new(output_tx),

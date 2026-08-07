@@ -3757,6 +3757,7 @@ mod tests {
             requested_start_ticks: 300_000_000,
             actual_start_ticks: None,
             stopped: false,
+            fallback_urls: vec![],
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
             prewarm: Arc::new(AtomicBool::new(false)),
             runtime_ticks: 120i64

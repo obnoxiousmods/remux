@@ -81,11 +81,17 @@ impl StreamDescriptor {
     }
 
     /// Input URL/path for ffprobe and ffmpeg (server-side tools).
-    /// `Local` → raw filesystem path. `Http` → URL as-is.
-    /// `Torrent`/`Opendal` → our stream proxy, which resolves them on demand.
+    /// Routes remote sources through the local stream proxy so ffprobe and
+    /// ffmpeg share the same reqwest connection pool — the probe's idle
+    /// connection is reused for playback, avoiding a second TCP/TLS handshake
+    /// that can trigger rate limiting on gateways like stremio.obby.ca.
+    /// `Local` → raw filesystem path. `Rtsp` → URL as-is (ffmpeg handles RTSP natively).
     pub fn server_input(&self, media_id: Uuid, port: u16) -> String {
         match self {
-            Self::Http { url, .. } | Self::Rtsp { url } => url.clone(),
+            Self::Http { .. } => {
+                format!("http://127.0.0.1:{}/stream/{}", port, media_id)
+            }
+            Self::Rtsp { url } => url.clone(),
             Self::Local(path) => path
                 .to_string_lossy()
                 .into_owned(),
@@ -599,48 +605,92 @@ impl HttpSource {
 
     async fn serve_http(&self, headers: &HeaderMap) -> Result<Response> {
         let client = STREAM_PROXY_CLIENT.clone();
-        let mut request = client.get(&self.url);
-        if let Some(value) = headers.get(http::header::RANGE) {
-            request = request.header(http::header::RANGE, value.clone());
-        }
-        request = self.apply_request_headers(request);
-
-        let upstream = match request
-            .send()
-            .await
-        {
-            Ok(upstream) => upstream,
-            Err(error) => {
-                tracing::warn!(
-                    upstream_host = self.sanitized_host(),
-                    error = %error,
-                    "upstream request failed; retrying with tolerant HTTP/1 parser"
-                );
-                return self
-                    .tolerant_request(headers)
-                    .await;
+        // Retry loop for rate-limited upstreams (429) and transient server errors.
+        // Gateway services like stremio.obby.ca proxy to debrid APIs that throttle.
+        // A 1-2s backoff lets the rate-limit window expire; ffmpeg's own
+        // -reconnect_on_http_error handles errors that occur mid-stream.
+        const MAX_RETRIES: u32 = 3;
+        let mut last_status: Option<reqwest::StatusCode> = None;
+        for attempt in 0..=MAX_RETRIES {
+            let mut request = client.get(&self.url);
+            if let Some(value) = headers.get(http::header::RANGE) {
+                request = request.header(http::header::RANGE, value.clone());
             }
-        };
+            request = self.apply_request_headers(request);
 
-        let status = upstream.status();
-        let upstream_headers = upstream
-            .headers()
-            .clone();
-        let body = Body::from_stream(
-            upstream
-                .bytes_stream()
-                .map_err(io::Error::other),
-        );
-        let mut response = Response::builder()
-            .status(status)
-            .body(body)
-            .expect("valid upstream response");
-        copy_stream_response_headers(
-            response.headers_mut(),
-            &upstream_headers,
-            &self.response_headers,
-        );
-        Ok(response)
+            let upstream = match request
+                .send()
+                .await
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    tracing::warn!(
+                        upstream_host = self.sanitized_host(),
+                        error = %error,
+                        attempt,
+                        "upstream request failed; retrying with tolerant HTTP/1 parser"
+                    );
+                    return self
+                        .tolerant_request(headers)
+                        .await;
+                }
+            };
+
+            let status = upstream.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RETRIES {
+                let delay = std::time::Duration::from_secs(1u64 << attempt);
+                tracing::info!(
+                    upstream_host = self.sanitized_host(),
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "upstream rate-limited (429); backing off"
+                );
+                last_status = Some(status);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            if status.is_server_error() && attempt < MAX_RETRIES {
+                let delay = std::time::Duration::from_millis(500 * (attempt as u64 + 1));
+                tracing::info!(
+                    upstream_host = self.sanitized_host(),
+                    status = status.as_u16(),
+                    attempt,
+                    "upstream server error; retrying"
+                );
+                last_status = Some(status);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let upstream_headers = upstream
+                .headers()
+                .clone();
+            let body = Body::from_stream(
+                upstream
+                    .bytes_stream()
+                    .map_err(io::Error::other),
+            );
+            let mut response = Response::builder()
+                .status(status)
+                .body(body)
+                .expect("valid upstream response");
+            copy_stream_response_headers(
+                response.headers_mut(),
+                &upstream_headers,
+                &self.response_headers,
+            );
+            return Ok(response);
+        }
+
+        // All retries exhausted — return the last error status to the caller
+        // so ffmpeg/ffprobe can handle it (e.g. fail fast to next source).
+        Err(anyhow::anyhow!(
+            "upstream returned {} after {} retries",
+            last_status
+                .map_or_else(|| "error".to_string(), |s| s.to_string()),
+            MAX_RETRIES
+        ))
+        .context_bad_gateway("upstream source unavailable")
     }
 
     async fn segmented_mp4_layout(
