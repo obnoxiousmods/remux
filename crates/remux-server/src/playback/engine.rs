@@ -1147,6 +1147,8 @@ fn append_http_input_options(args: &mut Vec<String>, input: &str) {
         "1".into(),
         "-reconnect_delay_max".into(),
         "5".into(),
+        "-reconnect_on_http_error".into(),
+        "429,500,502,503,504".into(),
         "-timeout".into(),
         "30000000".into(),
         "-rw_timeout".into(),
