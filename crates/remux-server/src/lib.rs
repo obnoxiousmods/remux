@@ -426,7 +426,9 @@ fn default_port() -> u16 {
 }
 
 fn default_hls_first_segment_secs() -> Option<u32> {
-    Some(2) // Short first segment for faster startup: ~4s faster to first frame
+    None // Disabled: short first segment creates a gap (2s then wait for next 6s keyframe)
+         // which prevents the player from building a buffer. Enable explicitly for
+         // low-bitrate or live content where fast first-frame is critical.
 }
 
 fn default_torrent_http_port() -> u16 {
