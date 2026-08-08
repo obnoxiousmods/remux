@@ -6,6 +6,8 @@ readonly RELEASE_ROOT="/opt/remux/releases"
 readonly CURRENT_LINK="/opt/remux/current"
 readonly PREVIOUS_LINK="/opt/remux/previous"
 readonly LOCK_FILE="/run/lock/remux-canonical-deploy.lock"
+readonly NGINX_CONFIG="deploy/remux.obnoxious.lol.nginx.conf"
+readonly NGINX_CONFIG_DEST="/etc/nginx/sites-enabled/remux.obnoxious.lol"
 
 die() {
   printf 'remux deploy: %s\n' "$*" >&2
@@ -16,6 +18,7 @@ die() {
 [[ "$(pwd -P)" == "$CANONICAL_SOURCE" ]] || cd "$CANONICAL_SOURCE"
 [[ "$(git rev-parse --show-toplevel)" == "$CANONICAL_SOURCE" ]] \
   || die "refusing to deploy outside $CANONICAL_SOURCE"
+[[ -f "$NGINX_CONFIG" ]] || die "tracked nginx configuration is missing"
 
 if [[ ! -e "$LOCK_FILE" ]]; then
   sudo install -o "$(id -un)" -g media -m 0660 /dev/null "$LOCK_FILE"
@@ -84,6 +87,9 @@ sudo install -o root -g root -m 0755 deploy/remux-verify-release.sh /usr/local/s
 sudo install -o root -g root -m 0644 deploy/remux.service /etc/systemd/system/remux.service
 sudo install -o root -g root -m 0644 deploy/remux-integrity.service /etc/systemd/system/remux-integrity.service
 sudo install -o root -g root -m 0644 deploy/remux-integrity.timer /etc/systemd/system/remux-integrity.timer
+sudo install -o root -g root -m 0644 "$NGINX_CONFIG" "$NGINX_CONFIG_DEST"
+sudo nginx -t
+sudo systemctl reload nginx
 sudo systemctl daemon-reload
 sudo /usr/local/sbin/remux-verify-release --release-only
 sudo systemctl enable --now remux-integrity.timer
