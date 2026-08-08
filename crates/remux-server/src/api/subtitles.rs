@@ -79,8 +79,6 @@ fn ffmpeg_bin() -> String {
 const SUBTITLE_HTTP_INPUT_OPTIONS: &[&str] = &[
     "-reconnect",
     "1",
-    "-reconnect_at_eof",
-    "1",
     "-reconnect_streamed",
     "1",
     "-reconnect_delay_max",
@@ -388,7 +386,7 @@ mod local_tests {
     fn subtitle_http_inputs_resume_interrupted_reads() {
         let options =
             subtitle_http_input_options("http://127.0.0.1:3008/stream/source");
-        assert!(options.contains(&"-reconnect_at_eof"));
+        assert!(!options.contains(&"-reconnect_at_eof"));
         assert!(options.contains(&"-reconnect_streamed"));
         assert!(options.contains(&"-reconnect_on_http_error"));
         assert!(subtitle_http_input_options("/media/source.mkv").is_empty());
