@@ -7,6 +7,7 @@ Type=simple
 User=jellyflix
 Group=media
 WorkingDirectory=/opt/remux/data
+EnvironmentFile=-/etc/remux/remux.env
 Environment="DATABASE_URL=sqlite:///opt/remux/data/db.sqlite?mode=rwc"
 Environment="DATA_DIR=/opt/remux/data"
 Environment="FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg"

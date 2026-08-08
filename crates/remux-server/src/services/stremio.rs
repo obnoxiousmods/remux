@@ -105,17 +105,33 @@ impl StremioService {
         media_type: sdks::stremio::MediaType,
         id: impl Into<String>,
     ) -> Result<Vec<sdks::stremio::Stream>> {
-        Ok(self
-            .client
-            .execute(
-                sdks::stremio::StreamEndpoint {
-                    kind: media_type,
-                    id: id.into(),
-                }
-                .with_cache(Duration::from_secs(300)),
-            )
-            .await?
-            .streams)
+        self.get_streams_attributed(media_type, id, None)
+            .await
+    }
+
+    pub async fn get_streams_attributed(
+        &self,
+        media_type: sdks::stremio::MediaType,
+        id: impl Into<String>,
+        attribution: Option<String>,
+    ) -> Result<Vec<sdks::stremio::Stream>> {
+        let endpoint = sdks::stremio::StreamEndpoint {
+            kind: media_type,
+            id: id.into(),
+            attribution: attribution.clone(),
+        };
+        // An attributed response contains user-bound playback links and must
+        // never enter the process-wide SDK cache.
+        let response = if attribution.is_some() {
+            self.client
+                .execute(endpoint)
+                .await?
+        } else {
+            self.client
+                .execute(endpoint.with_cache(Duration::from_secs(300)))
+                .await?
+        };
+        Ok(response.streams)
     }
 
     pub async fn get_subtitles(

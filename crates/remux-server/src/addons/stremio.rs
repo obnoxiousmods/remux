@@ -1,10 +1,13 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use futures::{Stream, StreamExt};
+use hmac::{Hmac, Mac};
 use nutype::nutype;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
+use sha2::Sha256;
 use sqlx::SqlitePool;
 use std::{
     pin::Pin,
@@ -16,12 +19,14 @@ use uuid::Uuid;
 
 use super::{
     AddonCapabilities, AddonKind, AddonMetadata, AddonOption, AddonOptionType,
-    AddonPreset, AddonPresetRegistration, CatalogAddon, CatalogInfo, MediaKind,
-    MetaAddon, ResourceType, SearchAddon, StreamAddon, SubtitleAddon, SubtitleInfo,
-    TreeAddon, addon,
+    AddonPreset, AddonPresetRegistration, AddonRequestIdentity, CatalogAddon,
+    CatalogInfo, MediaKind, MetaAddon, ResourceType, SearchAddon, StreamAddon,
+    SubtitleAddon, SubtitleInfo, TreeAddon, addon,
 };
 use crate::{
-    AppContext, common, db, sdks,
+    AppContext, common,
+    common::get_uuid,
+    db, sdks,
     sdks::{CachedEndpoint, ClientError},
     services::stremio as stremio_service,
 };
@@ -534,8 +539,100 @@ impl StreamAddon for StremioAddon {
         _ctx: &AppContext,
     ) -> Result<Vec<crate::stream::StreamInfo>> {
         let svc = self.service()?;
-        stremio_streams(&svc, &self.manifest_url, media).await
+        stremio_streams(&svc, &self.manifest_url, media, None).await
     }
+
+    async fn get_streams_for_user(
+        &self,
+        media: &db::Media,
+        ctx: &AppContext,
+        identity: Option<&AddonRequestIdentity>,
+    ) -> Result<Vec<crate::stream::StreamInfo>> {
+        let svc = self.service()?;
+        let attribution = identity.and_then(|identity| {
+            remux_attribution(&self.manifest_url, &ctx.config, identity)
+        });
+        stremio_streams(&svc, &self.manifest_url, media, attribution.as_deref()).await
+    }
+}
+
+#[derive(Serialize)]
+struct RemuxAttribution<'a> {
+    iss: &'static str,
+    aud: &'static str,
+    sub: String,
+    name: &'a str,
+    auth: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discord_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discord_name: Option<&'a str>,
+    iat: i64,
+    exp: i64,
+    rid: String,
+}
+
+fn remux_attribution(
+    manifest_url: &StremioManifestUrl,
+    config: &crate::Config,
+    identity: &AddonRequestIdentity,
+) -> Option<String> {
+    if config
+        .gateway_attribution_key
+        .is_empty()
+        || config
+            .gateway_attribution_origin
+            .is_empty()
+    {
+        return None;
+    }
+    let manifest = url::Url::parse(manifest_url.as_ref()).ok()?;
+    if manifest
+        .origin()
+        .ascii_serialization()
+        != config.gateway_attribution_origin
+    {
+        return None;
+    }
+    let now = Utc::now().timestamp();
+    let claims = RemuxAttribution {
+        iss: "remux",
+        aud: "obnoxioustv",
+        sub: identity
+            .user_id
+            .to_string(),
+        name: &identity.username,
+        auth: if identity
+            .discord_user_id
+            .is_some()
+        {
+            "discord_linked"
+        } else {
+            "password"
+        },
+        discord_id: identity
+            .discord_user_id
+            .as_deref(),
+        discord_name: identity
+            .discord_username
+            .as_deref(),
+        iat: now,
+        exp: now + 60,
+        rid: get_uuid().to_string(),
+    };
+    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).ok()?);
+    let mut mac = Hmac::<Sha256>::new_from_slice(
+        config
+            .gateway_attribution_key
+            .as_bytes(),
+    )
+    .ok()?;
+    mac.update(body.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(
+        mac.finalize()
+            .into_bytes(),
+    );
+    Some(format!("v1.{body}.{signature}"))
 }
 
 fn stremio_type_for_kind(kind: &db::MediaKind) -> Option<&'static str> {
@@ -1312,6 +1409,7 @@ async fn stremio_streams(
     svc: &stremio_service::StremioService,
     manifest_url: &StremioManifestUrl,
     media: &db::Media,
+    attribution: Option<&str>,
 ) -> Result<Vec<crate::stream::StreamInfo>> {
     let (media_type, id, tmdb_fallback_id) = match media.kind {
         db::MediaKind::Episode => {
@@ -1409,14 +1507,18 @@ async fn stremio_streams(
     };
 
     let streams = match svc
-        .get_streams(media_type.clone(), id)
+        .get_streams_attributed(media_type.clone(), id, attribution.map(str::to_owned))
         .await
     {
         Ok(s) => s,
         Err(e) if is_404(&e) => {
             if let Some(fb_id) = tmdb_fallback_id {
-                svc.get_streams(media_type, fb_id)
-                    .await?
+                svc.get_streams_attributed(
+                    media_type,
+                    fb_id,
+                    attribution.map(str::to_owned),
+                )
+                .await?
             } else {
                 return Err(e);
             }
@@ -1577,6 +1679,57 @@ async fn stremio_streams(
 mod tests {
     use super::*;
 
+    #[test]
+    fn attribution_is_signed_only_for_the_exact_gateway_origin() {
+        let config = crate::Config {
+            gateway_attribution_key: "shared-secret".to_string(),
+            gateway_attribution_origin: "https://stremio.obby.ca".to_string(),
+            ..Default::default()
+        };
+        let identity = AddonRequestIdentity {
+            user_id: Uuid::nil(),
+            username: "alice".to_string(),
+            discord_user_id: Some("123456789012345678".to_string()),
+            discord_username: Some("alice.example".to_string()),
+        };
+        let trusted = StremioManifestUrl::try_new(
+            "https://stremio.obby.ca/a/install-token/manifest.json".to_string(),
+        )
+        .unwrap();
+        let token = remux_attribution(&trusted, &config, &identity).unwrap();
+        let mut parts = token.split('.');
+        assert_eq!(parts.next(), Some("v1"));
+        let body = parts
+            .next()
+            .unwrap();
+        let signature = parts
+            .next()
+            .unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        mac.update(body.as_bytes());
+        assert_eq!(
+            signature,
+            URL_SAFE_NO_PAD.encode(
+                mac.finalize()
+                    .into_bytes()
+            )
+        );
+        let claims: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(body)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["sub"], Uuid::nil().to_string());
+        assert_eq!(claims["discord_id"], "123456789012345678");
+
+        let lookalike = StremioManifestUrl::try_new(
+            "https://stremio.obby.ca.evil.example/a/token/manifest.json".to_string(),
+        )
+        .unwrap();
+        assert!(remux_attribution(&lookalike, &config, &identity).is_none());
+    }
+
     fn mock_manifest(server: &httpmock::MockServer) {
         server.mock(|when, then| {
             when.path("/manifest.json");
@@ -1721,7 +1874,7 @@ mod tests {
             ..Default::default()
         });
 
-        let streams = stremio_streams(&svc, &manifest_url, &media)
+        let streams = stremio_streams(&svc, &manifest_url, &media, None)
             .await
             .unwrap();
 
@@ -1748,7 +1901,7 @@ mod tests {
             ..Default::default()
         });
 
-        let streams = stremio_streams(&svc, &manifest_url, &media)
+        let streams = stremio_streams(&svc, &manifest_url, &media, None)
             .await
             .unwrap();
 

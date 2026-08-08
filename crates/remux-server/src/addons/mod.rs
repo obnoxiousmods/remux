@@ -747,6 +747,15 @@ pub trait StreamAddon: Send + Sync {
         media: &db::Media,
         ctx: &AppContext,
     ) -> Result<Vec<crate::stream::StreamInfo>>;
+    async fn get_streams_for_user(
+        &self,
+        media: &db::Media,
+        ctx: &AppContext,
+        identity: Option<&AddonRequestIdentity>,
+    ) -> Result<Vec<crate::stream::StreamInfo>> {
+        let _ = identity;
+        self.get_streams(media, ctx).await
+    }
     /// Serve bytes for a stream that requires this addon's config (e.g. credentials).
     /// Only called when `StreamDescriptor::addon_id()` points to this addon.
     async fn serve_stream(
@@ -760,6 +769,14 @@ pub trait StreamAddon: Send + Sync {
             .detail("serve_stream not implemented for this addon")
             .build())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct AddonRequestIdentity {
+    pub user_id: Uuid,
+    pub username: String,
+    pub discord_user_id: Option<String>,
+    pub discord_username: Option<String>,
 }
 
 #[async_trait]
@@ -2168,6 +2185,24 @@ impl AddonService {
         ctx: &AppContext,
         user_id: Option<Uuid>,
     ) -> Result<Vec<db::Media>> {
+        let identity = if let Some(user_id) = user_id {
+            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                "SELECT u.username, e.provider_user_id, e.provider_username FROM users u \
+                 LEFT JOIN external_identities e ON e.user_id = u.id AND e.provider = 'discord' \
+                 WHERE u.id = ?1",
+            )
+            .bind(user_id)
+            .fetch_optional(&ctx.db)
+            .await?
+            .map(|(username, discord_user_id, discord_username)| AddonRequestIdentity {
+                user_id,
+                username,
+                discord_user_id,
+                discord_username,
+            })
+        } else {
+            None
+        };
         let addons = self
             .addons_for::<dyn StreamAddon>(media, &ctx.db, user_id)
             .await;
@@ -2181,11 +2216,16 @@ impl AddonService {
 
         let tasks: Vec<_> = addons
             .into_iter()
-            .map(|r| async move {
+            .map(|r| {
+                let identity = identity.clone();
+                async move {
                 let name = &r.row.name;
                 let t = std::time::Instant::now();
                 match wait_for_stream_addon(
-                    r.stream.as_ref().unwrap().get_streams(media, ctx),
+                    r.stream
+                        .as_ref()
+                        .unwrap()
+                        .get_streams_for_user(media, ctx, identity.as_ref()),
                     STREAM_ADDON_FETCH_TIMEOUT,
                 )
                 .await
@@ -2217,6 +2257,7 @@ impl AddonService {
                         );
                         vec![]
                     }
+                }
                 }
             })
             .collect();

@@ -531,6 +531,25 @@ pub struct Config {
     /// [`default_db_max_connections`].
     #[serde(default = "default_db_max_connections")]
     pub db_max_connections: u32,
+    /// Discord OAuth application and guild used for Remux sign-in. Secrets are
+    /// deliberately omitted from Config's Debug/Serialize output.
+    #[serde(default)]
+    pub discord_client_id: String,
+    #[serde(default, skip_serializing)]
+    pub discord_client_secret: String,
+    #[serde(default, skip_serializing)]
+    pub discord_bot_token: String,
+    #[serde(default)]
+    pub discord_guild_id: String,
+    #[serde(default)]
+    pub discord_redirect_uri: String,
+    #[serde(default)]
+    pub discord_jellyflix_role_id: String,
+    /// HMAC key and exact destination allowed to receive Remux identity.
+    #[serde(default, skip_serializing)]
+    pub gateway_attribution_key: String,
+    #[serde(default)]
+    pub gateway_attribution_origin: String,
 }
 
 /// Connection-pool default.
@@ -670,6 +689,14 @@ impl Default for Config {
             telemetry_slow_request_ms: default_telemetry_slow_request_ms(),
             remuxdb_url: default_remuxdb_url(),
             db_max_connections: default_db_max_connections(),
+            discord_client_id: String::new(),
+            discord_client_secret: String::new(),
+            discord_bot_token: String::new(),
+            discord_guild_id: String::new(),
+            discord_redirect_uri: String::new(),
+            discord_jellyflix_role_id: String::new(),
+            gateway_attribution_key: String::new(),
+            gateway_attribution_origin: String::new(),
         }
         .resolve()
     }

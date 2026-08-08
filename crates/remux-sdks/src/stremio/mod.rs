@@ -767,6 +767,7 @@ impl Episode {
 pub struct StreamEndpoint {
     pub kind: MediaType,
     pub id: String,
+    pub attribution: Option<String>,
 }
 
 impl Endpoint for StreamEndpoint {
@@ -782,6 +783,13 @@ impl Endpoint for StreamEndpoint {
             http::header::USER_AGENT,
             http::HeaderValue::from_static("AIOStreams/1.0"),
         );
+        if let Some(value) = self
+            .attribution
+            .as_deref()
+            .and_then(|value| http::HeaderValue::from_str(value).ok())
+        {
+            map.insert(http::HeaderName::from_static("x-remux-attribution"), value);
+        }
         map
     }
 }
