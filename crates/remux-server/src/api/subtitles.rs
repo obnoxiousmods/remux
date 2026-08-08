@@ -38,7 +38,7 @@ static SUBTITLE_RECENT_FAILURES: LazyLock<
 const SUBTITLE_FAILURE_COOLDOWN: std::time::Duration =
     std::time::Duration::from_secs(5);
 const SUBTITLE_EXTRACTION_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(300);
+    std::time::Duration::from_secs(900);
 
 fn subtitle_failure_is_cooling_down(key: &SubtitleArtifactKey) -> bool {
     let mut failures = SUBTITLE_RECENT_FAILURES
