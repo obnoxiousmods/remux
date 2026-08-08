@@ -51,6 +51,9 @@ fn subtitle_error_is_transient(error: &anyhow::Error) -> bool {
     detail.contains("429 Too Many Requests")
         || detail.contains("Server returned 429")
         || detail.contains("timed out")
+        || detail.contains("Stream ends prematurely")
+        || detail.contains("Input/output error")
+        || detail.contains("Read error")
 }
 
 fn record_transient_subtitle_failure(key: SubtitleArtifactKey, error: &anyhow::Error) {
@@ -71,6 +74,34 @@ fn clear_subtitle_failure(key: &SubtitleArtifactKey) {
 
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into())
+}
+
+const SUBTITLE_HTTP_INPUT_OPTIONS: &[&str] = &[
+    "-reconnect",
+    "1",
+    "-reconnect_at_eof",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+    "-reconnect_on_http_error",
+    "429,500,502,503,504",
+    "-timeout",
+    "30000000",
+    "-rw_timeout",
+    "30000000",
+];
+
+fn subtitle_http_input_options(input: &str) -> &'static [&'static str] {
+    let is_http = url::Url::parse(input)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https"));
+    if is_http {
+        SUBTITLE_HTTP_INPUT_OPTIONS
+    } else {
+        &[]
+    }
 }
 
 /// Tracks in-progress batch subtitle extractions. Subtitle endpoint waits on these
@@ -254,6 +285,7 @@ mod local_tests {
     use super::{
         is_valid_ass_document, subtitle_cache_source_id,
         subtitle_extraction_error_response, subtitle_extraction_plan,
+        subtitle_http_input_options,
     };
     use crate::{db, stream};
     use uuid::Uuid;
@@ -351,6 +383,21 @@ mod local_tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn subtitle_http_inputs_resume_interrupted_reads() {
+        let options =
+            subtitle_http_input_options("http://127.0.0.1:3008/stream/source");
+        assert!(options.contains(&"-reconnect_at_eof"));
+        assert!(options.contains(&"-reconnect_streamed"));
+        assert!(options.contains(&"-reconnect_on_http_error"));
+        assert!(subtitle_http_input_options("/media/source.mkv").is_empty());
+
+        let response = subtitle_extraction_error_response(&anyhow::anyhow!(
+            "Stream ends prematurely: Input/output error"
+        ));
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 /// Extract an embedded subtitle stream to the SRT cache and return the cache path.
@@ -400,9 +447,9 @@ pub(crate) async fn extract_subtitle_to_cache(
     // relative to the container start, matching the batch pre-extraction path
     // and the video timeline. With -copyts, containers with a non-zero start
     // time (e.g. ~1.4s for MPEG-TS) bake that offset into every cue.
+    cmd.args(["-y", "-nostdin"]);
+    cmd.args(subtitle_http_input_options(input_url));
     cmd.args([
-        "-y",
-        "-nostdin",
         "-i",
         input_url,
         "-map",
@@ -489,9 +536,9 @@ async fn extract_raw_ass_to_cache(
         .map_err(|_| anyhow!("subtitle extraction capacity closed"))?;
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.kill_on_drop(true);
+    cmd.args(["-y", "-nostdin"]);
+    cmd.args(subtitle_http_input_options(input_url));
     cmd.args([
-        "-y",
-        "-nostdin",
         "-i",
         input_url,
         "-map",
@@ -582,9 +629,9 @@ async fn extract_binary_subtitle_to_cache(
         .map_err(|_| anyhow!("subtitle extraction capacity closed"))?;
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.kill_on_drop(true);
+    cmd.args(["-y", "-nostdin"]);
+    cmd.args(subtitle_http_input_options(input_url));
     cmd.args([
-        "-y",
-        "-nostdin",
         "-i",
         input_url,
         "-map",
@@ -812,7 +859,9 @@ async fn pre_extract_all_subtitles_to_cache(
         // -y: overwrite without prompting (hangs forever waiting for stdin otherwise)
         // -nostdin: don't read from stdin at all
         // -c:s srt: convert to SRT so the cache is always valid SRT (not raw ASS/VTT bytes)
-        cmd.args(["-y", "-nostdin", "-i", &input_url]);
+        cmd.args(["-y", "-nostdin"]);
+        cmd.args(subtitle_http_input_options(&input_url));
+        cmd.args(["-i", &input_url]);
         for (idx, srt_output, ass_output, binary_output) in &to_extract {
             if let Some(p) = srt_output
                 .as_ref()
