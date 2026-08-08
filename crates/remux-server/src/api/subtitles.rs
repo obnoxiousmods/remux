@@ -37,6 +37,8 @@ static SUBTITLE_RECENT_FAILURES: LazyLock<
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 const SUBTITLE_FAILURE_COOLDOWN: std::time::Duration =
     std::time::Duration::from_secs(5);
+const SUBTITLE_EXTRACTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(300);
 
 fn subtitle_failure_is_cooling_down(key: &SubtitleArtifactKey) -> bool {
     let mut failures = SUBTITLE_RECENT_FAILURES
@@ -466,17 +468,16 @@ pub(crate) async fn extract_subtitle_to_cache(
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::piped());
 
-    let output =
-        tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-            .await
-            .map_err(|_| {
-                let p = temp_path.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::fs::remove_file(p).await;
-                });
-                anyhow!("subtitle extraction timed out")
-            })?
-            .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
+    let output = tokio::time::timeout(SUBTITLE_EXTRACTION_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| {
+            let p = temp_path.clone();
+            tokio::spawn(async move {
+                let _ = tokio::fs::remove_file(p).await;
+            });
+            anyhow!("subtitle extraction timed out")
+        })?
+        .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
 
     if !output
         .status
@@ -556,9 +557,7 @@ async fn extract_raw_ass_to_cache(
     cmd.stderr(std::process::Stdio::piped());
 
     let output =
-        match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-            .await
-        {
+        match tokio::time::timeout(SUBTITLE_EXTRACTION_TIMEOUT, cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
                 let _ = tokio::fs::remove_file(&temp_path).await;
@@ -647,11 +646,10 @@ async fn extract_binary_subtitle_to_cache(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::piped());
-    let output =
-        tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-            .await
-            .map_err(|_| anyhow!("binary subtitle extraction timed out"))?
-            .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
+    let output = tokio::time::timeout(SUBTITLE_EXTRACTION_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| anyhow!("binary subtitle extraction timed out"))?
+        .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
     if !output
         .status
         .success()
@@ -678,6 +676,90 @@ async fn extract_binary_subtitle_to_cache(
         anyhow::bail!("failed to publish binary subtitle cache entry: {error}");
     }
     Ok(cache_path)
+}
+
+async fn extract_raw_ass_detached(
+    cache_dir: std::path::PathBuf,
+    input_url: String,
+    map_spec: String,
+    item_id: Uuid,
+    cache_source_id: Uuid,
+    stream_index: i64,
+) -> anyhow::Result<std::path::PathBuf> {
+    tokio::spawn(async move {
+        let artifact_key = (
+            item_id,
+            cache_source_id,
+            stream_index,
+            SubtitleArtifactKind::RawAss,
+        );
+        let _artifact_guard = SUBTITLE_ARTIFACT_LOCKS
+            .lock(artifact_key)
+            .await;
+        let cache_path =
+            cache_dir.join(format!("{item_id}_{cache_source_id}_{stream_index}.ass"));
+        if tokio::fs::read(&cache_path)
+            .await
+            .ok()
+            .is_some_and(|bytes| is_valid_ass_document(&bytes))
+        {
+            return Ok(cache_path);
+        }
+        extract_raw_ass_to_cache(
+            &cache_dir,
+            &input_url,
+            &map_spec,
+            item_id,
+            cache_source_id,
+            stream_index,
+        )
+        .await
+    })
+    .await
+    .map_err(|error| anyhow!("ASS subtitle extraction task failed: {error}"))?
+}
+
+async fn extract_binary_subtitle_detached(
+    cache_dir: std::path::PathBuf,
+    input_url: String,
+    map_spec: String,
+    item_id: Uuid,
+    cache_source_id: Uuid,
+    stream_index: i64,
+    output_format: String,
+) -> anyhow::Result<std::path::PathBuf> {
+    tokio::spawn(async move {
+        let artifact_key = (
+            item_id,
+            cache_source_id,
+            stream_index,
+            SubtitleArtifactKind::RawBinary,
+        );
+        let _artifact_guard = SUBTITLE_ARTIFACT_LOCKS
+            .lock(artifact_key)
+            .await;
+        let cache_path =
+            cache_dir.join(format!("{item_id}_{cache_source_id}_{stream_index}.sup"));
+        if tokio::fs::metadata(&cache_path)
+            .await
+            .ok()
+            .is_some_and(|metadata| metadata.len() > 0)
+        {
+            return Ok(cache_path);
+        }
+        extract_binary_subtitle_to_cache(
+            &cache_dir,
+            &input_url,
+            &map_spec,
+            item_id,
+            cache_source_id,
+            stream_index,
+            &output_format,
+        )
+        .await
+    })
+    .await
+    .map_err(|error| anyhow!("binary subtitle extraction task failed: {error}"))?
 }
 
 fn subtitle_extraction_error_response(error: &anyhow::Error) -> Response<Body> {
@@ -918,7 +1000,7 @@ async fn pre_extract_all_subtitles_to_cache(
 
         let start = std::time::Instant::now();
         let extraction =
-            tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output());
+            tokio::time::timeout(SUBTITLE_EXTRACTION_TIMEOUT, cmd.output());
         let outcome = tokio::select! {
             result = extraction => Some(result),
             changed = cancel_rx.changed() => {
@@ -1287,9 +1369,6 @@ async fn subtitles_stream_inner(
             stream_index,
             SubtitleArtifactKind::RawAss,
         );
-        let _artifact_guard = SUBTITLE_ARTIFACT_LOCKS
-            .lock(artifact_key)
-            .await;
         let cache_dir = state
             .ctx
             .config
@@ -1314,11 +1393,9 @@ async fn subtitles_stream_inner(
             if let Some(mut rx) = in_progress_rx {
                 if !*rx.borrow() {
                     info!(%item_id, %media_source_id, stream_index, "batch ASS extraction in progress - waiting for it to finish");
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
-                        rx.changed(),
-                    )
-                    .await;
+                    let _ =
+                        tokio::time::timeout(SUBTITLE_EXTRACTION_TIMEOUT, rx.changed())
+                            .await;
                     cached = tokio::fs::read(&cache_path)
                         .await
                         .ok()
@@ -1335,10 +1412,10 @@ async fn subtitles_stream_inner(
                     "subtitle extraction timed out during retry cooldown"
                 )));
             }
-            let published_path = match extract_raw_ass_to_cache(
-                &cache_dir,
-                &url,
-                &map_spec,
+            let published_path = match extract_raw_ass_detached(
+                cache_dir.clone(),
+                url.clone(),
+                map_spec.clone(),
                 item_id,
                 cache_source_id,
                 stream_index,
@@ -1375,9 +1452,6 @@ async fn subtitles_stream_inner(
             stream_index,
             SubtitleArtifactKind::RawBinary,
         );
-        let _artifact_guard = SUBTITLE_ARTIFACT_LOCKS
-            .lock(artifact_key)
-            .await;
         let cache_dir = state
             .ctx
             .config
@@ -1398,11 +1472,9 @@ async fn subtitles_stream_inner(
             if let Some(mut rx) = in_progress_rx {
                 if !*rx.borrow() {
                     info!(%item_id, %media_source_id, stream_index, "batch PGS extraction in progress - waiting for it to finish");
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
-                        rx.changed(),
-                    )
-                    .await;
+                    let _ =
+                        tokio::time::timeout(SUBTITLE_EXTRACTION_TIMEOUT, rx.changed())
+                            .await;
                     cached = tokio::fs::metadata(&expected_cache_path)
                         .await
                         .ok()
@@ -1419,14 +1491,14 @@ async fn subtitles_stream_inner(
             debug!(%item_id, %media_source_id, stream_index, "raw PGS subtitle cache hit");
             expected_cache_path
         } else {
-            match extract_binary_subtitle_to_cache(
-                &cache_dir,
-                &url,
-                &map_spec,
+            match extract_binary_subtitle_detached(
+                cache_dir.clone(),
+                url.clone(),
+                map_spec.clone(),
                 item_id,
                 cache_source_id,
                 stream_index,
-                &output_format,
+                output_format.clone(),
             )
             .await
             {
@@ -1493,11 +1565,8 @@ async fn subtitles_stream_inner(
         if let Some(mut rx) = in_progress_rx {
             if !*rx.borrow() {
                 info!(%item_id, stream_index, "batch extraction in progress — waiting for it to finish");
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
-                    rx.changed(),
-                )
-                .await;
+                let _ = tokio::time::timeout(SUBTITLE_EXTRACTION_TIMEOUT, rx.changed())
+                    .await;
             }
         }
 
