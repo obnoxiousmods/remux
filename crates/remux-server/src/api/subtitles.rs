@@ -225,19 +225,27 @@ fn is_valid_ass_document(bytes: &[u8]) -> bool {
 pub(crate) struct SubtitleExtractionPlan {
     pub stream_index: i64,
     pub preserve_raw_ass: bool,
+    pub binary_format: Option<&'static str>,
 }
 
 pub(crate) fn subtitle_extraction_plan(
     stream_index: i64,
     codec: Option<&str>,
 ) -> SubtitleExtractionPlan {
-    let preserve_raw_ass = codec
+    let normalized_codec = codec
         .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|codec| matches!(codec.as_str(), "ass" | "ssa"));
+        .map(str::to_ascii_lowercase);
+    let preserve_raw_ass = normalized_codec
+        .as_deref()
+        .is_some_and(|codec| matches!(codec, "ass" | "ssa"));
+    let binary_format = normalized_codec
+        .as_deref()
+        .filter(|codec| matches!(*codec, "pgssub" | "sup" | "hdmv_pgs_subtitle"))
+        .map(|_| "sup");
     SubtitleExtractionPlan {
         stream_index,
         preserve_raw_ass,
+        binary_format,
     }
 }
 
@@ -292,6 +300,7 @@ mod local_tests {
     fn extraction_plan_preserves_only_native_ass_formats() {
         for codec in [Some("ass"), Some("SSA"), Some(" ass ")] {
             assert!(subtitle_extraction_plan(3, codec).preserve_raw_ass);
+            assert_eq!(subtitle_extraction_plan(3, codec).binary_format, None);
         }
         for codec in [
             Some("srt"),
@@ -305,6 +314,15 @@ mod local_tests {
             None,
         ] {
             assert!(!subtitle_extraction_plan(3, codec).preserve_raw_ass);
+        }
+        for codec in [Some("pgssub"), Some("sup"), Some("hdmv_pgs_subtitle")] {
+            assert_eq!(
+                subtitle_extraction_plan(3, codec).binary_format,
+                Some("sup")
+            );
+        }
+        for codec in [Some("srt"), Some("ass"), Some("dvdsub"), None] {
+            assert_eq!(subtitle_extraction_plan(3, codec).binary_format, None);
         }
     }
 
@@ -605,7 +623,10 @@ async fn extract_binary_subtitle_to_cache(
         .is_some_and(|m| m.len() > 0)
     {
         let _ = tokio::fs::remove_file(&temp_path).await;
-        anyhow::bail!("binary subtitle extraction produced empty output");
+        anyhow::bail!(
+            "binary subtitle extraction produced empty output: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     if let Err(error) = tokio::fs::rename(&temp_path, &cache_path).await {
         let _ = tokio::fs::remove_file(&temp_path).await;
@@ -634,8 +655,9 @@ fn subtitle_extraction_error_response(error: &anyhow::Error) -> Response<Body> {
         .unwrap()
 }
 
-/// Pre-extract all embedded text subtitle streams for a media source in one FFmpeg pass.
-/// ASS/SSA streams also retain a raw styled copy for renderer-capable clients.
+/// Pre-extract subtitle streams for a media source in one FFmpeg pass.
+/// Text streams get normalized SRT, ASS/SSA also retain their styled source,
+/// and PGS streams retain raw SUP data for bitmap-capable clients.
 /// Mirrors Jellyfin's one-command/multiple-output cache warming, but remains
 /// cancellable so playback startup always owns the upstream connection.
 /// The `subtitles_stream` endpoint falls back to on-demand extraction for any cache misses.
@@ -677,9 +699,20 @@ async fn pre_extract_all_subtitles_to_cache(
         let srt_path = cache_dir.join(format!("{item_id}_{cache_source_id}_{idx}.srt"));
         let raw_ass_path =
             cache_dir.join(format!("{item_id}_{cache_source_id}_{idx}.ass"));
-        let needs_srt = !cache_is_populated(&srt_path);
+        let raw_binary_path =
+            cache_dir.join(format!("{item_id}_{cache_source_id}_{idx}.sup"));
+        // Bitmap subtitles cannot be converted to text. Preserve them as SUP
+        // in the same FFmpeg pass instead of poisoning every SRT output.
+        let needs_srt = plan
+            .binary_format
+            .is_none()
+            && !cache_is_populated(&srt_path);
         let needs_raw_ass = plan.preserve_raw_ass && !cache_is_populated(&raw_ass_path);
-        if needs_srt || needs_raw_ass {
+        let needs_raw_binary = plan
+            .binary_format
+            .is_some()
+            && !cache_is_populated(&raw_binary_path);
+        if needs_srt || needs_raw_ass || needs_raw_binary {
             let srt_output = needs_srt.then(|| {
                 (
                     cache_dir.join(format!(
@@ -689,7 +722,25 @@ async fn pre_extract_all_subtitles_to_cache(
                     srt_path,
                 )
             });
-            to_extract.push((idx, srt_output, needs_raw_ass.then_some(raw_ass_path)));
+            let ass_output = needs_raw_ass.then(|| {
+                (
+                    cache_dir.join(format!(
+                        "{item_id}_{cache_source_id}_{idx}_{}.batch.tmp.ass",
+                        Uuid::new_v4()
+                    )),
+                    raw_ass_path,
+                )
+            });
+            let binary_output = needs_raw_binary.then(|| {
+                (
+                    cache_dir.join(format!(
+                        "{item_id}_{cache_source_id}_{idx}_{}.batch.tmp.sup",
+                        Uuid::new_v4()
+                    )),
+                    raw_binary_path,
+                )
+            });
+            to_extract.push((idx, srt_output, ass_output, binary_output));
         } else {
             debug!(%item_id, stream_index = idx, "subtitle caches hit, skipping");
         }
@@ -702,7 +753,7 @@ async fn pre_extract_all_subtitles_to_cache(
 
     let indices: Vec<i64> = to_extract
         .iter()
-        .map(|(i, _, _)| *i)
+        .map(|(i, _, _, _)| *i)
         .collect();
     info!(
         %item_id,
@@ -727,9 +778,6 @@ async fn pre_extract_all_subtitles_to_cache(
         extracting.insert(extraction_key, done_rx);
     }
 
-    if to_extract
-        .iter()
-        .any(|(_, srt_output, _)| srt_output.is_some())
     {
         let capacity = SUBTITLE_EXTRACTION_CAPACITY.acquire();
         let _capacity = match tokio::select! {
@@ -765,7 +813,7 @@ async fn pre_extract_all_subtitles_to_cache(
         // -nostdin: don't read from stdin at all
         // -c:s srt: convert to SRT so the cache is always valid SRT (not raw ASS/VTT bytes)
         cmd.args(["-y", "-nostdin", "-i", &input_url]);
-        for (idx, srt_output, _) in &to_extract {
+        for (idx, srt_output, ass_output, binary_output) in &to_extract {
             if let Some(p) = srt_output
                 .as_ref()
                 .and_then(|(temp_path, _)| temp_path.to_str())
@@ -781,6 +829,38 @@ async fn pre_extract_all_subtitles_to_cache(
                     "1",
                     "-f",
                     "srt",
+                    p,
+                ]);
+            }
+            if let Some(p) = ass_output
+                .as_ref()
+                .and_then(|(temp_path, _)| temp_path.to_str())
+            {
+                cmd.args([
+                    "-map",
+                    &format!("0:{idx}"),
+                    "-an",
+                    "-vn",
+                    "-c:s",
+                    "copy",
+                    "-f",
+                    "ass",
+                    p,
+                ]);
+            }
+            if let Some(p) = binary_output
+                .as_ref()
+                .and_then(|(temp_path, _)| temp_path.to_str())
+            {
+                cmd.args([
+                    "-map",
+                    &format!("0:{idx}"),
+                    "-an",
+                    "-vn",
+                    "-c:s",
+                    "copy",
+                    "-f",
+                    "sup",
                     p,
                 ]);
             }
@@ -800,9 +880,11 @@ async fn pre_extract_all_subtitles_to_cache(
             }
         };
         if outcome.is_none() {
-            for (_, srt_output, _) in &to_extract {
-                if let Some((temp_path, _)) = srt_output {
-                    let _ = tokio::fs::remove_file(temp_path).await;
+            for (_, srt_output, ass_output, binary_output) in &to_extract {
+                for output in [srt_output, ass_output, binary_output] {
+                    if let Some((temp_path, _)) = output {
+                        let _ = tokio::fs::remove_file(temp_path).await;
+                    }
                 }
             }
             debug!(%item_id, %cache_source_id, ?indices, "cancelled subtitle pre-extraction for active playback");
@@ -822,25 +904,29 @@ async fn pre_extract_all_subtitles_to_cache(
                     .status
                     .success()
                 {
-                    for (_, srt_output, _) in &to_extract {
-                        if let Some((temp_path, cache_path)) = srt_output {
-                            if cache_is_populated(temp_path) {
-                                if tokio::fs::rename(temp_path, cache_path)
-                                    .await
-                                    .is_err()
-                                {
+                    for (_, srt_output, ass_output, binary_output) in &to_extract {
+                        for output in [srt_output, ass_output, binary_output] {
+                            if let Some((temp_path, cache_path)) = output {
+                                if cache_is_populated(temp_path) {
+                                    if tokio::fs::rename(temp_path, cache_path)
+                                        .await
+                                        .is_err()
+                                    {
+                                        let _ = tokio::fs::remove_file(temp_path).await;
+                                    }
+                                } else {
                                     let _ = tokio::fs::remove_file(temp_path).await;
                                 }
-                            } else {
-                                let _ = tokio::fs::remove_file(temp_path).await;
                             }
                         }
                     }
                     info!(%item_id, %cache_source_id, ?indices, elapsed_secs = elapsed, "batch subtitle extraction completed");
                 } else {
-                    for (_, srt_output, _) in &to_extract {
-                        if let Some((temp_path, _)) = srt_output {
-                            let _ = tokio::fs::remove_file(temp_path).await;
+                    for (_, srt_output, ass_output, binary_output) in &to_extract {
+                        for output in [srt_output, ass_output, binary_output] {
+                            if let Some((temp_path, _)) = output {
+                                let _ = tokio::fs::remove_file(temp_path).await;
+                            }
                         }
                     }
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -848,55 +934,25 @@ async fn pre_extract_all_subtitles_to_cache(
                 }
             }
             Ok(Err(e)) => {
-                for (_, srt_output, _) in &to_extract {
-                    if let Some((temp_path, _)) = srt_output {
-                        let _ = tokio::fs::remove_file(temp_path).await;
+                for (_, srt_output, ass_output, binary_output) in &to_extract {
+                    for output in [srt_output, ass_output, binary_output] {
+                        if let Some((temp_path, _)) = output {
+                            let _ = tokio::fs::remove_file(temp_path).await;
+                        }
                     }
                 }
                 warn!(%item_id, %cache_source_id, ?indices, "failed to spawn ffmpeg for batch subtitle extraction: {e}");
             }
             Err(_) => {
-                for (_, srt_output, _) in &to_extract {
-                    if let Some((temp_path, _)) = srt_output {
-                        let _ = tokio::fs::remove_file(temp_path).await;
+                for (_, srt_output, ass_output, binary_output) in &to_extract {
+                    for output in [srt_output, ass_output, binary_output] {
+                        if let Some((temp_path, _)) = output {
+                            let _ = tokio::fs::remove_file(temp_path).await;
+                        }
                     }
                 }
                 warn!(%item_id, %cache_source_id, ?indices, "batch subtitle extraction timed out after 120s");
             }
-        }
-    }
-
-    // Preserve styled ASS/SSA artifacts independently. A failure here must
-    // never invalidate the normalized SRT cache used by VTT and JSON clients.
-    for (stream_index, _, raw_ass_path) in &to_extract {
-        if raw_ass_path.is_none() {
-            continue;
-        }
-        let map_spec = format!("0:{stream_index}");
-        let extraction = extract_raw_ass_to_cache(
-            &cache_dir,
-            &input_url,
-            &map_spec,
-            item_id,
-            cache_source_id,
-            *stream_index,
-        );
-        let result = tokio::select! {
-            result = extraction => Some(result),
-            changed = cancel_rx.changed() => {
-                let _ = changed;
-                None
-            }
-        };
-        match result {
-            Some(Err(error)) => {
-                warn!(%item_id, %cache_source_id, stream_index, %error, "raw ASS subtitle extraction failed");
-            }
-            None => {
-                debug!(%item_id, %cache_source_id, stream_index, "cancelled raw ASS pre-extraction for active playback");
-                break;
-            }
-            Some(Ok(_)) => {}
         }
     }
 
@@ -1275,32 +1331,64 @@ async fn subtitles_stream_inner(
         let _artifact_guard = SUBTITLE_ARTIFACT_LOCKS
             .lock(artifact_key)
             .await;
-        if subtitle_failure_is_cooling_down(&artifact_key) {
-            return Ok(subtitle_extraction_error_response(&anyhow!(
-                "subtitle extraction timed out during retry cooldown"
-            )));
-        }
         let cache_dir = state
             .ctx
             .config
             .data_dir
             .join("subtitle-cache");
-        let cache_path = match extract_binary_subtitle_to_cache(
-            &cache_dir,
-            &url,
-            &map_spec,
-            item_id,
-            cache_source_id,
-            stream_index,
-            &output_format,
-        )
-        .await
-        {
-            Ok(path) => path,
-            Err(error) => {
-                record_transient_subtitle_failure(artifact_key, &error);
-                error!(%item_id, stream_index, %map_spec, "binary subtitle extraction failed: {error}");
-                return Ok(subtitle_extraction_error_response(&error));
+        let expected_cache_path =
+            cache_dir.join(format!("{item_id}_{cache_source_id}_{stream_index}.sup"));
+        let mut cached = tokio::fs::metadata(&expected_cache_path)
+            .await
+            .ok()
+            .is_some_and(|metadata| metadata.len() > 0);
+        if !cached {
+            let in_progress_rx = batch_extraction_map()
+                .lock()
+                .unwrap()
+                .get(&(item_id, cache_source_id))
+                .cloned();
+            if let Some(mut rx) = in_progress_rx {
+                if !*rx.borrow() {
+                    info!(%item_id, %media_source_id, stream_index, "batch PGS extraction in progress - waiting for it to finish");
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        rx.changed(),
+                    )
+                    .await;
+                    cached = tokio::fs::metadata(&expected_cache_path)
+                        .await
+                        .ok()
+                        .is_some_and(|metadata| metadata.len() > 0);
+                }
+            }
+        }
+        if subtitle_failure_is_cooling_down(&artifact_key) {
+            return Ok(subtitle_extraction_error_response(&anyhow!(
+                "subtitle extraction timed out during retry cooldown"
+            )));
+        }
+        let cache_path = if cached {
+            debug!(%item_id, %media_source_id, stream_index, "raw PGS subtitle cache hit");
+            expected_cache_path
+        } else {
+            match extract_binary_subtitle_to_cache(
+                &cache_dir,
+                &url,
+                &map_spec,
+                item_id,
+                cache_source_id,
+                stream_index,
+                &output_format,
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    record_transient_subtitle_failure(artifact_key, &error);
+                    error!(%item_id, stream_index, %map_spec, "binary subtitle extraction failed: {error}");
+                    return Ok(subtitle_extraction_error_response(&error));
+                }
             }
         };
         clear_subtitle_failure(&artifact_key);
@@ -1311,6 +1399,7 @@ async fn subtitles_stream_inner(
             .status(StatusCode::OK)
             .header("Content-Type", content_type)
             .header("Cache-Control", "public, max-age=3600")
+            .header("Access-Control-Allow-Origin", "*")
             .body(Body::from(bytes))
             .unwrap());
     }
