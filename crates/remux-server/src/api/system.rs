@@ -754,10 +754,15 @@ pub struct LogTailResponse {
 }
 
 fn valid_log_name(name: &str) -> bool {
+    // Separators are banned outright, so a name is always a single path
+    // component; only exactly `.` / `..` could escape the log directory.
+    // Rotated files like `remux-.2026-08-04..log` legitimately contain `..`
+    // inside the component and must be accepted.
     !name.is_empty()
+        && name != "."
+        && name != ".."
         && !name.contains('/')
         && !name.contains('\\')
-        && !name.contains("..")
 }
 
 /// Read only the tail of a potentially multi-gigabyte log. The old dashboard
@@ -836,7 +841,8 @@ pub async fn system_log_tail(
 /// `GET /System/Logs/Log?name=` — download a single log file as plain text.
 ///
 /// The `name` is hardened against path traversal: it must be a bare filename
-/// (no `/`, `\`, or `..`), and is resolved strictly inside `log_dir`.
+/// (no `/` or `\`, and not exactly `.` / `..`), and is resolved strictly
+/// inside `log_dir`.
 #[get("/system/logs/log")]
 pub async fn system_log_file(
     State(state): State<AppState>,
@@ -1515,6 +1521,33 @@ mod test {
                 .unwrap()
                 <= 8 * 1024 * 1024
         );
+
+        // Rotated files legitimately contain `..` inside a single path
+        // component (tracing-appender joins prefix/date/suffix with `.`);
+        // they must tail and download like any other log.
+        std::fs::write(
+            log_dir
+                .path()
+                .join("remux-.2026-08-04..log"),
+            b"rotated info\n",
+        )
+        .unwrap();
+        let rotated_tail = server
+            .get("/system/logs/tail")
+            .add_query_param("name", "remux-.2026-08-04..log")
+            .add_header(AUTHORIZATION, header())
+            .await;
+        rotated_tail.assert_status_ok();
+        let rotated_body: serde_json::Value = rotated_tail.json();
+        assert_eq!(rotated_body["lines"][0].as_str().unwrap(), "rotated info");
+
+        let rotated_dl = server
+            .get("/system/logs/log")
+            .add_query_param("name", "remux-.2026-08-04..log")
+            .add_header(AUTHORIZATION, header())
+            .await;
+        rotated_dl.assert_status_ok();
+        assert_eq!(rotated_dl.text(), "rotated info\n");
 
         // Path traversal is rejected before touching the filesystem.
         let bad = server

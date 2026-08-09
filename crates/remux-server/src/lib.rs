@@ -770,8 +770,8 @@ pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
 }
 
 /// Initialise tracing: a compact stdout layer plus, when `log_dir` is given, a
-/// daily-rolled `remux.log` file layer (ANSI stripped, so downloaded logs are
-/// clean text).
+/// daily-rolled `remux-<date>.log` file layer (ANSI stripped, so downloaded
+/// logs are clean text).
 ///
 /// The returned [`WorkerGuard`](tracing_appender::non_blocking::WorkerGuard)
 /// **must be held for the process lifetime** — dropping it stops the background
@@ -799,7 +799,9 @@ pub fn setup_logging(
                 let appender = tracing_appender::rolling::Builder::new()
                     .rotation(tracing_appender::rolling::Rotation::DAILY)
                     .filename_prefix("remux-")
-                    .filename_suffix(".log")
+                    // No leading dot: tracing-appender joins prefix/date/suffix
+                    // with `.`, so ".log" would yield `..log` filenames.
+                    .filename_suffix("log")
                     .build(dir)
                     .expect("failed to create log appender");
                 let (writer, guard) = tracing_appender::non_blocking(appender);
