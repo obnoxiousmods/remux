@@ -436,20 +436,17 @@ async fn provision_user(
 }
 
 async fn link_identity(
-    state: &AppState,
+    db: &sqlx::SqlitePool,
     user_id: Uuid,
     discord: &DiscordUser,
 ) -> anyhow::Result<()> {
-    let existing: Option<String> = sqlx::query_scalar(
+    let existing: Option<Uuid> = sqlx::query_scalar(
         "SELECT user_id FROM external_identities WHERE provider = 'discord' AND provider_user_id = ?1",
     )
     .bind(&discord.id)
-    .fetch_optional(&state.ctx.db)
+    .fetch_optional(db)
     .await?;
-    if existing
-        .as_deref()
-        .is_some_and(|id| id != user_id.to_string())
-    {
+    if existing.is_some_and(|id| id != user_id) {
         return Err(anyhow!(
             "Discord identity is already linked to another Remux account"
         ));
@@ -462,7 +459,7 @@ async fn link_identity(
     .bind(&discord.id)
     .bind(user_id)
     .bind(&discord.username)
-    .execute(&state.ctx.db)
+    .execute(db)
     .await?;
     Ok(())
 }
@@ -502,9 +499,15 @@ pub async fn callback(
             .await
             .context("failed to provision Remux user")?,
     };
-    link_identity(&state, user.id, &discord)
-        .await
-        .context("failed to link Discord identity")?;
+    link_identity(
+        &state
+            .ctx
+            .db,
+        user.id,
+        &discord,
+    )
+    .await
+    .context("failed to link Discord identity")?;
     sync_role(&state, &discord.id, true).await;
     flow.completed = true;
     flow.quick_connect
@@ -603,6 +606,53 @@ pub async fn unlink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn linking_an_existing_discord_identity_decodes_uuid_storage() {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE external_identities (\
+             provider TEXT NOT NULL, provider_user_id TEXT NOT NULL, user_id TEXT NOT NULL, \
+             provider_username TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             PRIMARY KEY (provider, provider_user_id))",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let user_id = Uuid::new_v4();
+        let discord = DiscordUser {
+            id: "123456789012345678".to_string(),
+            username: "alice".to_string(),
+            global_name: Some("Alice".to_string()),
+        };
+        link_identity(&db, user_id, &discord)
+            .await
+            .unwrap();
+
+        let stored_type: String = sqlx::query_scalar(
+            "SELECT typeof(user_id) FROM external_identities WHERE provider_user_id = ?1",
+        )
+        .bind(&discord.id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(stored_type, "blob");
+        link_identity(&db, user_id, &discord)
+            .await
+            .unwrap();
+
+        let error = link_identity(&db, Uuid::new_v4(), &discord)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("already linked to another Remux account")
+        );
+    }
 
     #[test]
     fn usernames_and_callback_copy_are_safely_normalized() {
