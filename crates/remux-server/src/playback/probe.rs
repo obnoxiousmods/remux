@@ -46,6 +46,66 @@ fn normalize_lang(code: &str) -> &str {
     }
 }
 
+/// Tie cached probe metadata to the actual release represented by a stable
+/// stream row. Provider refreshes intentionally reuse stream UUIDs and may
+/// rotate signed URLs, but they can also replace the underlying filename. A
+/// source-scoped tag lets us distinguish those cases without re-probing every
+/// harmless URL refresh.
+fn stream_probe_cache_tag(stream: &db::Media) -> Uuid {
+    let Some(info) = stream
+        .stream_info
+        .as_ref()
+    else {
+        return Uuid::new_v5(&stream.id, b"no-stream-info");
+    };
+    let has_release_identity = info
+        .filename
+        .is_some()
+        || info
+            .torrent_info_hash
+            .is_some()
+        || info
+            .torrent_file_idx
+            .is_some()
+        || info
+            .size
+            .is_some();
+    let descriptor_identity = match &info.descriptor {
+        crate::stream::StreamDescriptor::Http { .. } if has_release_identity => {
+            "http".to_string()
+        }
+        crate::stream::StreamDescriptor::Http { url, .. } => url::Url::parse(url)
+            .map(|mut parsed| {
+                parsed.set_query(None);
+                parsed.set_fragment(None);
+                parsed.to_string()
+            })
+            .unwrap_or_else(|_| url.clone()),
+        crate::stream::StreamDescriptor::Local(path) => {
+            format!("local:{}", path.to_string_lossy())
+        }
+        crate::stream::StreamDescriptor::Rtsp { url } => format!("rtsp:{url}"),
+        crate::stream::StreamDescriptor::Torrent {
+            info_hash,
+            file_hint,
+            file_idx,
+            ..
+        } => format!("torrent:{info_hash}:{file_hint:?}:{file_idx:?}"),
+        crate::stream::StreamDescriptor::Opendal { addon_id, path } => {
+            format!("opendal:{addon_id}:{path}")
+        }
+    };
+    let identity = format!(
+        "{descriptor_identity}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        info.filename,
+        info.size,
+        info.duration,
+        info.torrent_info_hash,
+        info.torrent_file_idx,
+    );
+    Uuid::new_v5(&stream.id, identity.as_bytes())
+}
+
 fn first_to_upper(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -951,22 +1011,29 @@ pub(crate) async fn probe_stream(
         return Ok((api::MediaSourceInfo::from(stream.clone()), stream.clone()));
     }
     if let Some(cached) = &stream.probe_data {
+        let expected_tag = stream_probe_cache_tag(stream);
         // A probe carrying any playable stream is valid. Judging audio-only
         // probes stale re-ran a full ffprobe on every music PlaybackInfo
         // even though the cache had just been written.
-        if cached
-            .video_stream()
-            .is_some()
-            || cached
-                .audio_stream()
+        if cached.e_tag == expected_tag
+            && (cached
+                .video_stream()
                 .is_some()
+                || cached
+                    .audio_stream()
+                    .is_some())
         {
             debug!(id = %stream.id, "probe cache hit");
             let mut info = api::MediaSourceInfo::from(stream.clone());
             apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
             return Ok((info, stream.clone()));
         }
-        debug!(id = %stream.id, "probe cache stale (no playable stream), re-probing");
+        debug!(
+            id = %stream.id,
+            cached_tag = %cached.e_tag,
+            %expected_tag,
+            "probe cache stale (source changed or no playable stream), re-probing"
+        );
     }
     probe_with_fallback(
         stream.clone(),
@@ -1123,6 +1190,7 @@ where
                     && let Some(cached) = stream2
                         .probe_data
                         .as_ref()
+                    && cached.e_tag == stream_probe_cache_tag(&stream2)
                     && !cached
                         .chapters
                         .is_empty()
@@ -1196,6 +1264,7 @@ where
                         .audio_stream()
                         .is_some()
                 {
+                    probed.e_tag = stream_probe_cache_tag(&stream2);
                     if !segments.is_empty() {
                         probed.segments = Some(segments);
                     }
@@ -1264,6 +1333,43 @@ mod probe_tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn probe_cache_tag_ignores_rotated_http_url_for_same_release() {
+        let id = Uuid::new_v4();
+        let mut first = http_media_with_filename(
+            "https://debrid.example/first-token?expires=1",
+            "Episode.S01E07.1080p.ASS.mkv",
+        );
+        first.id = id;
+        let mut refreshed = http_media_with_filename(
+            "https://debrid.example/second-token?expires=2",
+            "Episode.S01E07.1080p.ASS.mkv",
+        );
+        refreshed.id = id;
+
+        assert_eq!(
+            stream_probe_cache_tag(&first),
+            stream_probe_cache_tag(&refreshed)
+        );
+    }
+
+    #[test]
+    fn probe_cache_tag_changes_when_stable_row_switches_release() {
+        let id = Uuid::new_v4();
+        let mut ass = http_media_with_filename(
+            "https://provider.example/play/first",
+            "Episode.S01E07.1080p.HEVC.ASS.mkv",
+        );
+        ass.id = id;
+        let mut pgs = http_media_with_filename(
+            "https://provider.example/play/second",
+            "Episode.S01E07.1080p.AVC.REMUX.mkv",
+        );
+        pgs.id = id;
+
+        assert_ne!(stream_probe_cache_tag(&ass), stream_probe_cache_tag(&pgs));
     }
 
     fn p2p_media() -> db::Media {
