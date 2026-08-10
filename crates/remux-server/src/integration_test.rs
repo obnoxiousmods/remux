@@ -118,7 +118,6 @@ pub async fn insert_test_source(ctx: &AppContext) -> db::Media {
     // Build minimal probe_data so playbackinfo can make transcode decisions
     // without needing ffprobe or a live network connection.
     let probe = MediaSourceInfo {
-        id: Uuid::new_v4(),
         container: Some("mp4".to_string()),
         bitrate: Some(8_000_000),
         run_time_ticks: Some(100_000_000),

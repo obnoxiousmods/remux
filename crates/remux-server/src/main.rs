@@ -42,6 +42,10 @@ fn load_cli_config(
         .try_deserialize()
 }
 
+fn load_paths() -> FilesystemPaths {
+    FilesystemPaths::load_from_env()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();

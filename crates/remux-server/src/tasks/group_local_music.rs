@@ -132,8 +132,9 @@ fn extract_embedded_cover(
     data_dir: &Path,
     album_id: Uuid,
 ) -> Option<String> {
-    let target =
-        crate::services::image::ImageService::image_path(data_dir, album_id, "primary");
+    let target = crate::services::image::ImageService::image_path(
+        data_dir, album_id, "primary", "jpg",
+    );
     if target
         .metadata()
         .is_ok_and(|metadata| metadata.len() > 0)

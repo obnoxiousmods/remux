@@ -479,11 +479,14 @@ pub async fn callback(
         .ctx
         .store
         .delete(format!("discord:state:{}", query.state));
-    let mut flow = state
+    let flow = state
         .ctx
         .store
         .get::<DiscordFlowEntry>(format!("discord:flow:{secret}"))
         .context_unauthorized("Discord sign-in request is invalid or expired")?;
+    let mut flow = flow
+        .as_ref()
+        .clone();
     let discord = discord_identity(&state, &query.code).await?;
     require_guild_member(&state, &discord.id).await?;
     let user = match flow.target_user_id {

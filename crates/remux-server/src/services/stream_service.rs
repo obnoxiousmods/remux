@@ -68,7 +68,7 @@ impl StreamService {
                 .store
                 .get::<Uuid>(&format!("pstream:{}:{}", media.id, key))
             {
-                sources.sort_by_key(|source| source.id != saved_id);
+                sources.sort_by_key(|source| source.id != *saved_id);
             }
         }
 
@@ -330,7 +330,7 @@ impl StreamService {
                     let by_pref = saved.and_then(|sid| {
                         sources
                             .iter()
-                            .find(|s| s.id == sid)
+                            .find(|s| s.id == *sid)
                             .cloned()
                     });
                     by_pref
@@ -506,7 +506,12 @@ impl StreamService {
         candidates.sort_by_key(|s| {
             if s.probe_data
                 .as_ref()
-                .is_some_and(|p| p.video_stream().is_some() || p.audio_stream().is_some())
+                .is_some_and(|p| {
+                    p.video_stream()
+                        .is_some()
+                        || p.audio_stream()
+                            .is_some()
+                })
             {
                 0u8
             } else {
@@ -552,7 +557,7 @@ impl StreamService {
             .ctx
             .config
             .port;
-        let item = db::Media::get_by_id(
+        let mut item = db::Media::get_by_id(
             &self
                 .ctx
                 .db,
@@ -561,6 +566,16 @@ impl StreamService {
         .await
         .ok()
         .flatten();
+        if let Some(ref mut it) = item {
+            it.grandparent(
+                &self
+                    .ctx
+                    .db,
+            )
+            .await
+            .ok();
+        }
+
         let mut results = Vec::with_capacity(
             sel.candidates
                 .len(),
@@ -767,7 +782,9 @@ impl StreamService {
         user_id: Uuid,
         group_id: Uuid,
     ) -> Option<Uuid> {
-        store.get::<Uuid>(format!("gitem:{}:{}", user_id, group_id))
+        store
+            .get::<Uuid>(format!("gitem:{}:{}", user_id, group_id))
+            .map(|id| *id)
     }
 }
 
@@ -840,6 +857,10 @@ fn media_info_from_probe(
         ),
     };
 
+    if info_hash.is_none() && nzb.is_none() {
+        return None;
+    }
+
     let (kind, external_ids, season, episode) = if let Some(item) = item {
         let kind = match item.kind {
             db::MediaKind::Episode => "episode",
@@ -850,11 +871,17 @@ fn media_info_from_probe(
             .external_ids
             .imdb
             .as_ref()
-            .or(item
-                .external_ids
-                .series_imdb
-                .as_ref())
-            .map(|v| v.to_string());
+            .map(|v| v.to_string())
+            .or_else(|| {
+                item.grandparent
+                    .as_deref()
+                    .and_then(|gp| {
+                        gp.external_ids
+                            .imdb
+                            .as_ref()
+                    })
+                    .map(|v| v.to_string())
+            });
         let ids = (imdb_id.is_some()
             || item
                 .external_ids

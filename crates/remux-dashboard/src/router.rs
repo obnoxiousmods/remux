@@ -1,5 +1,5 @@
 use crate::{
-    components::{SessionsCard, TasksCard},
+    components::{ActivityCard, TasksCard},
     layout::DashboardLayout,
     pages::*,
     state::AppState,
@@ -194,7 +194,7 @@ pub(crate) fn SystemTelemetryRoute() -> Element {
 #[component]
 pub(crate) fn SessionsRoute() -> Element {
     let app_state = use_context::<AppState>();
-    rsx! { SessionsCard { app_state } }
+    rsx! { ActivityCard { app_state } }
 }
 
 #[component]

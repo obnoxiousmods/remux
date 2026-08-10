@@ -182,14 +182,14 @@ impl Task for RefreshLibraryTask {
         const CHUNK_SIZE: u32 = 100;
         let mut total: Option<u32> = None;
         let mut processed = 0u32;
-        let mut offset = 0u32;
+        let mut last_id: Option<Uuid> = None;
         let meta_progress = progress.scaled(70.0, 100.0);
         super::log_process_memory("refresh_library:metadata_refresh:start");
         loop {
             let (batch, count) = db::Media::get_refreshable(
                 &ctx.db,
                 CHUNK_SIZE,
-                offset,
+                last_id,
                 total.is_none(),
             )
             .await?;
@@ -201,8 +201,11 @@ impl Task for RefreshLibraryTask {
                 break;
             }
             let fetched = batch.len() as u32;
+            last_id = batch
+                .last()
+                .map(|m| m.id);
             ctx.addons
-                .process_meta_batch(batch, &ctx, false)
+                .process_meta_batch(batch, &ctx, false, None)
                 .await?;
             processed += fetched;
             if processed % 1000 < fetched || fetched < CHUNK_SIZE {
@@ -216,7 +219,6 @@ impl Task for RefreshLibraryTask {
             if fetched < CHUNK_SIZE {
                 break;
             }
-            offset += CHUNK_SIZE;
         }
 
         super::log_process_memory("refresh_library:complete");

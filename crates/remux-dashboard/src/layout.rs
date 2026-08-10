@@ -1,7 +1,7 @@
 use crate::{
     components::{NavIcon, ThemeModeSegment},
     router::Route,
-    state::{get_stored_server, AppState, CREDENTIALS_KEY},
+    state::{get_stored_server, logout, AppState},
 };
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
@@ -396,10 +396,7 @@ pub fn DashboardLayout() -> Element {
                     button {
                         class: "btn btn-ghost",
                         style: "width:100%",
-                        onclick: move |_| {
-                            LocalStorage::delete(CREDENTIALS_KEY);
-                            logged_in.set(false);
-                        },
+                        onclick: move |_| logout(),
                         "Sign Out"
                     }
                 }

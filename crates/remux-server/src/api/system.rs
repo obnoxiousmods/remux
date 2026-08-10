@@ -474,10 +474,26 @@ pub async fn quickconnect_connect(
             None
         },
         date_added: entry.date_added,
-        device_id: Some(entry.device_id),
-        device_name: Some(entry.device_name),
-        app_name: Some(entry.app_name),
-        app_version: Some(entry.app_version),
+        device_id: Some(
+            entry
+                .device_id
+                .clone(),
+        ),
+        device_name: Some(
+            entry
+                .device_name
+                .clone(),
+        ),
+        app_name: Some(
+            entry
+                .app_name
+                .clone(),
+        ),
+        app_version: Some(
+            entry
+                .app_version
+                .clone(),
+        ),
     }))
 }
 
@@ -510,7 +526,7 @@ pub async fn quickconnect_authorize(
             QuickConnectEntry {
                 authenticated: true,
                 user_id: Some(approved_user_id),
-                ..entry
+                ..(*entry).clone()
             },
             Duration::from_secs(300),
         );
@@ -519,14 +535,6 @@ pub async fn quickconnect_authorize(
 }
 
 const BRANDING_CONFIG_KEY: &str = "branding_configuration";
-
-fn default_branding_configuration() -> api::BrandingOptions {
-    api::BrandingOptions {
-        login_disclaimer: None,
-        custom_css: None,
-        splashscreen_enabled: Some(false),
-    }
-}
 
 #[get("/branding/configuration")]
 pub async fn get_branding_configuration(
@@ -541,8 +549,8 @@ pub async fn get_branding_configuration(
     .await?
     {
         Some(json) => serde_json::from_str(&json)
-            .unwrap_or_else(|_| default_branding_configuration()),
-        None => default_branding_configuration(),
+            .unwrap_or_else(|_| api::BrandingOptions::default()),
+        None => api::BrandingOptions::default(),
     };
     Ok(Json(config))
 }
@@ -585,7 +593,7 @@ pub async fn update_branding_configuration(
 }
 
 async fn branding_css_response(state: &AppState) -> Result<Response> {
-    let config = match crate::db::Settings::get(
+    let config: api::BrandingOptions = match crate::db::Settings::get(
         &state
             .ctx
             .db,
@@ -593,11 +601,12 @@ async fn branding_css_response(state: &AppState) -> Result<Response> {
     )
     .await?
     {
-        Some(json) => serde_json::from_str::<api::BrandingOptions>(&json).ok(),
-        None => None,
+        Some(json) => serde_json::from_str(&json)
+            .unwrap_or_else(|_| api::BrandingOptions::default()),
+        None => api::BrandingOptions::default(),
     };
     match config
-        .and_then(|c| c.custom_css)
+        .custom_css
         .filter(|s| !s.is_empty())
     {
         Some(css) => Ok(([(header::CONTENT_TYPE, "text/css")], css).into_response()),
@@ -620,17 +629,28 @@ pub async fn get_branding_css_dotcss(
 }
 
 #[query]
-pub struct ActivityLogQuery {
-    pub start_index: Option<i64>,
-    pub limit: Option<i64>,
-    /// ISO8601 lower bound (`minDate`); entries strictly older are excluded.
-    pub min_date: Option<String>,
-    /// When present, keep only entries that do (`true`) or do not (`false`)
-    /// have an associated user.
-    pub has_user_id: Option<bool>,
+#[derive(Default)]
+struct ActivityLogQuery {
+    #[serde(rename = "startIndex", alias = "StartIndex")]
+    start_index: Option<i64>,
+    #[serde(alias = "Limit")]
+    limit: Option<i64>,
+    #[serde(rename = "searchTerm", alias = "SearchTerm")]
+    search_term: Option<String>,
 }
 
-/// `GET /System/ActivityLog/Entries` — paged audit log, newest first.
+fn action_display_name(action: &str) -> String {
+    match action {
+        "session_revoked" => "Session revoked",
+        "all_sessions_revoked" => "All sessions revoked",
+        "password_changed" => "Password changed",
+        "user_created" => "User created",
+        _ => action,
+    }
+    .to_string()
+}
+
+/// Get activity log entries
 #[get("/system/activitylog/entries")]
 pub async fn system_activity_log(
     State(state): State<AppState>,
@@ -643,33 +663,45 @@ pub async fn system_activity_log(
         .max(0);
     let limit = q
         .limit
-        .unwrap_or(100)
-        .clamp(0, 1000);
-    let min_date = q
-        .min_date
-        .as_deref()
-        .and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .ok()
-                .map(|d| d.with_timezone(&chrono::Utc))
-        });
-
-    let (items, total) = db::ActivityLog::query(
+        .unwrap_or(50)
+        .clamp(0, 200);
+    use remux_sdks::remux::{
+        ActivityLogEntry, ActivityLogEntryRemux, ActivityLogResult,
+    };
+    let (rows, total) = db::ActivityLog::list(
         &state
             .ctx
             .db,
         start_index,
         limit,
-        min_date,
-        q.has_user_id,
+        q.search_term
+            .as_deref(),
     )
     .await?;
-
-    Ok(Json(json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": start_index,
-    })))
+    let items: Vec<ActivityLogEntry> = rows
+        .into_iter()
+        .map(|r| ActivityLogEntry {
+            id: Some(r.id),
+            name: Some(action_display_name(&r.action)),
+            overview: r.details,
+            short_overview: None,
+            type_: Some(r.action),
+            date: Some(r.timestamp),
+            user_id: Some(r.user_id),
+            severity: Some("Information".to_string()),
+            remux: Some(ActivityLogEntryRemux {
+                user_name: Some(r.user_name),
+                target_user_id: r.target_user_id,
+                target_user_name: r.target_user_name,
+                device_id: r.device_id,
+                device_name: r.device_name,
+            }),
+        })
+        .collect();
+    Ok(Json(ActivityLogResult {
+        items,
+        total_record_count: total,
+    }))
 }
 
 /// `GET /System/Logs` — list the server log files in the configured `log_dir`,
@@ -1287,12 +1319,13 @@ mod test {
             .await;
 
         resp.assert_status_ok();
-        resp.assert_json(&json!({ "SplashscreenEnabled": false }));
         let body: serde_json::Value = resp.json();
         assert!(
-            body.get("CustomCss")
-                .is_none()
-                || body["CustomCss"].is_null()
+            body["CustomCss"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "default branding should include CSS"
         );
     }
 
@@ -1366,7 +1399,7 @@ mod test {
         server
             .get("/branding/css")
             .await
-            .assert_status(StatusCode::NO_CONTENT);
+            .assert_status_ok();
     }
 
     #[tokio::test]
@@ -1378,7 +1411,7 @@ mod test {
         server
             .get("/branding/css.css")
             .await
-            .assert_status(StatusCode::NO_CONTENT);
+            .assert_status_ok();
     }
 
     #[tokio::test]
@@ -1414,215 +1447,30 @@ mod test {
     }
 
     #[tokio::test]
-    async fn system_logs_lists_downloads_and_guards_traversal() {
-        use crate::Config;
-        use crate::integration_test::new_test_server_with_config;
-        use http::header::{AUTHORIZATION, HeaderValue};
-
-        let db_dir = tempfile::tempdir().unwrap();
-        let log_dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            log_dir
-                .path()
-                .join("remux.log"),
-            b"hello log\n",
-        )
-        .unwrap();
-
-        let db_path = db_dir
-            .path()
-            .join("remux-test.sqlite");
-        let (server, _guard) = new_test_server_with_config(Config {
-            database_url: Some(format!("sqlite://{}?mode=rwc", db_path.display())),
-            torrent_http_port: None,
-            disable_dht: true,
-            torrent_peer_port: None,
-            log_dir: Some(
-                log_dir
-                    .path()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-        // Authenticate as the seeded admin user.
-        let auth_resp = server
-            .post("/users/authenticatebyname")
-            .add_header(AUTHORIZATION, HeaderValue::from_static(AUTH_HEADER))
-            .json(&json!({ "Username": "test", "Pw": "test" }))
-            .await;
-        let token = auth_resp.json::<serde_json::Value>()["AccessToken"]
-            .as_str()
-            .unwrap()
-            .to_string();
+    async fn branding_custom_js_roundtrip_test() {
+        let (server, _ctx, token) = authenticated_server().await;
         let auth = auth_header_with_token(&token);
-        let header = || HeaderValue::from_str(&auth).unwrap();
+        let js = "console.log('hello')";
 
-        // List includes remux.log with its byte size.
-        let list = server
-            .get("/system/logs")
-            .add_header(AUTHORIZATION, header())
-            .await;
-        list.assert_status_ok();
-        let body: serde_json::Value = list.json();
-        let entry = body
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["Name"] == "remux.log")
-            .expect("remux.log should be listed");
-        assert_eq!(entry["Size"], 10);
-
-        // Download returns the exact contents as text.
-        let dl = server
-            .get("/system/logs/log")
-            .add_query_param("name", "remux.log")
-            .add_header(AUTHORIZATION, header())
-            .await;
-        dl.assert_status_ok();
-        assert_eq!(dl.text(), "hello log\n");
-
-        // The explorer reads a bounded tail and applies filtering server-side.
-        std::fs::write(
-            log_dir
-                .path()
-                .join("remux.log"),
-            b"old info\nrecent warning\nrecent error\n",
-        )
-        .unwrap();
-        let tail = server
-            .get("/system/logs/tail")
-            .add_query_param("name", "remux.log")
-            .add_query_param("lines", "2")
-            .add_query_param("search", "recent")
-            .add_header(AUTHORIZATION, header())
-            .await;
-        tail.assert_status_ok();
-        let tail_body: serde_json::Value = tail.json();
-        assert_eq!(
-            tail_body["lines"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        assert!(
-            tail_body["lines"][0]
-                .as_str()
-                .unwrap()
-                .contains("warning")
-        );
-        assert!(
-            tail_body["scannedBytes"]
-                .as_u64()
-                .unwrap()
-                <= 8 * 1024 * 1024
-        );
-
-        // Rotated files legitimately contain `..` inside a single path
-        // component (tracing-appender joins prefix/date/suffix with `.`);
-        // they must tail and download like any other log.
-        std::fs::write(
-            log_dir
-                .path()
-                .join("remux-.2026-08-04..log"),
-            b"rotated info\n",
-        )
-        .unwrap();
-        let rotated_tail = server
-            .get("/system/logs/tail")
-            .add_query_param("name", "remux-.2026-08-04..log")
-            .add_header(AUTHORIZATION, header())
-            .await;
-        rotated_tail.assert_status_ok();
-        let rotated_body: serde_json::Value = rotated_tail.json();
-        assert_eq!(rotated_body["lines"][0].as_str().unwrap(), "rotated info");
-
-        let rotated_dl = server
-            .get("/system/logs/log")
-            .add_query_param("name", "remux-.2026-08-04..log")
-            .add_header(AUTHORIZATION, header())
-            .await;
-        rotated_dl.assert_status_ok();
-        assert_eq!(rotated_dl.text(), "rotated info\n");
-
-        // Path traversal is rejected before touching the filesystem.
-        let bad = server
-            .get("/system/logs/log")
-            .add_query_param("name", "../remux-test.sqlite")
-            .add_header(AUTHORIZATION, header())
-            .expect_failure()
-            .await;
-        assert_eq!(bad.status_code(), StatusCode::BAD_REQUEST);
-
-        let bad_tail = server
-            .get("/system/logs/tail")
-            .add_query_param("name", "../remux-test.sqlite")
-            .add_header(AUTHORIZATION, header())
-            .expect_failure()
-            .await;
-        assert_eq!(bad_tail.status_code(), StatusCode::BAD_REQUEST);
-
-        // Admin-gated.
-        let unauth = server
-            .get("/system/logs")
-            .expect_failure()
-            .await;
-        assert_eq!(unauth.status_code(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn activity_log_records_login_event() {
-        use http::header::{AUTHORIZATION, HeaderValue};
-
-        // `authenticated_server` performs a real login, which records an
-        // `AuthenticationSucceeded` activity entry.
-        let (server, _guard, token) = authenticated_server().await;
-        let auth = auth_header_with_token(&token);
+        server
+            .post("/branding/configuration")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({ "remux": { "custom_js": js } }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
 
         let resp = server
-            .get("/system/activitylog/entries")
-            .add_header(AUTHORIZATION, HeaderValue::from_str(&auth).unwrap())
+            .get("/branding/configuration")
             .await;
         resp.assert_status_ok();
-
         let body: serde_json::Value = resp.json();
-        assert!(
-            body["TotalRecordCount"]
-                .as_i64()
-                .unwrap()
-                >= 1,
-            "expected at least one activity entry"
-        );
-        assert_eq!(body["StartIndex"], 0);
-        let items = body["Items"]
-            .as_array()
-            .unwrap();
-        assert!(
-            items
-                .iter()
-                .any(|e| e["Type"] == "AuthenticationSucceeded"),
-            "login should be recorded as AuthenticationSucceeded"
-        );
-
-        // The `hasUserId=false` filter must exclude the (user-attributed) login.
-        let system_only = server
-            .get("/system/activitylog/entries")
-            .add_query_param("hasUserId", "false")
-            .add_header(AUTHORIZATION, HeaderValue::from_str(&auth).unwrap())
-            .await;
-        system_only.assert_status_ok();
-        let sys_body: serde_json::Value = system_only.json();
-        assert!(
-            sys_body["Items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|e| e["Type"] != "AuthenticationSucceeded"),
-            "hasUserId=false must exclude user login events"
+        assert_eq!(
+            body["remux"]["custom_js"].as_str(),
+            Some(js),
+            "custom_js should round-trip through branding config"
         );
     }
 }

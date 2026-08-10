@@ -236,7 +236,9 @@ impl Task for JellyfinImportTask {
         // Collect unique top-level items (Movie or Series) across all users, then
         // run process_meta_batch so they get full metadata + child tree immediately.
         {
-            let mut stubs: HashMap<uuid::Uuid, db::Media> = HashMap::new();
+            let mut stubs: Vec<db::Media> = Vec::new();
+            let mut seen_stubs: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for (_, _, _, items) in &user_items {
                 for item in items {
                     let provider_ids = item
@@ -314,13 +316,16 @@ impl Task for JellyfinImportTask {
                         tvdb: top_tvdb,
                         ..Default::default()
                     };
-                    let raw = db::MediaIdRaw {
-                        kind: top_kind.clone(),
-                        external_ids: ext.clone(),
-                        season: None,
-                        episode: None,
-                    };
-                    let uuid = uuid::Uuid::from(&raw);
+
+                    // Build a stable dedup key from external IDs so the same media
+                    // is not queued twice even though stubs now use random UUIDs.
+                    let dedup_key = format!(
+                        "{:?}:imdb={:?}:tmdb={:?}:tvdb={:?}",
+                        top_kind,
+                        top_imdb.as_deref(),
+                        top_tmdb,
+                        top_tvdb
+                    );
 
                     // Already in local DB or already queued → skip
                     if resolve_from_index(
@@ -330,7 +335,7 @@ impl Task for JellyfinImportTask {
                         top_tvdb,
                     )
                     .is_some()
-                        || stubs.contains_key(&uuid)
+                        || seen_stubs.contains(&dedup_key)
                     {
                         continue;
                     }
@@ -361,8 +366,8 @@ impl Task for JellyfinImportTask {
                         .run_time_ticks
                         .map(|t| t / 10_000_000);
 
-                    let mut stub = db::Media {
-                        id: uuid,
+                    let stub = db::Media {
+                        id: uuid::Uuid::new_v4(),
                         kind: top_kind,
                         title,
                         external_ids: ext,
@@ -373,31 +378,18 @@ impl Task for JellyfinImportTask {
                         runtime,
                         ..Default::default()
                     };
-                    // Ensure the computed UUID matches what the DB would derive
-                    stub.id = uuid::Uuid::from(&db::MediaIdRaw {
-                        kind: stub
-                            .kind
-                            .clone(),
-                        external_ids: stub
-                            .external_ids
-                            .clone(),
-                        season: None,
-                        episode: None,
-                    });
-                    stubs.insert(stub.id, stub);
+                    seen_stubs.insert(dedup_key);
+                    stubs.push(stub);
                 }
             }
 
             if !stubs.is_empty() {
-                let stubs: Vec<db::Media> = stubs
-                    .into_values()
-                    .collect();
                 debug!(
                     count = stubs.len(),
                     "seeding missing media stubs from Jellyfin"
                 );
                 ctx.addons
-                    .process_meta_batch(stubs, &ctx, false)
+                    .process_meta_batch(stubs, &ctx, false, None)
                     .await?;
             }
         }
@@ -462,6 +454,21 @@ impl Task for JellyfinImportTask {
                     Some("Episode") => db::MediaKind::Episode,
                     _ => db::MediaKind::Movie,
                 };
+                // For Season/Episode: check if we resolved a series IMDB (used for has_ids).
+                // ProviderIds["Imdb"] is NOT used — it can be the episode's own IMDB.
+                let series_imdb_resolved =
+                    matches!(kind, db::MediaKind::Season | db::MediaKind::Episode)
+                        && (item
+                            .series_provider_ids
+                            .as_ref()
+                            .and_then(|p| p.get("Imdb"))
+                            .is_some()
+                            || item
+                                .series_id
+                                .as_deref()
+                                .and_then(|sid| series_imdb_map.get(sid))
+                                .is_some());
+
                 let raw = db::MediaIdRaw {
                     kind: kind.clone(),
                     external_ids: db::ExternalIds {
@@ -473,28 +480,6 @@ impl Task for JellyfinImportTask {
                             imdb.and_then(|s| {
                                 db::NonEmptyString::try_new(s.to_string()).ok()
                             })
-                        })
-                        .flatten(),
-                        // For episodes/seasons, resolve series IMDB via:
-                        // 1. SeriesProviderIds["Imdb"] (authoritative when set)
-                        // 2. series_imdb_map[SeriesId] (look up series item by Jellyfin UUID)
-                        // ProviderIds["Imdb"] is NOT used — it can be the episode's own IMDB.
-                        series_imdb: matches!(
-                            kind,
-                            db::MediaKind::Season | db::MediaKind::Episode
-                        )
-                        .then(|| {
-                            item.series_provider_ids
-                                .as_ref()
-                                .and_then(|p| p.get("Imdb"))
-                                .map(|s| s.to_string())
-                                .or_else(|| {
-                                    item.series_id
-                                        .as_deref()
-                                        .and_then(|sid| series_imdb_map.get(sid))
-                                        .cloned()
-                                })
-                                .and_then(|s| db::NonEmptyString::try_new(s).ok())
                         })
                         .flatten(),
                         tmdb,
@@ -509,10 +494,7 @@ impl Task for JellyfinImportTask {
                     .external_ids
                     .imdb
                     .is_some()
-                    || raw
-                        .external_ids
-                        .series_imdb
-                        .is_some()
+                    || series_imdb_resolved
                     || raw
                         .external_ids
                         .tmdb
@@ -537,8 +519,8 @@ impl Task for JellyfinImportTask {
                 }
 
                 // Use the local DB UUID when the item is already imported; otherwise
-                // compute the stable UUID from external IDs so the state is ready
-                // when the item gets imported later.
+                // derive the stable UUID from external IDs so get_or_new can find the
+                // state row via ext_id_uuid_candidates when the item is imported later.
                 let media_uuid = resolve_from_index(&index, imdb, tmdb, tvdb)
                     .unwrap_or_else(|| uuid::Uuid::from(&raw));
 

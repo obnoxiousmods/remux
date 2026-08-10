@@ -637,7 +637,8 @@ impl HttpSource {
             };
 
             let status = upstream.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RETRIES {
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RETRIES
+            {
                 let delay = std::time::Duration::from_secs(1u64 << attempt);
                 tracing::info!(
                     upstream_host = self.sanitized_host(),
@@ -650,7 +651,8 @@ impl HttpSource {
                 continue;
             }
             if status.is_server_error() && attempt < MAX_RETRIES {
-                let delay = std::time::Duration::from_millis(500 * (attempt as u64 + 1));
+                let delay =
+                    std::time::Duration::from_millis(500 * (attempt as u64 + 1));
                 tracing::info!(
                     upstream_host = self.sanitized_host(),
                     status = status.as_u16(),
@@ -686,8 +688,7 @@ impl HttpSource {
         // so ffmpeg/ffprobe can handle it (e.g. fail fast to next source).
         Err(anyhow::anyhow!(
             "upstream returned {} after {} retries",
-            last_status
-                .map_or_else(|| "error".to_string(), |s| s.to_string()),
+            last_status.map_or_else(|| "error".to_string(), |s| s.to_string()),
             MAX_RETRIES
         ))
         .context_bad_gateway("upstream source unavailable")

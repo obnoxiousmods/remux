@@ -51,7 +51,7 @@ fn normalize_lang(code: &str) -> &str {
 /// rotate signed URLs, but they can also replace the underlying filename. A
 /// source-scoped tag lets us distinguish those cases without re-probing every
 /// harmless URL refresh.
-fn stream_probe_cache_tag(stream: &db::Media) -> Uuid {
+pub(crate) fn stream_probe_cache_tag(stream: &db::Media) -> Uuid {
     let Some(info) = stream
         .stream_info
         .as_ref()

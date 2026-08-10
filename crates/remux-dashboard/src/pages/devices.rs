@@ -33,7 +33,7 @@ pub fn DevicesPage(app_state: AppState) -> Element {
             .clone();
         spawn(async move {
             match client
-                .execute(GetDevices)
+                .execute(GetDevices::default())
                 .await
             {
                 Ok(result) => {

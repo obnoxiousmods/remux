@@ -68,27 +68,25 @@ impl MediaSourceInfoExt for db::Media {
     }
 }
 
-pub fn device_info_from(device: &db::auth::Device) -> DeviceInfo {
+pub fn device_info_from(
+    device: &db::auth::Device,
+    username: Option<&str>,
+    caller_token: &str,
+) -> DeviceInfo {
     DeviceInfo {
         name: Some(
             device
                 .name
                 .clone(),
         ),
-        custom_name: device
-            .custom_name
-            .clone(),
-        access_token: Some(
-            device
-                .access_token
-                .clone(),
-        ),
+        custom_name: None,
+        access_token: None,
         id: Some(
             device
                 .id
                 .clone(),
         ),
-        last_user_name: None,
+        last_user_name: username.map(str::to_owned),
         app_name: Some(
             device
                 .app_name
@@ -102,6 +100,14 @@ pub fn device_info_from(device: &db::auth::Device) -> DeviceInfo {
         last_user_id: Some(device.user_id),
         date_last_activity: device.last_activity_at,
         icon_url: None,
+        date_created: device.created_at,
+        remux: Some(DeviceInfoRemux {
+            remote_end_point: device
+                .remote_ip
+                .clone(),
+            user_id: Some(device.user_id),
+            is_current_session: Some(device.access_token == caller_token),
+        }),
     }
 }
 
@@ -344,11 +350,6 @@ pub fn db_state_to_dto(
     }
 }
 
-/// Whether an Audio item should advertise `HasLyrics`. Streaming tracks keep
-/// `true` because a lyrics addon can resolve them on demand; a local track only
-/// claims lyrics when it actually carries a lyric stream (embedded, or a sidecar
-/// injected at probe time). This matches Jellyfin, which reports `HasLyrics:false`
-/// for a bare audio file with no lyrics.
 fn track_has_lyrics(media: &db::Media) -> bool {
     if media.is_remote_url() {
         return true;
@@ -356,11 +357,33 @@ fn track_has_lyrics(media: &db::Media) -> bool {
     media
         .probe_data
         .as_ref()
-        .is_some_and(|p| {
-            p.media_streams
+        .is_some_and(|probe| {
+            probe
+                .media_streams
                 .iter()
-                .any(|s| s.type_ == Some(MediaStreamType::Lyric))
+                .any(|stream| stream.type_ == Some(MediaStreamType::Lyric))
         })
+}
+
+/// Stub sources for items without resolvable sources: two entries so
+/// multi-version clients (e.g. Infuse) expose a version picker.
+fn stub_sources(media: &db::Media) -> Vec<MediaSourceInfo> {
+    vec![
+        media
+            .clone()
+            .into(),
+        MediaSourceInfo {
+            id: uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("{}-stub2", media.id).as_bytes(),
+            ),
+            e_tag: media.id,
+            name: Some(format!("{} (2)", media.title)),
+            protocol: MediaProtocol::File,
+            container: None,
+            ..Default::default()
+        },
+    ]
 }
 
 pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
@@ -567,9 +590,13 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                         db::MediaKind::Episode | db::MediaKind::Season
                     ) {
                         media
-                            .external_ids
-                            .series_imdb
+                            .grandparent
                             .as_deref()
+                            .and_then(|gp| {
+                                gp.external_ids
+                                    .imdb
+                                    .as_deref()
+                            })
                     } else {
                         None
                     }
@@ -1093,11 +1120,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             .sources
             .clone()
         {
-            Some(sources) if sources.is_empty() => Some(vec![
-                media
-                    .clone()
-                    .into(),
-            ]),
+            Some(sources) if sources.is_empty() => Some(stub_sources(&media)),
             Some(sources) => {
                 let mut infos: Vec<MediaSourceInfo> = sources
                     .into_iter()
@@ -1110,11 +1133,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                 }
                 Some(infos)
             }
-            None => Some(vec![
-                media
-                    .clone()
-                    .into(),
-            ]),
+            None => Some(stub_sources(&media)),
         };
         item.path = item
             .media_sources
@@ -1224,7 +1243,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             .collection_media_kind
             .clone()
             .and_then(db_media_kind_to_collection_type);
-        if media.promoted {
+        if media.promoted || media.is_group_container() {
             item.type_ = MediaType::CollectionFolder;
             item.display_preferences_id = Some(
                 item.id

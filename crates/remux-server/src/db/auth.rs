@@ -50,10 +50,7 @@ pub struct Device {
     pub last_activity_at: Option<DateTime<Utc>>,
     pub capabilities: Option<sqlx::types::Json<crate::api::ClientCapabilitiesDto>>,
     pub remote_ip: Option<String>,
-    /// Operator-assigned display name (Jellyfin `DeviceOptions.CustomName`).
-    /// `None` means fall back to the client-reported [`Device::name`]. Preserved
-    /// across logins: `save()` never overwrites it.
-    pub custom_name: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 impl Device {
@@ -61,9 +58,9 @@ impl Device {
         sqlx::query(
             r#"
             INSERT INTO devices
-                (user_id, access_token, id, name, app_name, app_version)
+                (user_id, access_token, id, name, app_name, app_version, created_at)
             VALUES
-                (?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id, user_id) DO UPDATE SET
                 name = excluded.name,
                 access_token = excluded.access_token,
@@ -77,6 +74,7 @@ impl Device {
         .bind(&self.name)
         .bind(&self.app_name)
         .bind(&self.app_version)
+        .bind(Utc::now())
         .execute(db)
         .await?;
 
@@ -120,6 +118,17 @@ impl Device {
         "#,
         )
         .bind(token)
+        .fetch_optional(db)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn get_by_id(db: &SqlitePool, device_id: &str) -> Result<Option<Self>> {
+        let row = sqlx::query_as::<_, Self>(
+            "SELECT * FROM devices WHERE lower(id) = lower(?) ORDER BY last_activity_at DESC LIMIT 1",
+        )
+        .bind(device_id)
         .fetch_optional(db)
         .await?;
 
@@ -172,6 +181,52 @@ impl Device {
         Ok(devices)
     }
 
+    /// Get devices with pagination; returns (items, total_count).
+    /// When `username_filter` is provided, only devices belonging to users whose
+    /// username contains the filter (case-insensitive) are returned.
+    pub async fn get_paged(
+        db: &SqlitePool,
+        offset: i64,
+        limit: i64,
+        username_filter: Option<&str>,
+    ) -> Result<(Vec<Self>, i64)> {
+        let (total, items) = if let Some(pattern) = username_filter {
+            let total: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM devices d JOIN users u ON d.user_id = u.id WHERE lower(u.username) LIKE ?",
+            )
+            .bind(pattern)
+            .fetch_one(db)
+            .await?;
+
+            let items = sqlx::query_as::<_, Self>(
+                "SELECT d.* FROM devices d JOIN users u ON d.user_id = u.id WHERE lower(u.username) LIKE ? ORDER BY d.name LIMIT ? OFFSET ?",
+            )
+            .bind(pattern)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(db)
+            .await?;
+
+            (total, items)
+        } else {
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices")
+                .fetch_one(db)
+                .await?;
+
+            let items = sqlx::query_as::<_, Self>(
+                "SELECT * FROM devices ORDER BY name LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(db)
+            .await?;
+
+            (total, items)
+        };
+
+        Ok((items, total))
+    }
+
     pub async fn delete_by_access_token(db: &SqlitePool, token: &str) -> Result<bool> {
         let result = sqlx::query("DELETE FROM devices WHERE access_token = ?")
             .bind(token)
@@ -180,47 +235,38 @@ impl Device {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn delete_by_id(db: &SqlitePool, device_id: &str) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM devices WHERE id = ?")
-            .bind(device_id)
-            .execute(db)
-            .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Look up a device by its (client-reported) device id. The primary key is
-    /// `(user_id, id)`; in practice a device id maps to a single row, so we take
-    /// the first match ordered by most-recent activity.
-    pub async fn get_by_id(db: &SqlitePool, device_id: &str) -> Result<Option<Self>> {
-        let row = sqlx::query_as::<_, Self>(
-            r#"
-            SELECT *
-            FROM devices
-            WHERE id = ?1
-            ORDER BY last_activity_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(device_id)
-        .fetch_optional(db)
-        .await?;
-
-        Ok(row)
-    }
-
-    /// Set (or clear, with `None`) the operator-assigned custom name for every
-    /// row with this device id. Returns whether any row was updated.
-    pub async fn set_custom_name(
+    pub async fn delete_by_id(
         db: &SqlitePool,
         device_id: &str,
-        custom_name: Option<&str>,
+        user_id: &Uuid,
     ) -> Result<bool> {
-        let result = sqlx::query("UPDATE devices SET custom_name = ? WHERE id = ?")
-            .bind(custom_name)
+        let result = sqlx::query("DELETE FROM devices WHERE id = ? AND user_id = ?")
             .bind(device_id)
+            .bind(user_id)
             .execute(db)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete all devices for a user, optionally skipping one token (e.g. the caller's own).
+    pub async fn delete_all_for_user(
+        db: &SqlitePool,
+        user_id: &Uuid,
+        except_token: Option<&str>,
+    ) -> Result<u64> {
+        let result = if let Some(token) = except_token {
+            sqlx::query("DELETE FROM devices WHERE user_id = ? AND access_token != ?")
+                .bind(user_id)
+                .bind(token)
+                .execute(db)
+                .await?
+        } else {
+            sqlx::query("DELETE FROM devices WHERE user_id = ?")
+                .bind(user_id)
+                .execute(db)
+                .await?
+        };
+        Ok(result.rows_affected())
     }
 
     fn merge_runtime_metadata_from_header(&mut self, header: &JellyfinAuthHeader) {
@@ -448,7 +494,7 @@ impl FromRequestParts<AppState> for AuthSession {
             last_activity_at: None,
             capabilities: None,
             remote_ip: None,
-            custom_name: None,
+            created_at: None,
         };
 
         tracing::Span::current().record(
@@ -688,5 +734,102 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
         }
 
         Ok(JellyfinAuthHeader::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> SqlitePool {
+        let db = crate::db::connect("sqlite::memory:", 10_000, 5)
+            .await
+            .unwrap();
+        crate::db::migrate(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn insert_device(db: &SqlitePool, user_id: Uuid, token: &str) {
+        Device {
+            id: Uuid::new_v4().to_string(),
+            access_token: token.to_string(),
+            user_id,
+            name: "Test Device".to_string(),
+            app_name: "Test".to_string(),
+            app_version: "1.0".to_string(),
+            ..Default::default()
+        }
+        .save(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_all_removes_every_device_for_user() {
+        let db = test_db().await;
+        let uid = Uuid::new_v4();
+
+        insert_device(&db, uid, "token-a").await;
+        insert_device(&db, uid, "token-b").await;
+
+        let deleted = Device::delete_all_for_user(&db, &uid, None)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+                .bind(uid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_all_except_current_token() {
+        let db = test_db().await;
+        let uid = Uuid::new_v4();
+
+        insert_device(&db, uid, "token-keep").await;
+        insert_device(&db, uid, "token-del-1").await;
+        insert_device(&db, uid, "token-del-2").await;
+
+        let deleted = Device::delete_all_for_user(&db, &uid, Some("token-keep"))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+                .bind(uid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_all_does_not_touch_other_users() {
+        let db = test_db().await;
+        let uid_a = Uuid::new_v4();
+        let uid_b = Uuid::new_v4();
+
+        insert_device(&db, uid_a, "token-a").await;
+        insert_device(&db, uid_b, "token-b").await;
+
+        Device::delete_all_for_user(&db, &uid_a, None)
+            .await
+            .unwrap();
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_id = ?")
+                .bind(uid_b)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
     }
 }

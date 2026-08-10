@@ -102,6 +102,13 @@ async fn probe_hw_accel() -> HardwareAccelerationType {
         .await
     {
         Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                "ffmpeg not found — transcoding and hardware acceleration detection will not work. \
+                 Set the FFMPEG_PATH environment variable to the ffmpeg binary path."
+            );
+            String::new()
+        }
         Err(e) => {
             warn!("Could not run ffmpeg to detect encoders: {e}");
             String::new()
@@ -1230,9 +1237,19 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         "-v".into(),
         "error".into(),
         "-analyzeduration".into(),
-        if params.trusted_probe_data { "200000" } else { "1000000" }.into(),
+        if params.trusted_probe_data {
+            "200000"
+        } else {
+            "1000000"
+        }
+        .into(),
         "-probesize".into(),
-        if params.trusted_probe_data { "200000" } else { "1000000" }.into(),
+        if params.trusted_probe_data {
+            "200000"
+        } else {
+            "1000000"
+        }
+        .into(),
     ];
     append_http_input_options(&mut args, &params.input_url);
 

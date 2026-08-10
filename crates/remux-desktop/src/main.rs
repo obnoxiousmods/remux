@@ -16,7 +16,7 @@ use tray_icon::{
 #[cfg(dashboard_built)]
 include!(concat!(env!("OUT_DIR"), "/dashboard_embed.rs"));
 
-#[cfg(all(dashboard_built, jellyfin_web_built))]
+#[cfg(jellyfin_web_built)]
 include!(concat!(env!("OUT_DIR"), "/jellyfin_web_embed.rs"));
 
 fn data_dir() -> PathBuf {
@@ -98,7 +98,12 @@ fn main() -> Result<()> {
     std::thread::spawn(move || {
         rt.block_on(async move {
             if let Err(e) = ffmpeg::ensure_ffmpeg(&data_dir_for_ffmpeg).await {
-                tracing::warn!("ffmpeg setup failed: {e:#}");
+                tracing::warn!(
+                    "ffmpeg could not be downloaded and was not found on this system: {e:#}. \
+                     Transcoding will not work. Install ffmpeg manually \
+                     (e.g. via Homebrew: brew install ffmpeg) or set the FFMPEG_PATH \
+                     environment variable."
+                );
             }
             if let Err(e) = serve(server_config).await {
                 tracing::error!("server error: {e:#}");
@@ -168,29 +173,33 @@ fn main() -> Result<()> {
 }
 
 async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
-    #[cfg(all(dashboard_built, jellyfin_web_built))]
+    #[cfg(dashboard_built)]
     let admin = remux_server::embedded_static::EmbeddedDir {
         dir: &DASHBOARD,
         spa_fallback: true,
     }
     .into_admin_service();
 
-    #[cfg(not(all(dashboard_built, jellyfin_web_built)))]
-    let admin = remux_server::admin_from_filesystem(
-        &remux_server::FilesystemPaths::default().dashboard_path,
-    );
-
-    #[cfg(all(dashboard_built, jellyfin_web_built))]
-    let web_client = remux_server::WebClientService::from_embedded(&JELLYFIN_WEB);
-
-    #[cfg(not(all(dashboard_built, jellyfin_web_built)))]
-    let web_client = {
-        let paths = remux_server::FilesystemPaths::default();
-        remux_server::WebClientService::from_filesystem(&paths.web_path)
+    #[cfg(not(dashboard_built))]
+    let admin = {
+        let paths = remux_server::FilesystemPaths::load_from_env();
+        remux_server::admin_from_filesystem(&paths.dashboard_path)
     };
 
     let port = config.port;
-    let (router, _) = remux_server::init_app(config, None, admin, web_client).await?;
+    let (router, _) = remux_server::init_app(config, None, admin, |pool| {
+        #[cfg(jellyfin_web_built)]
+        {
+            remux_server::WebClientService::from_embedded(&JELLYFIN_WEB, pool)
+        }
+
+        #[cfg(not(jellyfin_web_built))]
+        {
+            let paths = remux_server::FilesystemPaths::load_from_env();
+            remux_server::WebClientService::from_filesystem(&paths.web_path, pool)
+        }
+    })
+    .await?;
     remux_server::bind_and_serve(router, port).await
 }
 

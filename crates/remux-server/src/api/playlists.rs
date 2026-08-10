@@ -322,14 +322,24 @@ pub async fn get_playlist_items(
         None => &relations[start.min(relations.len())..],
     };
 
-    let items = relations_to_items(
-        &state
-            .ctx
-            .db,
-        slice,
-        false,
-    )
-    .await?;
+    let mut items = Vec::with_capacity(slice.len());
+    for rel in slice {
+        if let Some(media) = db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &rel.right_media_id,
+        )
+        .await?
+        {
+            let mut dto = api::db_media_to_item(media, false);
+            dto.playlist_item_id = Some(
+                rel.relation_id
+                    .to_string(),
+            );
+            items.push(dto);
+        }
+    }
 
     Ok(Json(api::BaseItemDtoQueryResult {
         items,

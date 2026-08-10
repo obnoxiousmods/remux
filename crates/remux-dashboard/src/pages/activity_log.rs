@@ -39,7 +39,7 @@ pub fn ActivityLogPage(app_state: AppState) -> Element {
                 .execute(GetActivityLog {
                     start_index: Some(0),
                     limit: Some(PAGE_SIZE),
-                    has_user_id: None,
+                    search_term: None,
                 })
                 .await
             {
@@ -77,7 +77,7 @@ pub fn ActivityLogPage(app_state: AppState) -> Element {
                     div { class: "row-list",
                         for entry in entries.read().clone() {
                             {
-                                let id = entry.id.unwrap_or(0);
+                                let id = entry.id.unwrap_or_default();
                                 let name = entry.name.clone().unwrap_or_default();
                                 let kind = entry.type_.clone().unwrap_or_default();
                                 let overview = entry.overview.clone().unwrap_or_default();
@@ -121,7 +121,7 @@ pub fn ActivityLogPage(app_state: AppState) -> Element {
                                         match c.execute(GetActivityLog {
                                             start_index: Some(start),
                                             limit: Some(PAGE_SIZE),
-                                            has_user_id: None,
+                                            search_term: None,
                                         }).await {
                                             Ok(result) => {
                                                 total.set(result.total_record_count);

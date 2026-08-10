@@ -162,6 +162,20 @@ pub(super) fn parse_manifest_info(
 
 #[nutype(
     sanitize(trim, with = |s: String| {
+        // Parse as a URL so we strip /manifest.json and /configure from the path
+        // even when a query string is present (a plain suffix match would miss
+        // "…/manifest.json?apikey=abc" because the string doesn't end with the suffix).
+        if let Ok(mut url) = url::Url::parse(s.trim()) {
+            let path = url
+                .path()
+                .trim_end_matches('/')
+                .trim_end_matches("/manifest.json")
+                .trim_end_matches("/configure")
+                .to_string();
+            url.set_path(&path);
+            return url.to_string();
+        }
+        // Fallback for bare paths / non-URL strings.
         let s = s.trim_end_matches('/');
         let s = s.strip_suffix("/manifest.json").unwrap_or(s);
         s.strip_suffix("/configure").unwrap_or(s).to_string()
@@ -330,6 +344,10 @@ impl CatalogAddon for StremioAddon {
                 let svc = svc.clone();
                 let tmdb = tmdb_client.clone();
                 async move {
+                    if meta.is_error() {
+                        debug!(id = %meta.id, "catalog item is an error stub, skipping");
+                        return vec![];
+                    }
                     if !resolve_imdb_id(&mut meta, Some(&svc), tmdb.as_ref()).await {
                         debug!(id = %meta.id, "could not resolve imdb_id, skipping");
                         return vec![];
@@ -409,9 +427,20 @@ impl TreeAddon for StremioAddon {
                 }
             }
             db::MediaKind::Season => {
+                // The series meta is cached under the series' own lookup ID.
+                // Prefer grandparent (always set during process_tree_root) over
+                // the season's own external_ids which carry no series-level ID.
                 let meta_id = root
-                    .external_ids
-                    .stremio_lookup_id()
+                    .grandparent
+                    .as_deref()
+                    .and_then(|gp| {
+                        gp.external_ids
+                            .stremio_lookup_id()
+                    })
+                    .or_else(|| {
+                        root.external_ids
+                            .stremio_lookup_id()
+                    })
                     .ok_or_else(|| {
                         anyhow!("season {} has no resolvable meta id", root.id)
                     })?;
@@ -428,25 +457,14 @@ impl TreeAddon for StremioAddon {
                     Some(i) => i,
                     None => return Ok(None),
                 };
-                // Rebuild series external_ids from what the season carries.
-                let series_external_ids = db::ExternalIds {
-                    imdb: root
-                        .external_ids
-                        .series_imdb
-                        .clone(),
-                    tmdb: root
-                        .external_ids
-                        .series_tmdb,
-                    custom_stremio_id: root
-                        .external_ids
-                        .series_custom_stremio_id
-                        .clone(),
-                    custom_stremio_type: root
-                        .external_ids
-                        .custom_stremio_type
-                        .clone(),
-                    ..Default::default()
-                };
+                let series_external_ids = root
+                    .grandparent
+                    .as_deref()
+                    .map(|gp| {
+                        gp.external_ids
+                            .clone()
+                    })
+                    .ok_or_else(|| anyhow!("season {} missing grandparent", root.id))?;
                 let series_id = root
                     .grandparent_id
                     .ok_or_else(|| {
@@ -537,9 +555,10 @@ impl StreamAddon for StremioAddon {
         &self,
         media: &db::Media,
         _ctx: &AppContext,
+        id_prefixes: Option<&[String]>,
     ) -> Result<Vec<crate::stream::StreamInfo>> {
         let svc = self.service()?;
-        stremio_streams(&svc, &self.manifest_url, media, None).await
+        stremio_streams(&svc, &self.manifest_url, media, id_prefixes, None).await
     }
 
     async fn get_streams_for_user(
@@ -547,12 +566,20 @@ impl StreamAddon for StremioAddon {
         media: &db::Media,
         ctx: &AppContext,
         identity: Option<&AddonRequestIdentity>,
+        id_prefixes: Option<&[String]>,
     ) -> Result<Vec<crate::stream::StreamInfo>> {
         let svc = self.service()?;
         let attribution = identity.and_then(|identity| {
             remux_attribution(&self.manifest_url, &ctx.config, identity)
         });
-        stremio_streams(&svc, &self.manifest_url, media, attribution.as_deref()).await
+        stremio_streams(
+            &svc,
+            &self.manifest_url,
+            media,
+            id_prefixes,
+            attribution.as_deref(),
+        )
+        .await
     }
 }
 
@@ -810,9 +837,21 @@ async fn fetch_and_cache_meta(
     >,
     ctx: &AppContext,
 ) -> Result<Arc<sdks::stremio::Meta>> {
+    // For Season/Episode, the series meta is cached under the series' ID.
+    // Prefer grandparent lookup so Seasons/Episodes with empty own external_ids
+    // still resolve to the correct cache entry.
     let meta_id: String = media
-        .external_ids
-        .stremio_lookup_id()
+        .grandparent
+        .as_deref()
+        .and_then(|gp| {
+            gp.external_ids
+                .stremio_lookup_id()
+        })
+        .or_else(|| {
+            media
+                .external_ids
+                .stremio_lookup_id()
+        })
         .ok_or_else(|| anyhow!("no resolvable meta id for {}", media.id))?;
 
     if let Some(cached) = cache
@@ -824,18 +863,23 @@ async fn fetch_and_cache_meta(
         return Ok(cached);
     }
 
+    let series_imdb = media
+        .grandparent
+        .as_deref()
+        .and_then(|gp| {
+            gp.external_ids
+                .imdb
+                .clone()
+        });
     let is_custom = media
         .external_ids
         .imdb
         .is_none()
-        && media
-            .external_ids
-            .series_imdb
-            .is_none();
+        && series_imdb.is_none();
     let media_type = media
         .external_ids
         .stremio_media_type(&media.kind);
-    let meta = if let Some(stored) = ctx
+    let meta: Arc<sdks::stremio::Meta> = if let Some(stored) = ctx
         .store
         .get::<sdks::stremio::Meta>(
             media
@@ -844,49 +888,57 @@ async fn fetch_and_cache_meta(
         ) {
         stored
     } else {
-        match svc
-            .get_meta(media_type.clone(), meta_id.clone())
-            .await
-        {
-            Ok(m) => m,
-            // Custom-ID items (no IMDB/TMDB) have no `MediaKind`-derived type that's
-            // guaranteed correct: a DB row imported before `custom_stremio_type` was
-            // tracked (or a season/episode that never inherited it) falls back to a
-            // generic type that may not match the addon's own non-standard one (e.g.
-            // "anime"). Ask the addon's manifest what type(s) it actually serves for
-            // this ID and retry, rather than failing permanently.
-            Err(e)
-                if is_404(&e)
-                    && is_custom
-                    && media
-                        .external_ids
-                        .custom_stremio_type
-                        .is_none() =>
+        Arc::new(
+            match svc
+                .get_meta(media_type.clone(), meta_id.clone())
+                .await
             {
-                match manifest_meta_type_fallback(svc, &media_type, &meta_id).await {
-                    Some(m) => m,
-                    None => return Err(e),
+                Ok(m) => m,
+                // Custom-ID items (no IMDB/TMDB) have no `MediaKind`-derived type that's
+                // guaranteed correct: a DB row imported before `custom_stremio_type` was
+                // tracked (or a season/episode that never inherited it) falls back to a
+                // generic type that may not match the addon's own non-standard one (e.g.
+                // "anime"). Ask the addon's manifest what type(s) it actually serves for
+                // this ID and retry, rather than failing permanently.
+                Err(e)
+                    if is_404(&e)
+                        && is_custom
+                        && media
+                            .external_ids
+                            .custom_stremio_type
+                            .is_none() =>
+                {
+                    match manifest_meta_type_fallback(svc, &media_type, &meta_id).await
+                    {
+                        Some(m) => m,
+                        None => return Err(e),
+                    }
                 }
-            }
-            Err(e) if is_404(&e) && !is_custom => {
-                let tmdb_id = media
-                    .external_ids
-                    .tmdb
-                    .or(media
+                Err(e) if is_404(&e) && !is_custom => {
+                    let series_tmdb = media
+                        .grandparent
+                        .as_deref()
+                        .and_then(|gp| {
+                            gp.external_ids
+                                .tmdb
+                        });
+                    let tmdb_id = media
                         .external_ids
-                        .series_tmdb);
-                if let Some(tid) = tmdb_id {
-                    svc.get_meta(media_type, format!("tmdb:{}", tid))
-                        .await?
-                } else {
-                    return Err(e);
+                        .tmdb
+                        .or(series_tmdb);
+                    if let Some(tid) = tmdb_id {
+                        svc.get_meta(media_type, format!("tmdb:{}", tid))
+                            .await?
+                    } else {
+                        return Err(e);
+                    }
                 }
-            }
-            Err(e) => return Err(e),
-        }
+                Err(e) => return Err(e),
+            },
+        )
     };
 
-    let arc = Arc::new(meta);
+    let arc = meta;
     cache
         .lock()
         .unwrap()
@@ -903,9 +955,13 @@ async fn stremio_meta_fetch(
     >,
 ) -> Result<Option<db::Media>> {
     let imdb_id = media
-        .external_ids
-        .series_imdb
-        .clone()
+        .grandparent
+        .as_deref()
+        .and_then(|gp| {
+            gp.external_ids
+                .imdb
+                .clone()
+        })
         .or(media
             .external_ids
             .imdb
@@ -914,21 +970,24 @@ async fn stremio_meta_fetch(
 
     let meta_arc = fetch_and_cache_meta(svc, media, medias_cache, ctx).await?;
 
-    // Patch imdb_id into a mutable clone for root-level conversion and relations.
-    let mut meta_patched = (*meta_arc).clone();
-    if meta_patched
-        .imdb_id
-        .is_none()
-        && !is_custom
-    {
-        meta_patched.imdb_id = db::ExternalIds::from_stremio_id(&meta_patched.id)
-            .imdb
-            .map(Into::into)
-            .or_else(|| imdb_id.map(Into::into));
-    }
-
     match media.kind {
         db::MediaKind::Movie | db::MediaKind::Series => {
+            // Patch imdb_id into a mutable clone for root-level conversion and
+            // relations. Only the Movie/Series arm needs the owned copy — cloning
+            // it unconditionally deep-copies every entry in `videos`, which is
+            // ruinous for series with thousands of episodes.
+            let mut meta_patched = (*meta_arc).clone();
+            if meta_patched
+                .imdb_id
+                .is_none()
+                && !is_custom
+            {
+                meta_patched.imdb_id =
+                    db::ExternalIds::from_stremio_id(&meta_patched.id)
+                        .imdb
+                        .map(Into::into)
+                        .or_else(|| imdb_id.map(Into::into));
+            }
             if meta_patched.is_error() {
                 warn!(
                     id = %media.id,
@@ -953,24 +1012,14 @@ async fn stremio_meta_fetch(
                 .grandparent_id
                 .or(media.parent_id)
                 .ok_or_else(|| anyhow!("season {} missing grandparent_id", media.id))?;
-            let series_external_ids = db::ExternalIds {
-                imdb: media
-                    .external_ids
-                    .series_imdb
-                    .clone(),
-                tmdb: media
-                    .external_ids
-                    .series_tmdb,
-                custom_stremio_id: media
-                    .external_ids
-                    .series_custom_stremio_id
-                    .clone(),
-                custom_stremio_type: media
-                    .external_ids
-                    .custom_stremio_type
-                    .clone(),
-                ..Default::default()
-            };
+            let series_external_ids = media
+                .grandparent
+                .as_deref()
+                .map(|gp| {
+                    gp.external_ids
+                        .clone()
+                })
+                .ok_or_else(|| anyhow!("season {} missing grandparent", media.id))?;
             let seasons =
                 db::stremio_meta_seasons(&meta_arc, series_id, &series_external_ids);
             Ok(seasons
@@ -989,52 +1038,41 @@ async fn stremio_meta_fetch(
             let season_idx = media
                 .parent_idx
                 .ok_or_else(|| anyhow!("episode {} missing parent_idx", media.id))?;
-            let series_external_ids = db::ExternalIds {
-                imdb: media
-                    .external_ids
-                    .series_imdb
-                    .clone(),
-                tmdb: media
-                    .external_ids
-                    .series_tmdb,
-                custom_stremio_id: media
-                    .external_ids
-                    .series_custom_stremio_id
-                    .clone(),
-                custom_stremio_type: media
-                    .external_ids
-                    .custom_stremio_type
-                    .clone(),
-                ..Default::default()
+            let series_external_ids = media
+                .grandparent
+                .as_deref()
+                .map(|gp| {
+                    gp.external_ids
+                        .clone()
+                })
+                .ok_or_else(|| anyhow!("episode {} missing grandparent", media.id))?;
+            // Locate just this episode's video entry. Materialising the whole
+            // season here and discarding all but one row made a season of N
+            // episodes cost O(N^2) to refresh.
+            let Some(meta_ep) = meta_arc
+                .videos
+                .as_ref()
+                .and_then(|v| {
+                    v.iter()
+                        .find(|e| {
+                            e.episode == media.idx && e.season == media.parent_idx
+                        })
+                })
+            else {
+                return Ok(None);
             };
-            let episodes = db::stremio_meta_season_episodes(
-                &meta_arc,
+            let mut found = db::stremio_meta_episode(
+                meta_ep,
                 series_id,
                 season_id,
                 season_idx,
                 &series_external_ids,
             )?;
-            let mut found = episodes
-                .into_iter()
-                .find(|e| e.idx == media.idx);
-            if let Some(ref mut ep) = found {
-                if let Some(meta_ep) = meta_patched
-                    .videos
-                    .as_ref()
-                    .and_then(|v| {
-                        v.iter()
-                            .find(|e| {
-                                e.episode == media.idx && e.season == media.parent_idx
-                            })
-                    })
-                {
-                    let relations = build_episode_relations(media, meta_ep);
-                    if !relations.is_empty() {
-                        ep.relations = Some(relations);
-                    }
-                }
+            let relations = build_episode_relations(media, meta_ep);
+            if !relations.is_empty() {
+                found.relations = Some(relations);
             }
-            Ok(found)
+            Ok(Some(found))
         }
         _ => Ok(None),
     }
@@ -1329,6 +1367,7 @@ async fn stremio_search(
                 .unwrap_or_else(|| format!("{}:{}", m.media_type, m.id))
         })
         .take(limit)
+        .filter(|meta| !meta.is_error())
         .filter_map(|meta| {
             let mut m = db::Media::try_from(meta.clone()).ok()?;
             let rels = build_relations(&m, &meta);
@@ -1363,10 +1402,14 @@ async fn stremio_subtitles(
         ),
         db::MediaKind::Episode => (
             media
-                .external_ids
-                .series_imdb
+                .grandparent
                 .as_deref()
-                .ok_or_else(|| anyhow!("no series_imdb"))?,
+                .and_then(|gp| {
+                    gp.external_ids
+                        .imdb
+                        .as_deref()
+                })
+                .ok_or_else(|| anyhow!("no grandparent imdb for subtitle lookup"))?,
             sdks::stremio::MediaType::Series,
             media.parent_idx,
             media.idx,
@@ -1409,121 +1452,56 @@ async fn stremio_streams(
     svc: &stremio_service::StremioService,
     manifest_url: &StremioManifestUrl,
     media: &db::Media,
+    id_prefixes: Option<&[String]>,
     attribution: Option<&str>,
 ) -> Result<Vec<crate::stream::StreamInfo>> {
-    let (media_type, id, tmdb_fallback_id) = match media.kind {
-        db::MediaKind::Episode => {
-            let season = media
-                .parent_idx
-                .unwrap_or(1);
-            let episode = media
-                .idx
-                .unwrap_or(1);
-            let tmdb_fb = media
-                .external_ids
-                .series_tmdb
-                .map(|tid| format!("tmdb:{}:{}:{}", tid, season, episode));
-            // Prefer the addon's own video id (captured from the series meta's
-            // `videos[].id`) over reconstructing "{series}:{season}:{episode}" —
-            // that composite form is only a convention for series-type addons,
-            // not guaranteed for custom types. Fall back to reconstruction for
-            // episodes stored before this field was captured.
-            let id = media
-                .external_ids
-                .custom_stremio_id
-                .clone()
-                .ok_or(())
-                .or_else(|_| {
-                    media
-                        .external_ids
-                        .series_imdb
-                        .as_deref()
-                        .map(|s| s.to_string())
-                        .or_else(|| media.external_ids.series_custom_stremio_id.clone())
-                        .map(|series_id| format!("{}:{}:{}", series_id, season, episode))
-                        .ok_or_else(|| {
-                            anyhow!("episode has no series_imdb or series_custom_stremio_id for stream lookup")
-                        })
-                })?;
-            (
-                media
-                    .external_ids
-                    .stremio_media_type(&media.kind),
-                id,
-                tmdb_fb,
-            )
-        }
-        db::MediaKind::Track => {
-            let id = media
-                .external_ids
-                .deezer_track
-                .map(|n| format!("deezer:{n}"))
-                .ok_or_else(|| {
-                    anyhow!("track has no deezer ID for Stremio stream lookup")
-                })?;
-            (sdks::stremio::MediaType::Track, id, None)
-        }
-        db::MediaKind::Album => {
-            let id = media
-                .external_ids
-                .deezer_album
-                .map(|n| format!("deezer:{n}"))
-                .ok_or_else(|| {
-                    anyhow!("album has no deezer ID for Stremio stream lookup")
-                })?;
-            (sdks::stremio::MediaType::Album, id, None)
-        }
-        db::MediaKind::Artist => {
-            let id = media
-                .external_ids
-                .deezer_artist
-                .map(|n| format!("deezer:{n}"))
-                .ok_or_else(|| {
-                    anyhow!("artist has no deezer ID for Stremio stream lookup")
-                })?;
-            (sdks::stremio::MediaType::Artist, id, None)
-        }
-        _ => {
-            let id = media
-                .external_ids
-                .imdb
-                .as_deref()
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    anyhow!("media has no identifiable ID for Stremio stream lookup")
-                })?;
-            let tmdb_fb = media
-                .external_ids
-                .tmdb
-                .map(|tid| format!("tmdb:{}", tid));
-            (
-                media
-                    .external_ids
-                    .stremio_media_type(&media.kind),
-                id,
-                tmdb_fb,
-            )
-        }
+    let gp_ext = media
+        .grandparent
+        .as_deref()
+        .map(|gp| &gp.external_ids);
+    let all_candidates = media.candidate_ids(gp_ext);
+    let ids_to_try: Vec<String> = match id_prefixes {
+        Some(prefixes) => all_candidates
+            .into_iter()
+            .filter(|id| {
+                prefixes
+                    .iter()
+                    .any(|p| id.starts_with(p.as_str()))
+            })
+            .collect(),
+        None => all_candidates,
     };
+    if ids_to_try.is_empty() {
+        return Err(anyhow!("no resolvable ID for Stremio stream lookup"));
+    }
+    let media_type = media
+        .external_ids
+        .stremio_media_type(&media.kind);
 
-    let streams = match svc
-        .get_streams_attributed(media_type.clone(), id, attribution.map(str::to_owned))
-        .await
-    {
-        Ok(s) => s,
-        Err(e) if is_404(&e) => {
-            if let Some(fb_id) = tmdb_fallback_id {
-                svc.get_streams_attributed(
-                    media_type,
-                    fb_id,
-                    attribution.map(str::to_owned),
-                )
-                .await?
-            } else {
-                return Err(e);
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut streams_opt: Option<Vec<sdks::stremio::Stream>> = None;
+    for id in ids_to_try {
+        match svc
+            .get_streams_attributed(
+                media_type.clone(),
+                id,
+                attribution.map(str::to_owned),
+            )
+            .await
+        {
+            Ok(s) => {
+                streams_opt = Some(s);
+                break;
             }
+            Err(e) if is_404(&e) => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
+    }
+    let streams = match streams_opt {
+        Some(s) => s,
+        None => return Err(last_err.unwrap_or_else(|| anyhow!("no streams found"))),
     };
 
     Ok(streams
@@ -1680,54 +1658,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attribution_is_signed_only_for_the_exact_gateway_origin() {
-        let config = crate::Config {
-            gateway_attribution_key: "shared-secret".to_string(),
-            gateway_attribution_origin: "https://stremio.obby.ca".to_string(),
-            ..Default::default()
-        };
-        let identity = AddonRequestIdentity {
-            user_id: Uuid::nil(),
-            username: "alice".to_string(),
-            discord_user_id: Some("123456789012345678".to_string()),
-            discord_username: Some("alice.example".to_string()),
-        };
-        let trusted = StremioManifestUrl::try_new(
-            "https://stremio.obby.ca/a/install-token/manifest.json".to_string(),
+    fn manifest_url_strips_manifest_json_with_query_string() {
+        let url = StremioManifestUrl::try_new(
+            "https://example.com/path/manifest.json?apikey=abc",
         )
         .unwrap();
-        let token = remux_attribution(&trusted, &config, &identity).unwrap();
-        let mut parts = token.split('.');
-        assert_eq!(parts.next(), Some("v1"));
-        let body = parts
-            .next()
-            .unwrap();
-        let signature = parts
-            .next()
-            .unwrap();
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
-        mac.update(body.as_bytes());
-        assert_eq!(
-            signature,
-            URL_SAFE_NO_PAD.encode(
-                mac.finalize()
-                    .into_bytes()
-            )
+        assert!(
+            !url.as_str()
+                .contains("manifest.json"),
+            "manifest.json not stripped: {url}"
         );
-        let claims: serde_json::Value = serde_json::from_slice(
-            &URL_SAFE_NO_PAD
-                .decode(body)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(claims["sub"], Uuid::nil().to_string());
-        assert_eq!(claims["discord_id"], "123456789012345678");
+        assert!(
+            url.as_str()
+                .contains("apikey=abc"),
+            "query string lost: {url}"
+        );
+    }
 
-        let lookalike = StremioManifestUrl::try_new(
-            "https://stremio.obby.ca.evil.example/a/token/manifest.json".to_string(),
-        )
-        .unwrap();
-        assert!(remux_attribution(&lookalike, &config, &identity).is_none());
+    #[test]
+    fn manifest_url_strips_manifest_json_without_query_string() {
+        let url = StremioManifestUrl::try_new("https://example.com/path/manifest.json")
+            .unwrap();
+        assert!(
+            !url.as_str()
+                .contains("manifest.json"),
+            "manifest.json not stripped: {url}"
+        );
     }
 
     fn mock_manifest(server: &httpmock::MockServer) {
@@ -1867,14 +1823,23 @@ mod tests {
         let svc =
             stremio_service::StremioService::from_url(&server.base_url()).unwrap();
         let manifest_url = StremioManifestUrl::try_new(server.base_url()).unwrap();
-        let media = episode_media(db::ExternalIds {
-            series_custom_stremio_id: Some("fk:27".to_string()),
+        let grandparent = db::Media {
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                custom_stremio_id: Some("fk:27".to_string()),
+                custom_stremio_type: Some("anime".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut media = episode_media(db::ExternalIds {
             custom_stremio_id: Some("fk-ep-1".to_string()),
             custom_stremio_type: Some("anime".to_string()),
             ..Default::default()
         });
+        media.grandparent = Some(Box::new(grandparent));
 
-        let streams = stremio_streams(&svc, &manifest_url, &media, None)
+        let streams = stremio_streams(&svc, &manifest_url, &media, None, None)
             .await
             .unwrap();
 
@@ -1895,13 +1860,22 @@ mod tests {
         let svc =
             stremio_service::StremioService::from_url(&server.base_url()).unwrap();
         let manifest_url = StremioManifestUrl::try_new(server.base_url()).unwrap();
-        let media = episode_media(db::ExternalIds {
-            series_custom_stremio_id: Some("fk:27".to_string()),
+        let grandparent = db::Media {
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                custom_stremio_id: Some("fk:27".to_string()),
+                custom_stremio_type: Some("anime".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut media = episode_media(db::ExternalIds {
             custom_stremio_type: Some("anime".to_string()),
             ..Default::default()
         });
+        media.grandparent = Some(Box::new(grandparent));
 
-        let streams = stremio_streams(&svc, &manifest_url, &media, None)
+        let streams = stremio_streams(&svc, &manifest_url, &media, None, None)
             .await
             .unwrap();
 

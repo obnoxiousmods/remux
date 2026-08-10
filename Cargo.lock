@@ -6701,6 +6701,7 @@ dependencies = [
  "nutype",
  "opendal",
  "pbkdf2",
+ "percent-encoding",
  "quick-xml 0.37.5",
  "rand 0.8.5",
  "regex",

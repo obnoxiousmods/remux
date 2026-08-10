@@ -344,9 +344,7 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
         preview_loading.set(true);
         preview_data.set(None);
         preview_error.set(None);
-        let client = app_state_preview
-            .client
-            .clone();
+        let client = app_state_preview.clone();
         spawn(async move {
             match client
                 .execute(GetStreamGroupPreview { imdb_id: imdb })
@@ -367,9 +365,7 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
     use_effect(move || {
         let _r = *refresh.read();
         loading.set(true);
-        let client = app_state_effect
-            .client
-            .clone();
+        let client = app_state_effect.clone();
         spawn(async move {
             let groups_res = client
                 .execute(ListStreamGroups)
@@ -420,7 +416,7 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                             checked: *show_ungrouped.read(),
                             disabled: *saving_setting.read(),
                             onchange: {
-                                let client = app_state.client.clone();
+                                let client = app_state.clone();
                                 move |e: Event<FormData>| {
                                     let checked = e.checked();
                                     show_ungrouped.set(checked);

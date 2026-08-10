@@ -28,9 +28,7 @@ pub fn ApiKeysPage(app_state: AppState) -> Element {
     use_effect(move || {
         let _r = *refresh.read();
         loading.set(true);
-        let client = app_state_effect
-            .client
-            .clone();
+        let client = app_state_effect.clone();
         spawn(async move {
             match client
                 .execute(GetApiKeys)
@@ -217,7 +215,7 @@ pub fn ApiKeysPage(app_state: AppState) -> Element {
 
         if let Some(token) = key_to_delete.read().clone() {
             {
-                let client = app_state.client.clone();
+                let client = app_state.clone();
                 rsx! {
                     Modal { on_close: move |_| key_to_delete.set(None),
                         div { class: "modal-header",

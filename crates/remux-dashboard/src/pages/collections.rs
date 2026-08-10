@@ -1,10 +1,24 @@
 use crate::{components::*, state::AppState};
 use dioxus::prelude::*;
 use remux_sdks::remux::{
-    BaseItemDto, CollectionFilter, CreateVirtualFolder, CreateVirtualFolderPayload,
-    DeleteVirtualFolder, FilterGroup, FilterMatchMode, GetItems, GetItemsQuery,
-    ItemSortBy, MediaType, PatchItem, PatchItemPayload, SortOrder,
+    BaseItemDto, CollectionFilter, CollectionType, CreateVirtualFolder,
+    CreateVirtualFolderPayload, DeleteVirtualFolder, FilterGroup, FilterMatchMode,
+    GetItems, GetItemsQuery, ItemSortBy, MediaType, PatchItem, PatchItemPayload,
+    SortOrder,
 };
+
+fn is_group_container(item: &BaseItemDto) -> bool {
+    item.collection_type
+        .as_ref()
+        == Some(&CollectionType::Boxsets)
+}
+
+fn is_promoted(item: &BaseItemDto) -> bool {
+    item.remux
+        .as_ref()
+        .and_then(|r| r.promoted)
+        .unwrap_or(false)
+}
 
 /// Which collection is currently being edited (None = creating new).
 #[derive(Clone, Debug)]
@@ -35,9 +49,7 @@ pub fn CollectionsPage(app_state: AppState) -> Element {
     use_effect(move || {
         let _r = *refresh.read();
         loading.set(true);
-        let client = app_state_effect
-            .client
-            .clone();
+        let client = app_state_effect.clone();
         spawn(async move {
             match client
                 .execute(GetItems(GetItemsQuery {
@@ -85,7 +97,7 @@ pub fn CollectionsPage(app_state: AppState) -> Element {
                                 for (col_idx, col) in collections.read().clone().into_iter().enumerate() {
                                 {
                                     let col_edit = col.clone();
-                                    let client_sort = app_state.client.clone();
+                                    let client_sort = app_state.clone();
                                     let col_id_str = col.id.to_string();
                                     let name = col.name.clone().unwrap_or_default();
                                     let col_type_label = match col.collection_type.as_ref() {
@@ -114,8 +126,11 @@ pub fn CollectionsPage(app_state: AppState) -> Element {
                                                     if !col_kind_label.is_empty() {
                                                         span { class: "session-client-badge", "{col_kind_label}" }
                                                     }
-                                                    if col.remux.as_ref().and_then(|r| r.promoted).unwrap_or(false) {
+                                                    if is_promoted(&col) {
                                                         span { class: "task-badge task-badge-running", "Library" }
+                                                    }
+                                                    if is_group_container(&col) && !is_promoted(&col) {
+                                                        span { class: "task-badge task-badge-idle", "Group" }
                                                     }
                                                 }
                                             }
@@ -436,9 +451,7 @@ pub fn CollectionForm(
     let mut pending_image_bytes: Signal<Option<Vec<u8>>> = use_signal(|| None);
     let mut pending_image_preview: Signal<Option<String>> = use_signal(|| None);
     let mut has_image = use_signal(|| existing_image_tag.is_some());
-    let client_for_delete = app_state
-        .client
-        .clone();
+    let client_for_delete = app_state.clone();
     let app_state_delete = app_state.clone();
     let delete_name = existing
         .as_ref()
@@ -450,9 +463,7 @@ pub fn CollectionForm(
 
     let on_submit = move |e: Event<FormData>| {
         e.prevent_default();
-        let client = app_state
-            .client
-            .clone();
+        let client = app_state.clone();
         let item_id = existing
             .as_ref()
             .map(|f| {
@@ -464,6 +475,7 @@ pub fn CollectionForm(
         let ct = col_type
             .peek()
             .clone();
+        let is_group = ct == "collections";
         let ck = col_kind
             .peek()
             .clone();
@@ -528,8 +540,16 @@ pub fn CollectionForm(
                             promoted: Some(prm),
                             tags: Some(current_tags),
                             sort_order: None,
-                            latest_auto_unplayed: Some(auto_unplayed),
-                            latest_sort_digital: Some(sort_digital),
+                            latest_auto_unplayed: Some(if is_group {
+                                false
+                            } else {
+                                auto_unplayed
+                            }),
+                            latest_sort_digital: Some(if is_group {
+                                false
+                            } else {
+                                sort_digital
+                            }),
                             collection_default_sort: default_sort_payload,
                             collection_default_sort_order: default_sort_order_payload,
                         },
@@ -580,8 +600,16 @@ pub fn CollectionForm(
                             promoted: None,
                             tags: Some(current_tags),
                             sort_order: None,
-                            latest_auto_unplayed: Some(auto_unplayed),
-                            latest_sort_digital: Some(sort_digital),
+                            latest_auto_unplayed: Some(if is_group {
+                                false
+                            } else {
+                                auto_unplayed
+                            }),
+                            latest_sort_digital: Some(if is_group {
+                                false
+                            } else {
+                                sort_digital
+                            }),
                             collection_default_sort: default_sort_payload,
                             collection_default_sort_order: default_sort_order_payload,
                         },
@@ -756,58 +784,67 @@ pub fn CollectionForm(
                 on_change: move |v| promoted.set(v),
             }
 
-            ToggleRow {
-                label: "Latest: Unplayed Only",
-                checked: *latest_auto_unplayed.read(),
-                on_change: move |v| latest_auto_unplayed.set(v),
+            if col_type.read().as_str() != "collections" {
+                ToggleRow {
+                    label: "Latest: Unplayed Only",
+                    checked: *latest_auto_unplayed.read(),
+                    on_change: move |v| latest_auto_unplayed.set(v),
+                }
+
+                ToggleRow {
+                    label: "Latest: Sort by Digital Release",
+                    checked: *latest_sort_digital.read(),
+                    on_change: move |v| latest_sort_digital.set(v),
+                }
             }
 
-            ToggleRow {
-                label: "Latest: Sort by Digital Release",
-                checked: *latest_sort_digital.read(),
-                on_change: move |v| latest_sort_digital.set(v),
-            }
-
-            if (col_kind.read().as_str() == "smart" || col_kind.read().as_str() == "catalog") && col_type.read().as_str() != "collections" {
-                FilterRuleEditor { match_mode: sf_match, groups: sf_groups }
-
-                div { class: "field",
-                    label { class: "field-label", "Default Sort Override" }
-                    p { class: "field-hint", "Overrides the sort order when the client sends no preference or its default (Sort Name). Note: the client UI may still show its own sort label." }
-                    div { style: "display:flex;gap:8px",
-                        Select {
-                            class: "flex-1 min-w-0".to_string(),
-                            value: default_sort.read().clone(),
-                            options: {
-                                let mut opts = vec![SelectOption::new("", "— None —")];
-                                if sf_groups.read().iter().flat_map(|g| g.rules.iter()).any(|r| matches!(r, remux_sdks::remux::FilterRule::Catalog { .. })) {
-                                    opts.push(SelectOption::new("CatalogOrder", "Catalog Order"));
-                                }
-                                opts.push(SelectOption::new("SortName", "Name"));
-                                opts.push(SelectOption::new("PremiereDate", "Release Date"));
-                                opts.push(SelectOption::new("DigitalReleaseDate", "Digital Release Date"));
-                                opts.push(SelectOption::new("DateCreated", "Date Added"));
-                                opts.push(SelectOption::new("CommunityRating", "Community Rating"));
-                                opts.push(SelectOption::new("PopularityDay", "Popularity (Today)"));
-                                opts.push(SelectOption::new("PopularityWeek", "Popularity (This Week)"));
-                                opts.push(SelectOption::new("PopularityMonth", "Popularity (This Month)"));
-                                opts.push(SelectOption::new("PopularityAllTime", "Popularity (All Time)"));
-                                opts.push(SelectOption::new("TrendingWeek", "Trending (7 days)"));
-                                opts.push(SelectOption::new("TrendingMonth", "Trending (30 days)"));
-                                opts.push(SelectOption::new("Random", "Random"));
-                                opts
-                            },
-                            on_change: move |v: String| default_sort.set(v),
-                        }
-                        if !default_sort.read().is_empty() && *default_sort.read() != "Random" {
+            if col_kind.read().as_str() == "smart" || col_kind.read().as_str() == "catalog" {
+                if col_type.read().as_str() == "collections" {
+                    FilterRuleEditor {
+                        match_mode: sf_match,
+                        groups: sf_groups,
+                        allowed_fields: vec!["collection_id"],
+                    }
+                } else {
+                    FilterRuleEditor { match_mode: sf_match, groups: sf_groups }
+                    div { class: "field",
+                        label { class: "field-label", "Default Sort Override" }
+                        p { class: "field-hint", "Overrides the sort order when the client sends no preference or its default (Sort Name). Note: the client UI may still show its own sort label." }
+                        div { style: "display:flex;gap:8px",
                             Select {
-                                class: "flex-[0_0_auto] w-auto".to_string(),
-                                value: default_sort_order.read().clone(),
-                                options: vec![
-                                    SelectOption::new("Ascending", "Asc"),
-                                    SelectOption::new("Descending", "Desc"),
-                                ],
-                                on_change: move |v: String| default_sort_order.set(v),
+                                class: "flex-1 min-w-0".to_string(),
+                                value: default_sort.read().clone(),
+                                options: {
+                                    let mut opts = vec![SelectOption::new("", "— None —")];
+                                    if sf_groups.read().iter().flat_map(|g| g.rules.iter()).any(|r| matches!(r, remux_sdks::remux::FilterRule::Catalog { .. })) {
+                                        opts.push(SelectOption::new("CatalogOrder", "Catalog Order"));
+                                    }
+                                    opts.push(SelectOption::new("SortName", "Name"));
+                                    opts.push(SelectOption::new("PremiereDate", "Release Date"));
+                                    opts.push(SelectOption::new("DigitalReleaseDate", "Digital Release Date"));
+                                    opts.push(SelectOption::new("DateCreated", "Date Added"));
+                                    opts.push(SelectOption::new("CommunityRating", "Community Rating"));
+                                    opts.push(SelectOption::new("PopularityDay", "Popularity (Today)"));
+                                    opts.push(SelectOption::new("PopularityWeek", "Popularity (This Week)"));
+                                    opts.push(SelectOption::new("PopularityMonth", "Popularity (This Month)"));
+                                    opts.push(SelectOption::new("PopularityAllTime", "Popularity (All Time)"));
+                                    opts.push(SelectOption::new("TrendingWeek", "Trending (7 days)"));
+                                    opts.push(SelectOption::new("TrendingMonth", "Trending (30 days)"));
+                                    opts.push(SelectOption::new("Random", "Random"));
+                                    opts
+                                },
+                                on_change: move |v: String| default_sort.set(v),
+                            }
+                            if !default_sort.read().is_empty() && *default_sort.read() != "Random" {
+                                Select {
+                                    class: "flex-[0_0_auto] w-auto".to_string(),
+                                    value: default_sort_order.read().clone(),
+                                    options: vec![
+                                        SelectOption::new("Ascending", "Asc"),
+                                        SelectOption::new("Descending", "Desc"),
+                                    ],
+                                    on_change: move |v: String| default_sort_order.set(v),
+                                }
                             }
                         }
                     }
@@ -825,7 +862,7 @@ pub fn CollectionForm(
                         class: "btn btn-ghost",
                         style: "color:var(--error);border-color:var(--error);margin-right:auto",
                         onclick: {
-                            let client = app_state_delete.client.clone();
+                            let client = app_state_delete.clone();
                             let name = delete_name.clone();
                             move |_| {
                                 let client = client.clone();

@@ -42,9 +42,7 @@ pub fn UsersPage(app_state: AppState) -> Element {
     use_effect(move || {
         let _r = *refresh.read();
         loading.set(true);
-        let client = app_state_effect
-            .client
-            .clone();
+        let client = app_state_effect.clone();
         spawn(async move {
             match client
                 .execute(GetUsers)
@@ -87,7 +85,7 @@ pub fn UsersPage(app_state: AppState) -> Element {
                                     let is_admin  = user.policy.is_administrator;
                                     let user_edit = user.clone();
                                     let user_id   = user.id;
-                                    let client_del = app_state.client.clone();
+                                    let client_del = app_state.clone();
                                     rsx! {
                                         div { class: "flex items-center border-b border-[var(--border)] hover:bg-[var(--row-hover)] even:bg-[var(--row-stripe)] even:hover:bg-[var(--row-hover)]", key: "{user.id}",
                                             div { class: "flex-1 min-w-0 px-3 py-[10px]",
@@ -303,9 +301,7 @@ pub fn UserForm(
     let edit_user_id = existing
         .as_ref()
         .map(|u| u.id);
-    let addon_client = app_state
-        .client
-        .clone();
+    let addon_client = app_state.clone();
     use_effect(move || {
         let Some(uid) = edit_user_id else {
             return;
@@ -372,9 +368,7 @@ pub fn UserForm(
             return;
         }
 
-        let client = app_state
-            .client
-            .clone();
+        let client = app_state.clone();
         let name = username
             .peek()
             .clone();
