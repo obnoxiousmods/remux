@@ -932,6 +932,23 @@ struct RemoteMessageBody {
     timeout_ms: Option<i64>,
 }
 
+fn canonical_playstate_command(command: &str) -> String {
+    match command
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "playpause" => "PlayPause",
+        "pause" => "Pause",
+        "unpause" => "Unpause",
+        "stop" => "Stop",
+        "seek" => "Seek",
+        "nexttrack" => "NextTrack",
+        "previoustrack" => "PreviousTrack",
+        _ => command,
+    }
+    .to_string()
+}
+
 /// Instruct a session to play a list of items.
 #[post("/sessions/{sessionid}/playing")]
 pub async fn remote_play(
@@ -967,6 +984,7 @@ pub async fn remote_play(
         "AudioStreamIndex": q.audio_stream_index,
         "SubtitleStreamIndex": q.subtitle_stream_index,
         "StartIndex": q.start_index,
+        "ControllingUserId": session.user.id,
     });
     let receivers = state
         .ctx
@@ -1016,9 +1034,9 @@ pub async fn remote_playstate_command(
             .context_forbidden("cannot control other users' sessions"));
     }
     let data = serde_json::json!({
-        "Command": command,
+        "Command": canonical_playstate_command(&command),
         "SeekPositionTicks": q.seek_position_ticks,
-        "ControllingUserId": q.controlling_user_id,
+        "ControllingUserId": q.controlling_user_id.unwrap_or_else(|| session.user.id.to_string()),
     });
     let _ = state
         .ctx
@@ -1284,4 +1302,16 @@ pub async fn delete_transcoding(
             .send(crate::ws::WsEvent::SessionsChanged);
     }
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod remote_control_tests {
+    use super::canonical_playstate_command;
+
+    #[test]
+    fn playstate_commands_use_jellyfin_casing() {
+        assert_eq!(canonical_playstate_command("pause"), "Pause");
+        assert_eq!(canonical_playstate_command("NEXTTRACK"), "NextTrack");
+        assert_eq!(canonical_playstate_command("Seek"), "Seek");
+    }
 }
