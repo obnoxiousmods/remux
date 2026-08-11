@@ -548,8 +548,11 @@ async fn extract_text_subtitle_detached(
     item_id: Uuid,
     cache_source_id: Uuid,
     stream_index: i64,
-) -> anyhow::Result<std::path::PathBuf> {
-    tokio::spawn(async move {
+) -> anyhow::Result<(Vec<u8>, bool)> {
+    let cache_dir = data_dir.join("subtitle-cache");
+    let cache_name = format!("{item_id}_{cache_source_id}_{stream_index}.srt");
+    let partial_prefix = format!("{item_id}_{cache_source_id}_{stream_index}_");
+    let mut extraction = tokio::spawn(async move {
         let artifact_key = (
             item_id,
             cache_source_id,
@@ -578,9 +581,52 @@ async fn extract_text_subtitle_detached(
             stream_index,
         )
         .await
-    })
-    .await
-    .map_err(|error| anyhow!("text subtitle extraction task failed: {error}"))?
+    });
+
+    loop {
+        tokio::select! {
+            result = &mut extraction => {
+                let path = result
+                    .map_err(|error| anyhow!("text subtitle extraction task failed: {error}"))??;
+                let bytes = tokio::fs::read(path)
+                    .await
+                    .map_err(|error| anyhow!("failed to read extracted subtitle: {error}"))?;
+                return Ok((bytes, false));
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                // Text cues are useful long before FFmpeg has traversed a large
+                // remote container. Return a stable in-memory snapshot while the
+                // detached extraction keeps filling and eventually publishes the
+                // complete cache. The client refreshes snapshots marked partial.
+                let mut entries = match tokio::fs::read_dir(&cache_dir).await {
+                    Ok(entries) => entries,
+                    Err(_) => continue,
+                };
+                let mut best = Vec::new();
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name == cache_name
+                        || !name.starts_with(&partial_prefix)
+                        || !name.ends_with(".srt.tmp")
+                    {
+                        continue;
+                    }
+                    let bytes = tokio::fs::read(entry.path()).await.unwrap_or_default();
+                    let cue_count = bytes
+                        .windows(5)
+                        .filter(|window| *window == b" --> ")
+                        .count();
+                    if cue_count >= 3 && bytes.len() > best.len() {
+                        best = bytes;
+                    }
+                }
+                if !best.is_empty() {
+                    return Ok((best, true));
+                }
+            }
+        }
+    }
 }
 
 async fn extract_raw_ass_to_cache(
@@ -1654,7 +1700,7 @@ async fn subtitles_stream_inner(
             "subtitle extraction timed out during retry cooldown"
         )));
     }
-    let cache_path = match extract_text_subtitle_detached(
+    let (cached_bytes, is_partial) = match extract_text_subtitle_detached(
         state
             .ctx
             .config
@@ -1668,21 +1714,18 @@ async fn subtitles_stream_inner(
     )
     .await
     {
-        Ok(p) => p,
+        Ok(payload) => payload,
         Err(e) => {
             record_transient_subtitle_failure(artifact_key, &e);
             error!(%item_id, stream_index, %map_spec, "subtitle extraction failed: {e}");
             return Ok(subtitle_extraction_error_response(&e));
         }
     };
-    clear_subtitle_failure(&artifact_key);
+    if !is_partial {
+        clear_subtitle_failure(&artifact_key);
+    }
 
-    let cached = String::from_utf8_lossy(
-        &tokio::fs::read(&cache_path)
-            .await
-            .map_err(|e| anyhow!("failed to read cached subtitle: {e}"))?,
-    )
-    .into_owned();
+    let cached = String::from_utf8_lossy(&cached_bytes).into_owned();
 
     let body = if is_passthrough {
         cached
@@ -1694,13 +1737,30 @@ async fn subtitles_stream_inner(
         cached
     };
 
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", content_type)
-        .header("Cache-Control", "public, max-age=3600")
+        .header(
+            "Cache-Control",
+            if is_partial {
+                "no-store"
+            } else {
+                "public, max-age=3600"
+            },
+        )
         .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Expose-Headers", "X-Remux-Subtitle-Partial")
         .body(Body::from(body))
-        .unwrap())
+        .unwrap();
+    if is_partial {
+        response
+            .headers_mut()
+            .insert(
+                "X-Remux-Subtitle-Partial",
+                http::HeaderValue::from_static("true"),
+            );
+    }
+    Ok(response)
 }
 
 pub(crate) use remux_sdks::remux::lang_to_two_letter;
