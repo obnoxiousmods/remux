@@ -360,6 +360,11 @@ async fn create_hls_session(
                 .to_string()
         });
 
+    // Playback owns the upstream source. Cancel speculative subtitle cache
+    // warming before any lookup or FFmpeg startup so it cannot consume the
+    // provider's connection/rate-limit budget ahead of first frame.
+    crate::api::subtitles::cancel_subtitle_pre_extraction(id);
+
     debug!("Using play session ID: {}", play_session_id);
 
     let encoding_opts_hls = crate::db::Settings::get_encoding_config(
