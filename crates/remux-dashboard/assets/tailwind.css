@@ -13,6 +13,7 @@
     --text-sm: 0.875rem;
     --text-lg: 1.125rem;
     --text-xl: 1.25rem;
+    --font-weight-semibold: 600;
     --radius-sm: 0.25rem;
     --radius-md: 0.375rem;
     --radius-lg: 0.5rem;
@@ -182,6 +183,9 @@
   .static {
     position: static;
   }
+  .mt-0\.5 {
+    margin-top: calc(var(--spacing) * 0.5);
+  }
   .mt-1 {
     margin-top: calc(var(--spacing) * 1);
   }
@@ -281,6 +285,13 @@
   .even\:bg-\[var\(--row-stripe\)\] {
     &:nth-child(even) {
       background-color: var(--row-stripe);
+    }
+  }
+  .hover\:bg-\[var\(--hover-overlay\)\] {
+    &:hover {
+      @media (hover: hover) {
+        background-color: var(--hover-overlay);
+      }
     }
   }
   .hover\:bg-\[var\(--row-hover\)\] {
