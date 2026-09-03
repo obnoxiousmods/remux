@@ -47,9 +47,10 @@ async fn addon_to_dto(addon: Addon, config: &crate::Config) -> AddonDto {
             .clone();
         match p.from_cfg(
             addon.id,
-            &addon
+            addon
                 .preset
-                .config,
+                .config
+                .expose(),
             config,
         ) {
             Ok(caps) => {
@@ -114,7 +115,8 @@ async fn addon_to_dto(addon: Addon, config: &crate::Config) -> AddonDto {
         name: addon.name,
         config: addon
             .preset
-            .config,
+            .config
+            .into_inner(),
         resources: addon.resources,
         types: addon
             .types
@@ -130,6 +132,12 @@ async fn addon_to_dto(addon: Addon, config: &crate::Config) -> AddonDto {
         priority: addon.priority,
         system: addon.system,
         is_default: addon.is_default,
+        http_redirect_stream: addon.http_redirect_stream,
+        service_filter: addon.service_filter,
+        description: preset.map(|p| {
+            p.metadata()
+                .description
+        }),
         created_at: addon.created_at,
         updated_at: addon.updated_at,
     }
@@ -235,7 +243,8 @@ pub async fn create_addon(
         .normalize_cfg(
             payload
                 .preset
-                .config,
+                .config
+                .into_inner(),
             &state
                 .ctx
                 .config,
@@ -243,13 +252,14 @@ pub async fn create_addon(
         .context_bad_request("Invalid addon configuration")?;
     payload
         .preset
-        .config = normalized_config;
+        .config = normalized_config.into();
     let caps = preset
         .from_cfg(
             addon_id,
-            &payload
+            payload
                 .preset
-                .config,
+                .config
+                .expose(),
             &state
                 .ctx
                 .config,
@@ -328,6 +338,8 @@ pub async fn create_addon(
         updated_at: now,
         system: false,
         is_default: payload.is_default,
+        http_redirect_stream: false,
+        service_filter: vec![],
     };
 
     addon
@@ -419,6 +431,12 @@ pub async fn update_addon(
     if let Some(is_default) = payload.is_default {
         addon.is_default = is_default;
     }
+    if let Some(http_redirect_stream) = payload.http_redirect_stream {
+        addon.http_redirect_stream = http_redirect_stream;
+    }
+    if let Some(service_filter) = payload.service_filter {
+        addon.service_filter = service_filter;
+    }
     addon.updated_at = Utc::now().naive_utc();
 
     let presets = registered_presets();
@@ -449,14 +467,16 @@ pub async fn update_addon(
                     .ctx
                     .config,
             )
-            .context_bad_request("Invalid addon configuration")?;
+            .context_bad_request("Invalid addon configuration")?
+            .into();
     }
     preset
         .from_cfg(
             addon.id,
-            &addon
+            addon
                 .preset
-                .config,
+                .config
+                .expose(),
             &state
                 .ctx
                 .config,

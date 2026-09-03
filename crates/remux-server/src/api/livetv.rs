@@ -183,10 +183,14 @@ pub struct GetRecommendedQuery {
 #[get("/livetv/programs/recommended")]
 pub async fn livetv_programs_recommended(
     State(state): State<AppState>,
-    _session: AuthSession,
+    session: AuthSession,
     Query(q): Query<GetRecommendedQuery>,
 ) -> Result<impl IntoResponse> {
     let now = Utc::now().naive_utc();
+    let policy = session
+        .user
+        .policy
+        .as_ref();
     let result = db::Media::get_by_filter(
         &state
             .ctx
@@ -202,6 +206,30 @@ pub async fn livetv_programs_recommended(
                     .unwrap_or(20),
             ),
             total_count: false,
+            user_id: Some(
+                session
+                    .user
+                    .id,
+            ),
+            max_parental_rating: policy.and_then(|p| p.max_parental_rating),
+            blocked_tags: policy
+                .map(|p| {
+                    p.blocked_tags
+                        .clone()
+                })
+                .filter(|v| !v.is_empty()),
+            allowed_tags: policy
+                .map(|p| {
+                    p.allowed_tags
+                        .clone()
+                })
+                .filter(|v| !v.is_empty()),
+            policy_filter: policy
+                .and_then(|p| {
+                    p.filter_rules
+                        .as_ref()
+                })
+                .cloned(),
             ..Default::default()
         },
     )
@@ -260,7 +288,7 @@ pub struct GetProgramsQuery {
 #[get("/livetv/programs")]
 pub async fn livetv_programs(
     State(state): State<AppState>,
-    _session: AuthSession,
+    session: AuthSession,
     Query(q): Query<GetProgramsQuery>,
 ) -> Result<impl IntoResponse> {
     if q.library_series_id
@@ -300,6 +328,10 @@ pub async fn livetv_programs(
         program_kinds.push(db::ProgramKind::Sports);
     }
 
+    let policy = session
+        .user
+        .policy
+        .as_ref();
     let mut filter = db::MediaFilter {
         kind: Some(vec![db::MediaKind::TvProgram]),
         limit: q.limit,
@@ -322,6 +354,30 @@ pub async fn livetv_programs(
         } else {
             Some(program_kinds)
         },
+        user_id: Some(
+            session
+                .user
+                .id,
+        ),
+        max_parental_rating: policy.and_then(|p| p.max_parental_rating),
+        blocked_tags: policy
+            .map(|p| {
+                p.blocked_tags
+                    .clone()
+            })
+            .filter(|v| !v.is_empty()),
+        allowed_tags: policy
+            .map(|p| {
+                p.allowed_tags
+                    .clone()
+            })
+            .filter(|v| !v.is_empty()),
+        policy_filter: policy
+            .and_then(|p| {
+                p.filter_rules
+                    .as_ref()
+            })
+            .cloned(),
         ..Default::default()
     };
 
@@ -360,7 +416,8 @@ pub async fn livetv_programs(
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct GetProgramsBody {
-    pub channel_ids: Option<Vec<Uuid>>,
+    #[serde(rename = "channelIds", alias = "ChannelIds", default)]
+    pub channel_ids: remux_sdks::CommaSeparatedList<Uuid>,
     pub start_index: Option<u32>,
     pub limit: Option<u32>,
     pub has_aired: Option<bool>,
@@ -372,7 +429,7 @@ pub struct GetProgramsBody {
 #[post("/livetv/programs")]
 pub async fn livetv_programs_post(
     State(state): State<AppState>,
-    _session: AuthSession,
+    session: AuthSession,
     Json(body): Json<GetProgramsBody>,
 ) -> Result<impl IntoResponse> {
     let parse_dt = |s: &str| {
@@ -381,6 +438,10 @@ pub async fn livetv_programs_post(
             .map(|dt| dt.naive_utc())
     };
 
+    let policy = session
+        .user
+        .policy
+        .as_ref();
     let mut filter = db::MediaFilter {
         kind: Some(vec![db::MediaKind::TvProgram]),
         limit: body.limit,
@@ -398,15 +459,45 @@ pub async fn livetv_programs_post(
             .max_start_date
             .as_deref()
             .and_then(parse_dt),
+        user_id: Some(
+            session
+                .user
+                .id,
+        ),
+        max_parental_rating: policy.and_then(|p| p.max_parental_rating),
+        blocked_tags: policy
+            .map(|p| {
+                p.blocked_tags
+                    .clone()
+            })
+            .filter(|v| !v.is_empty()),
+        allowed_tags: policy
+            .map(|p| {
+                p.allowed_tags
+                    .clone()
+            })
+            .filter(|v| !v.is_empty()),
+        policy_filter: policy
+            .and_then(|p| {
+                p.filter_rules
+                    .as_ref()
+            })
+            .cloned(),
         ..Default::default()
     };
 
-    if let Some(ids) = body.channel_ids {
-        match ids.len() {
-            1 => filter.parent_id = Some(ids[0]),
-            n if n > 1 => filter.parent_ids = Some(ids),
-            _ => {}
+    match body
+        .channel_ids
+        .len()
+    {
+        1 => filter.parent_id = Some(body.channel_ids[0]),
+        n if n > 1 => {
+            filter.parent_ids = Some(
+                body.channel_ids
+                    .to_vec(),
+            )
         }
+        _ => {}
     }
 
     let result = db::Media::get_by_filter(

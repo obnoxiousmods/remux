@@ -12,7 +12,8 @@ use remux_sdks::{
 
 use crate::state::{
     browser_metadata_country_code, get_or_create_device_id, get_origin,
-    get_stored_server, store_credentials, StoredServer, TAILWIND_CSS, THEME_CSS,
+    get_stored_server, store_credentials, StoredServer, FAVICON, TAILWIND_CSS,
+    THEME_CSS,
 };
 
 mod components;
@@ -112,6 +113,7 @@ fn App() -> Element {
     });
 
     rsx! {
+        document::Link { rel: "icon", r#type: "image/x-icon", href: FAVICON }
         document::Link { rel: "stylesheet", href: TAILWIND_CSS }
         document::Link { rel: "stylesheet", href: THEME_CSS }
         // Live overrides for the user-chosen accent color and UI scale. A

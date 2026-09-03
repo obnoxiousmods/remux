@@ -36,8 +36,6 @@ fn subtitle_format_from_url(url: &str) -> Option<String> {
         })
 }
 
-// ── Metadata remote search ──────────────────────────────────────────────────
-
 #[post("/items/remotesearch/movie")]
 pub async fn remote_search_movie(
     State(state): State<AppState>,
@@ -243,8 +241,6 @@ pub async fn remote_search_apply(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ── Subtitle remote search ──────────────────────────────────────────────────
-
 #[remux_macros::query]
 #[derive(Debug, Default)]
 pub struct SubtitleSearchQuery {
@@ -258,7 +254,7 @@ pub async fn search_remote_subtitles(
     Path((item_id, language)): Path<(Uuid, String)>,
     Query(_q): Query<SubtitleSearchQuery>,
 ) -> Result<impl IntoResponse> {
-    let media = db::Media::get_by_id(
+    let mut media = db::Media::get_by_id(
         &state
             .ctx
             .db,
@@ -271,7 +267,7 @@ pub async fn search_remote_subtitles(
         .ctx
         .addons
         .fetch_subtitles(
-            &media,
+            &mut media,
             &state
                 .ctx
                 .db,
@@ -341,8 +337,6 @@ pub async fn download_remote_subtitle(
         .get::<String>(format!("subtitle:{}", subtitle_id));
     Ok(StatusCode::NO_CONTENT)
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

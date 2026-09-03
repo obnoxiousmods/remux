@@ -19,6 +19,7 @@ pub mod settings;
 pub mod stream_group;
 pub mod task;
 pub mod user;
+pub mod user_media_tracker;
 pub use activity::*;
 pub use api_key::*;
 pub use image::*;
@@ -28,6 +29,7 @@ pub use settings::*;
 pub use stream_group::*;
 pub use task::*;
 pub use user::*;
+pub use user_media_tracker::*;
 
 pub async fn connect(
     url: &str,
@@ -137,6 +139,7 @@ async fn prepare_squash(pool: &SqlitePool) -> Result<()> {
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     prepare_squash(pool).await?;
     sqlx::migrate!("./migrations")
+        .set_ignore_missing(true)
         .run(pool)
         .await?;
 

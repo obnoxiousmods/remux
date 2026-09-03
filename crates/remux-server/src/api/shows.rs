@@ -294,7 +294,10 @@ async fn shows_nextup_all(
         .id;
     let limit = q
         .limit
-        .unwrap_or(50) as i64;
+        .map(|l| l as usize);
+    let start_index = q
+        .start_index
+        .unwrap_or(0) as usize;
     let enable_resumable = q
         .enable_resumable
         .unwrap_or(true);
@@ -312,6 +315,8 @@ async fn shows_nextup_all(
     // because the two legs are mutually exclusive (play_count > 0 vs play_count = 0).
     // CROSS JOIN pins SQLite to start from the small active set and then PK-lookup
     // media rows, avoiding a slow scan over the full episode index.
+    // No series-count LIMIT here — we apply the page limit to the final episode list
+    // (matching Jellyfin's approach: consider all active series, paginate results).
     let date_cutoff = q
         .next_up_date_cutoff
         .clone()
@@ -331,13 +336,11 @@ async fn shows_nextup_all(
          AND m.grandparent_id IS NOT NULL \
          GROUP BY m.grandparent_id \
          HAVING last_activity >= ? \
-         ORDER BY last_activity DESC \
-         LIMIT ?",
+         ORDER BY last_activity DESC",
     )
     .bind(user_id)
     .bind(user_id)
     .bind(&date_cutoff)
-    .bind(limit)
     .fetch_all(&state.ctx.db)
     .await?;
 
@@ -447,7 +450,16 @@ async fn shows_nextup_all(
                 .iter()
                 .rposition(|e| state_for(e).map_or(false, |s| s.play_count > 0));
             if let Some(pos) = last_played_pos {
-                next_ep = episodes.get(pos + 1);
+                let candidate = episodes.get(pos + 1);
+                // Mirror Jellyfin: when EnableResumable=false, skip a candidate that
+                // is already in-progress — the user should resume or mark it watched.
+                next_ep = if !enable_resumable {
+                    candidate.filter(|e| {
+                        !state_for(e).map_or(false, |s| s.playback_position > 0)
+                    })
+                } else {
+                    candidate
+                };
             }
         }
 
@@ -511,8 +523,11 @@ async fn shows_nextup_all(
             .unwrap_or_default();
     }
 
+    let total = next_eps.len() as i64;
     let items: Vec<api::BaseItemDto> = next_eps
         .into_iter()
+        .skip(start_index)
+        .take(limit.unwrap_or(usize::MAX))
         .map(|ep| {
             let mut item = api::db_media_to_item(ep.clone(), false);
             if let Some(s) = states_map.get(&ep.id) {
@@ -522,25 +537,137 @@ async fn shows_nextup_all(
         })
         .collect();
 
-    let total = items.len() as i64;
     Ok(Json(api::BaseItemDtoQueryResult {
         items,
         total_record_count: total,
-        start_index: q
-            .start_index
-            .unwrap_or(0),
+        start_index: start_index as u32,
         ..Default::default()
     })
     .into_response())
 }
 
-/// Upcoming episodes (live TV future airings) — not supported, return empty.
+/// Upcoming episodes sorted by premiere date, soonest first.
+/// The digital_released_before filter is intentionally skipped so episodes
+/// that have aired but are not yet digitally available are included.
 #[get("/shows/upcoming")]
 pub async fn shows_upcoming(
-    _state: State<AppState>,
-    _session: auth::AuthSession,
-) -> impl IntoResponse {
-    Json(api::BaseItemDtoQueryResult::default())
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Query(q): Query<api::GetItemsQuery>,
+) -> Result<impl IntoResponse> {
+    let user_id = q
+        .user_id
+        .unwrap_or(
+            session
+                .user
+                .id,
+        );
+
+    // Use start-of-today so episodes stored as midnight UTC on today's date are included.
+    let today = chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+
+    // Resolve the ParentId if provided. Clients often send the TV library view UUID
+    // (a Collection/Folder). We map it to the right filter field:
+    //   Manual collection → fetch series via media_relations (role='collection') → grandparent_ids
+    //   Series            → grandparent_id
+    //   Season            → parent_id
+    //   not in DB (virtual view UUID) → no filter
+    let mut episode_parent_id: Option<uuid::Uuid> = None;
+    let mut episode_grandparent_id: Option<uuid::Uuid> = None;
+    let mut episode_grandparent_ids: Option<Vec<uuid::Uuid>> = None;
+    if let Some(pid) = q.parent_id {
+        use crate::services::resolve::MediaResolveService;
+        if let Some(parent) = MediaResolveService::resolve_item(pid, &state.ctx).await?
+        {
+            match parent.kind {
+                db::MediaKind::Series => episode_grandparent_id = Some(parent.id),
+                db::MediaKind::Season => episode_parent_id = Some(parent.id),
+                _ => {
+                    // Collection/Folder: get the series it contains and scope episodes to those.
+                    let series = db::MediaRelation::get_collection_items(
+                        &state
+                            .ctx
+                            .db,
+                        &parent.id,
+                    )
+                    .await?;
+                    let ids: Vec<uuid::Uuid> = series
+                        .into_iter()
+                        .map(|s| s.right_media_id)
+                        .collect();
+                    if !ids.is_empty() {
+                        episode_grandparent_ids = Some(ids);
+                    }
+                }
+            }
+        }
+    }
+
+    let policy = session
+        .user
+        .policy
+        .as_ref();
+    let result = db::Media::get_by_filter(
+        &state
+            .ctx
+            .db,
+        &db::MediaFilter {
+            kind: Some(vec![db::MediaKind::Episode]),
+            parent_id: episode_parent_id,
+            grandparent_id: episode_grandparent_id,
+            grandparent_ids: episode_grandparent_ids,
+            released_after: Some(today),
+            digital_released_before: None,
+            limit: q.limit,
+            offset: q.start_index,
+            include_user_state: true,
+            user_id: Some(user_id),
+            sort_by: vec![api::ItemSortBy::PremiereDate],
+            sort_order: vec![api::SortOrder::Ascending],
+            total_count: q
+                .enable_total_record_count
+                .unwrap_or(true),
+            max_parental_rating: policy.and_then(|p| p.max_parental_rating),
+            blocked_tags: policy
+                .map(|p| {
+                    p.blocked_tags
+                        .clone()
+                })
+                .filter(|v| !v.is_empty()),
+            allowed_tags: policy
+                .map(|p| {
+                    p.allowed_tags
+                        .clone()
+                })
+                .filter(|v| !v.is_empty()),
+            policy_filter: policy
+                .and_then(|p| {
+                    p.filter_rules
+                        .as_ref()
+                })
+                .cloned(),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let items = result
+        .records
+        .into_iter()
+        .map(|m| api::db_media_to_item(m, false))
+        .collect::<Vec<_>>();
+
+    Ok(Json(api::BaseItemDtoQueryResult {
+        total_record_count: result.total_count as i64,
+        start_index: q
+            .start_index
+            .unwrap_or(0),
+        items,
+        ..Default::default()
+    }))
 }
 
 // --------------------------------------------------------------------------
@@ -713,7 +840,9 @@ mod test {
     async fn insert_user(db: &SqlitePool, username: &str) -> db::User {
         let mut user = db::User {
             username: username.to_string(),
-            password_hash: "test".to_string(),
+            password_hash: "test"
+                .to_string()
+                .into(),
             ..Default::default()
         };
         user.save(db)
@@ -1090,9 +1219,11 @@ mod test {
 
         let ep_a2_str = eps_a[1]
             .id
+            .simple()
             .to_string();
         let ep_b2_str = ep_b2
             .id
+            .simple()
             .to_string();
 
         let pos_a = id_strs
@@ -1177,6 +1308,7 @@ mod test {
                 .unwrap(),
             episodes[1]
                 .id
+                .simple()
                 .to_string(),
             "NextUp should return episode 2, not {:?}",
             items[0]["Name"]
@@ -1237,6 +1369,7 @@ mod test {
                 .unwrap(),
             episodes[1]
                 .id
+                .simple()
                 .to_string(),
         );
     }
@@ -1297,6 +1430,7 @@ mod test {
                 .unwrap(),
             episodes[0]
                 .id
+                .simple()
                 .to_string(),
             "In-progress episode 1 should be returned as NextUp when EnableResumable=true"
         );
@@ -1364,6 +1498,7 @@ mod test {
                 .unwrap(),
             episodes[1]
                 .id
+                .simple()
                 .to_string()
         );
     }
@@ -1628,6 +1763,353 @@ mod test {
             0,
             "null-date episode must not appear in Next Up; got: {:?}",
             items
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: /shows/upcoming
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upcoming_returns_episodes_with_released_at_today_or_future() {
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let now = Utc::now().naive_utc();
+        let today_midnight = now
+            .date()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let future = today_midnight + chrono::Duration::days(7);
+        let past = today_midnight - chrono::Duration::days(7);
+
+        let (_, episodes_today) =
+            insert_series_with_episodes(db, "Upcoming Today Series", &["Ep Today"])
+                .await;
+        let (_, episodes_future) =
+            insert_series_with_episodes(db, "Upcoming Future Series", &["Ep Future"])
+                .await;
+        let (_, episodes_past) =
+            insert_series_with_episodes(db, "Past Series", &["Ep Past"]).await;
+
+        // Set released_at directly (insert_series_with_episodes sets digital_released_at to 2020-01-01).
+        // Override released_at for our test episodes.
+        sqlx::query("UPDATE media SET released_at = ? WHERE id = ?")
+            .bind(today_midnight)
+            .bind(episodes_today[0].id)
+            .execute(db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE media SET released_at = ? WHERE id = ?")
+            .bind(future)
+            .bind(episodes_future[0].id)
+            .execute(db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE media SET released_at = ? WHERE id = ?")
+            .bind(past)
+            .bind(episodes_past[0].id)
+            .execute(db)
+            .await
+            .unwrap();
+
+        let resp = server
+            .get("/shows/upcoming")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|i| {
+                i["Id"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+
+        let today_id = episodes_today[0]
+            .id
+            .simple()
+            .to_string();
+        let future_id = episodes_future[0]
+            .id
+            .simple()
+            .to_string();
+        let past_id = episodes_past[0]
+            .id
+            .simple()
+            .to_string();
+
+        assert!(
+            ids.contains(&today_id.as_str()),
+            "today's episode must appear in /shows/upcoming; got: {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&future_id.as_str()),
+            "future episode must appear in /shows/upcoming; got: {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&past_id.as_str()),
+            "past episode must NOT appear in /shows/upcoming; got: {:?}",
+            ids
+        );
+    }
+
+    #[tokio::test]
+    async fn upcoming_virtual_parent_id_returns_all_not_empty() {
+        // Clients send ParentId = TV library view UUID (not in DB). Must return episodes,
+        // not empty — the virtual UUID must not be used as a filter.
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let now = Utc::now().naive_utc();
+        let today = now
+            .date()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+
+        let (_, episodes) =
+            insert_series_with_episodes(db, "Upcoming Virtual Parent Test", &["Ep1"])
+                .await;
+        sqlx::query("UPDATE media SET released_at = ? WHERE id = ?")
+            .bind(today)
+            .bind(episodes[0].id)
+            .execute(db)
+            .await
+            .unwrap();
+
+        // This UUID does not exist in the DB — it's the virtual TV library view.
+        let virtual_uuid =
+            uuid::Uuid::parse_str("a1b2c3d4-0000-4000-8000-000000000002").unwrap();
+
+        let resp = server
+            .get(&format!("/shows/upcoming?ParentId={virtual_uuid}"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|i| {
+                i["Id"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        let ep_id = episodes[0]
+            .id
+            .simple()
+            .to_string();
+
+        assert!(
+            ids.contains(&ep_id.as_str()),
+            "/shows/upcoming with virtual ParentId must not return empty; got: {:?}",
+            ids
+        );
+    }
+
+    #[tokio::test]
+    async fn upcoming_collection_parent_id_scopes_to_collection_series() {
+        // When ParentId is a real collection, only return episodes from series in that collection.
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let now = Utc::now().naive_utc();
+        let today = now
+            .date()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+
+        let (series_in, eps_in) =
+            insert_series_with_episodes(db, "In Collection Series", &["In Ep"]).await;
+        let (_, eps_out) =
+            insert_series_with_episodes(db, "Not In Collection Series", &["Out Ep"])
+                .await;
+
+        // Set both episodes to today.
+        for ep in [&eps_in[0], &eps_out[0]] {
+            sqlx::query("UPDATE media SET released_at = ? WHERE id = ?")
+                .bind(today)
+                .bind(ep.id)
+                .execute(db)
+                .await
+                .unwrap();
+        }
+
+        // Create a collection and add only series_in to it.
+        let collection_id = uuid::Uuid::new_v4();
+        let mut collection = db::Media {
+            id: collection_id,
+            title: "Test Collection".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            ..Default::default()
+        };
+        collection
+            .save(db)
+            .await
+            .unwrap();
+        db::MediaRelation::add_collection_items(db, &collection_id, &[series_in.id])
+            .await
+            .unwrap();
+
+        let resp = server
+            .get(&format!("/shows/upcoming?ParentId={collection_id}"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|i| {
+                i["Id"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+
+        let ep_in_id = eps_in[0]
+            .id
+            .simple()
+            .to_string();
+        let ep_out_id = eps_out[0]
+            .id
+            .simple()
+            .to_string();
+
+        assert!(
+            ids.contains(&ep_in_id.as_str()),
+            "episode from collection series must appear; got: {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&ep_out_id.as_str()),
+            "episode NOT in collection must not appear; got: {:?}",
+            ids
+        );
+    }
+
+    #[tokio::test]
+    async fn upcoming_skips_digital_released_before_filter() {
+        // Even when the release-date gate is on, /shows/upcoming must not hide
+        // episodes that have aired but aren't yet digitally available.
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        // Enable the release-date filter.
+        let cfg = api::ServerConfiguration {
+            filter_by_digital_release_date: true,
+            digital_release_buffer_days: 0,
+            ..Default::default()
+        };
+        db::Settings::set_config(db, &cfg)
+            .await
+            .unwrap();
+
+        let now = Utc::now().naive_utc();
+        let today = now
+            .date()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let future_digital = today + chrono::Duration::days(14); // digital release in 2 weeks
+
+        let (_, episodes) =
+            insert_series_with_episodes(db, "Aired Not Digital Series", &["Ep Aired"])
+                .await;
+
+        // released_at = today (aired), but digital_released_at = 2 weeks away.
+        sqlx::query(
+            "UPDATE media SET released_at = ?, digital_released_at = ? WHERE id = ?",
+        )
+        .bind(today)
+        .bind(future_digital)
+        .bind(episodes[0].id)
+        .execute(db)
+        .await
+        .unwrap();
+
+        let resp = server
+            .get("/shows/upcoming")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|i| {
+                i["Id"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        let ep_id = episodes[0]
+            .id
+            .simple()
+            .to_string();
+
+        assert!(
+            ids.contains(&ep_id.as_str()),
+            "/shows/upcoming must include aired episode even when digital_released_at is in the future; got: {:?}",
+            ids
         );
     }
 

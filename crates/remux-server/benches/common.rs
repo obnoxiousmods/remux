@@ -9,22 +9,20 @@ use serde_json::json;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
-// ── series dataset ────────────────────────────────────────────────────────────
 //
-// 20 000 series, 1 season × 12 episodes each → ~280 000 rows.
-// 5 000 user_media_state rows:
-//   Series   0– 2 499 : S1E1 played,      timestamp = 60 days ago  (old)
-//   Series 2 500– 3 749: S1E1 played,      timestamp = 7–90 days    (recent)
-//   Series 3 750– 4 999: S1E2 in-progress, timestamp = 7–90 days    (recent)
-//   Series 5 000–19 999: no state
+// 50 000 series, 1 season × 24 episodes each → ~1 250 000 rows.
+// 10 000 user_media_state rows:
+//   Series   0– 4 999 : S1E1 played,      timestamp = 60 days ago  (old)
+//   Series 5 000– 7 499: S1E1 played,      timestamp = 7–90 days    (recent)
+//   Series 7 500– 9 999: S1E2 in-progress, timestamp = 7–90 days    (recent)
+//   Series 10 000–49 999: no state
 
-const TOTAL_SERIES: usize = 20_000;
-const ACTIVE_SERIES: usize = 5_000;
-const OLD_ACTIVE: usize = 2_500;
-const IN_PROGRESS_START: usize = 3_750;
-const EPISODES: i64 = 12;
+const TOTAL_SERIES: usize = 50_000;
+const ACTIVE_SERIES: usize = 10_000;
+const OLD_ACTIVE: usize = 5_000;
+const IN_PROGRESS_START: usize = 7_500;
+const EPISODES: i64 = 24;
 
-// ── movie dataset ─────────────────────────────────────────────────────────────
 //
 // 10 000 movies, created_at spread over the last 730 days.
 // 2 000 in-progress (playback_position = 300, play_count = 0)
@@ -149,9 +147,47 @@ async fn seed_all(db: &sqlx::SqlitePool, user_id: Uuid) {
 
     seed_series(db, user_id, now, old_ts).await;
     seed_movies(db, user_id, now).await;
+    seed_userviews(db).await;
 
     sqlx::query("ANALYZE")
         .execute(db)
+        .await
+        .unwrap();
+}
+
+async fn seed_userviews(db: &sqlx::SqlitePool) {
+    use remux_server::sdks::remux::{
+        CollectionFilter, FilterGroup, FilterMatchMode, FilterRule,
+    };
+
+    let plain = db::Media {
+        title: "Movies".to_string(),
+        kind: db::MediaKind::Collection,
+        promoted: true,
+        ..Default::default()
+    };
+    let watched = db::Media {
+        title: "Watched".to_string(),
+        kind: db::MediaKind::Collection,
+        collection_kind: Some(db::CollectionKind::Smart),
+        promoted: true,
+        collection_smart_filter: Some(CollectionFilter {
+            groups: vec![FilterGroup {
+                rules: vec![FilterRule::Played { value: true }],
+                match_mode: FilterMatchMode::All,
+            }],
+            match_mode: FilterMatchMode::All,
+        }),
+        ..Default::default()
+    };
+
+    // seed plain collection via upsert (no smart filter to persist)
+    db::Media::upsert(db, &[plain])
+        .await
+        .unwrap();
+    // seed watched collection via save so collection_smart_filter is stored
+    let mut w = watched;
+    w.save(db)
         .await
         .unwrap();
 }
@@ -179,6 +215,8 @@ async fn seed_series(
             season: None,
             episode: None,
         });
+        // released_at required: release date filter excludes items without it.
+        let released_days_ago = (i as i64 * 730) / TOTAL_SERIES as i64 + 30;
         items.push(db::Media {
             id: series_id,
             title: format!("Bench Series {i}"),
@@ -187,6 +225,7 @@ async fn seed_series(
                 imdb: Some(imdb.clone()),
                 ..Default::default()
             },
+            released_at: Some(now - chrono::Duration::days(released_days_ago)),
             ..Default::default()
         });
 
@@ -397,18 +436,18 @@ impl IntoBench for remux_server::sdks::remux::GetItemsQuery {
     }
 }
 
-pub fn run_bench(bencher: codspeed_divan_compat::Bencher, url: &str) {
+pub fn run_bench(b: &mut criterion::Bencher, url: &str) {
     let f = fixture();
     let full_url = format!("{}{}", f.base_url, url);
     let auth = auth_header(&f.token);
-    bencher.bench(|| {
+    b.iter(|| {
         f.rt.block_on(async {
             f.client
                 .get(&full_url)
                 .header(reqwest::header::AUTHORIZATION, &auth)
                 .send()
                 .await
-                .unwrap();
+                .unwrap()
         })
     });
 }

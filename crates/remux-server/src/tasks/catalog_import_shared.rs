@@ -31,6 +31,7 @@ where
     let mut new_counts: HashMap<String, usize> = HashMap::new();
     let mut total = 0usize;
     let mut catalog_position = 0i64;
+    let mut imported_ids: HashSet<Uuid> = HashSet::new();
     let membership = catalog_membership(media_id);
 
     let collection_id: Uuid = match membership {
@@ -105,6 +106,20 @@ where
                 .into_iter()
                 .collect()
         };
+        // Snapshot stream-order weights before partitioning — partition() does not
+        // preserve the original order across the two vecs, so new items would
+        // otherwise always get the lowest weights within a chunk regardless of where
+        // they actually appeared in the catalog.
+        let item_weights: Vec<(Uuid, i64)> = items
+            .iter()
+            .map(|item| {
+                let w = catalog_position;
+                catalog_position += 1;
+                imported_ids.insert(item.id);
+                (item.id, w)
+            })
+            .collect();
+
         let (new_items, existing_items): (Vec<db::Media>, Vec<db::Media>) = items
             .into_iter()
             .partition(|m| !existing_ids.contains(&m.id));
@@ -198,18 +213,11 @@ where
                     vec![]
                 };
 
-            let relation_rows: Vec<(Uuid, Uuid, i64, Uuid)> = new_items
+            let relation_rows: Vec<(Uuid, Uuid, i64, Uuid)> = item_weights
                 .iter()
-                .chain(existing_items.iter())
-                .map(|item| {
-                    let relation_id = Uuid::new_v5(
-                        &collection_id,
-                        item.id
-                            .as_bytes(),
-                    );
-                    let weight = catalog_position;
-                    catalog_position += 1;
-                    (relation_id, collection_id, weight, item.id)
+                .map(|(item_id, weight)| {
+                    let relation_id = Uuid::new_v5(&collection_id, item_id.as_bytes());
+                    (relation_id, collection_id, *weight, *item_id)
                 })
                 .collect();
 
@@ -303,6 +311,50 @@ where
             .sum();
         if total >= max {
             break;
+        }
+    }
+
+    // Remove items that were in this catalog before but weren't returned this run.
+    if collection_id != Uuid::nil() && !imported_ids.is_empty() {
+        let existing_members: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'catalog'",
+        )
+        .bind(collection_id)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap_or_default();
+
+        let stale: Vec<Uuid> = existing_members
+            .into_iter()
+            .filter(|id| !imported_ids.contains(id))
+            .collect();
+
+        if !stale.is_empty() {
+            info!(
+                catalog = media_id,
+                count = stale.len(),
+                "removing stale catalog members"
+            );
+            const STALE_CHUNK: usize = 900;
+            for chunk in stale.chunks(STALE_CHUNK) {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "DELETE FROM media_relations WHERE left_media_id = ",
+                );
+                qb.push_bind(collection_id);
+                qb.push(" AND role = 'catalog' AND right_media_id IN (");
+                let mut sep = qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(id);
+                }
+                qb.push(")");
+                if let Err(e) = qb
+                    .build()
+                    .execute(&ctx.db)
+                    .await
+                {
+                    warn!(catalog = media_id, error = %e, "failed to remove stale catalog members");
+                }
+            }
         }
     }
 

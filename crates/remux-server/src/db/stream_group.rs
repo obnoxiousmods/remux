@@ -364,7 +364,7 @@ impl StreamGroup {
                 .as_deref())
         {
             Some(s) => s,
-            None => return MatchOutcome::NoMatch,
+            None => return MatchOutcome::PassThrough,
         };
 
         let candidates: Vec<&str> = if raw.contains('\n') {
@@ -390,15 +390,15 @@ impl StreamGroup {
 
         let parsed = match best {
             Some(p) => p,
-            None => return MatchOutcome::NoMatch,
+            None => return MatchOutcome::PassThrough,
         };
 
         let resolution = min_screen_size(&parsed)
             .and_then(StreamResolution::from_hunch)
-            .unwrap_or(StreamResolution::Unknown);
+            .unwrap_or(StreamResolution::Other);
         let source = {
             let s = canonical_source(&parsed);
-            if s == StreamQuality::Unknown {
+            if s == StreamQuality::Other {
                 fallback_source(raw)
             } else {
                 s
@@ -407,13 +407,13 @@ impl StreamGroup {
         let codec = parsed
             .video_codec()
             .and_then(StreamCodec::from_hunch)
-            .unwrap_or(StreamCodec::Unknown);
+            .unwrap_or(StreamCodec::Other);
 
         let eval = |rule: &StreamRule| -> MatchOutcome {
             match rule {
                 StreamRule::Resolution { op, values } => {
-                    if resolution == StreamResolution::Unknown
-                        && !values.contains(&StreamResolution::Unknown)
+                    if resolution == StreamResolution::Other
+                        && !values.contains(&StreamResolution::Other)
                     {
                         return MatchOutcome::PassThrough;
                     }
@@ -421,10 +421,20 @@ impl StreamGroup {
                     bool_to_outcome(matches!(op, SetOp::In | SetOp::Is) == hit)
                 }
                 StreamRule::Quality { op, values } => {
+                    if source == StreamQuality::Other
+                        && !values.contains(&StreamQuality::Other)
+                    {
+                        return MatchOutcome::PassThrough;
+                    }
                     let hit = values.contains(&source);
                     bool_to_outcome(matches!(op, SetOp::In | SetOp::Is) == hit)
                 }
                 StreamRule::Codec { op, values } => {
+                    if codec == StreamCodec::Other
+                        && !values.contains(&StreamCodec::Other)
+                    {
+                        return MatchOutcome::PassThrough;
+                    }
                     let hit = values.contains(&codec);
                     bool_to_outcome(matches!(op, SetOp::In | SetOp::Is) == hit)
                 }
@@ -652,7 +662,7 @@ fn canonical_source(parsed: &hunch::HunchResult) -> StreamQuality {
         return if is_remux {
             StreamQuality::BluRayRemux
         } else {
-            StreamQuality::Unknown
+            StreamQuality::Other
         };
     };
     match source {
@@ -663,7 +673,7 @@ fn canonical_source(parsed: &hunch::HunchResult) -> StreamQuality {
         "HDTV" => StreamQuality::Hdtv,
         "DVD" => StreamQuality::Dvd,
         "TV" => StreamQuality::Tv,
-        _ => StreamQuality::Unknown,
+        _ => StreamQuality::Other,
     }
 }
 
@@ -685,7 +695,7 @@ fn fallback_source(raw: &str) -> StreamQuality {
     } else if lower.contains("dvdrip") {
         StreamQuality::Dvd
     } else {
-        StreamQuality::Unknown
+        StreamQuality::Other
     }
 }
 
@@ -887,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn resolution_group_rejects_source_without_filename() {
+    fn resolution_group_passes_through_source_without_filename() {
         let group = StreamGroup {
             id: Uuid::nil(),
             name: "1080p".to_string(),
@@ -909,7 +919,7 @@ mod tests {
             name: None,
             ..Default::default()
         };
-        assert_eq!(group.match_outcome(&si, None), MatchOutcome::NoMatch);
+        assert_eq!(group.match_outcome(&si, None), MatchOutcome::PassThrough);
     }
 
     // Mixed filter (All): Resolution Match + AudioLanguage PassThrough → PassThrough.

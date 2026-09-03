@@ -1,5 +1,7 @@
 use crate::{
-    components::{EmptyState, FormGroup, LoadingText},
+    components::{
+        DragAndDropList, EmptyState, FormGroup, LoadingText, Switch, ToggleRow,
+    },
     state::AppState,
 };
 use dioxus::prelude::*;
@@ -12,11 +14,14 @@ use remux_sdks::{
     },
     stremio::ResourceType,
 };
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[component]
 pub fn AddonsPage(app_state: AppState) -> Element {
     let mut addons: Signal<Vec<AddonDto>> = use_signal(Vec::new);
+    let mut global_addon_order: Signal<Vec<String>> = use_signal(Vec::new);
+    let mut user_addon_order: Signal<Vec<String>> = use_signal(Vec::new);
     let mut kinds: Signal<Vec<AddonMetadata>> = use_signal(Vec::new);
     let mut loading = use_signal(|| true);
     let mut error: Signal<Option<String>> = use_signal(|| None);
@@ -56,6 +61,9 @@ pub fn AddonsPage(app_state: AppState) -> Element {
         std::collections::HashMap<String, (bool, String, String)>,
     > = use_signal(std::collections::HashMap::new);
 
+    let mut edit_http_redirect_stream = use_signal(|| false);
+    let mut edit_service_filter = use_signal(String::new);
+
     // Confirm-delete state
     let mut id_to_delete: Signal<Option<Uuid>> = use_signal(|| None);
     let mut deleting = use_signal(|| false);
@@ -74,6 +82,26 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                 .await;
             match (kinds_res, addons_res) {
                 (Ok(k), Ok(a)) => {
+                    global_addon_order.set(
+                        a.iter()
+                            .filter(|addon| addon.is_default)
+                            .map(|addon| {
+                                addon
+                                    .id
+                                    .to_string()
+                            })
+                            .collect(),
+                    );
+                    user_addon_order.set(
+                        a.iter()
+                            .filter(|addon| !addon.is_default)
+                            .map(|addon| {
+                                addon
+                                    .id
+                                    .to_string()
+                            })
+                            .collect(),
+                    );
                     kinds.set(k);
                     addons.set(a);
                     error.set(None);
@@ -142,180 +170,196 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                         if visible.is_empty() {
                             rsx! { EmptyState { message: "No addons configured — add one to get started." } }
                         } else {
-                            rsx! {
-                                div { class: "addon-list",
-                                    for (addon_idx, addon) in visible.into_iter().enumerate() {
-                                        {
-                                            let id = addon.id;
-                                            let addon_count = addons.read().iter().filter(|a| if *active_tab.read() == "global" { a.is_default } else { !a.is_default }).count();
-                                            rsx! {
-                                                div { class: "addon-card", key: "{id}",
-                                        div { class: "addon-card-header",
-                                            span { class: "addon-card-name", "{addon.name}" }
-                                            span { class: "addon-card-kind", "{addon.kind}" }
-                                        }
-                                        div { class: "addon-kind-card-badges",
-                                            {
-                                                let is_user_tab = *active_tab.read() == "user";
-                                                let res_list = if is_user_tab {
-                                                    addon.supported_resources_user.clone()
-                                                } else {
-                                                    addon.resources.clone()
-                                                };
-                                                let display_types = if is_user_tab {
-                                                    addon.supported_types_user.clone()
-                                                } else if addon.types.is_empty() {
-                                                    addon.supported_types.clone()
-                                                } else {
-                                                    addon.types.clone()
-                                                };
-                                                rsx! {
-                                                    for res in res_list.iter() {
-                                                        span { class: "addon-kind-badge", "{res}" }
-                                                    }
-                                                    for t in display_types.iter() {
-                                                        span { class: "addon-kind-type", "{t}" }
-                                                    }
+                            let mut addon_order = if *active_tab.read() == "global" {
+                                global_addon_order
+                            } else {
+                                user_addon_order
+                            };
+                            let list_key = visible
+                                .iter()
+                                .map(|addon| addon.id.to_string())
+                                .collect::<Vec<_>>()
+                                .join(":");
+                            let items: Vec<Element> = visible
+                                .into_iter()
+                                .map(|addon| {
+                                    let id = addon.id;
+                                    let id_string = id.to_string();
+                                    let is_user_tab = *active_tab.read() == "user";
+                                    let res_list = if is_user_tab {
+                                        addon.supported_resources_user.clone()
+                                    } else {
+                                        addon.resources.clone()
+                                    };
+                                    let display_types = if is_user_tab {
+                                        addon.supported_types_user.clone()
+                                    } else if addon.types.is_empty() {
+                                        addon.supported_types.clone()
+                                    } else {
+                                        addon.types.clone()
+                                    };
+
+                                    rsx! {
+                                        div { class: "addon-card", key: "{id_string}",
+                                            div { class: "addon-card-header",
+                                                span { class: "addon-card-name", "{addon.name}" }
+                                                span { class: "addon-card-kind", "{addon.kind}" }
+                                            }
+                                            if let Some(desc) = addon.description.as_deref().filter(|d| !d.is_empty()) {
+                                                div { class: "addon-kind-card-desc", "{desc}" }
+                                            }
+                                            div { class: "addon-kind-card-badges",
+                                                for res in res_list.iter() {
+                                                    span { class: "addon-kind-badge", "{res}" }
+                                                }
+                                                for t in display_types.iter() {
+                                                    span { class: "addon-kind-type", "{t}" }
                                                 }
                                             }
-                                        }
-                                        div { class: "addon-card-actions",
-                                            // Up/down reorder buttons
-                                            div { class: "addon-card-sort",
+                                            div { class: "addon-card-actions",
                                                 button {
-                                                    class: "btn btn-ghost addon-sort-btn",
-                                                    disabled: addon_idx == 0,
-                                                    title: "Move up (higher priority)",
+                                                    class: "btn btn-ghost",
+                                                    style: "height:28px;font-size:.68rem;padding:0 10px",
+                                                    draggable: "false",
+                                                    onpointerdown: move |e| e.stop_propagation(),
+                                                    onmousedown: move |e| e.stop_propagation(),
+                                                    onmouseup: move |e| e.stop_propagation(),
                                                     onclick: {
                                                         let client = app_state.clone();
-                                                        move |_| {
-                                                            let current = addons.read().clone();
-                                                            if addon_idx == 0 { return; }
-                                                            let mut new_order = current.clone();
-                                                            new_order.swap(addon_idx, addon_idx - 1);
-                                                            let updates: Vec<(Uuid, i64)> = new_order.iter().enumerate()
-                                                                .filter_map(|(i, a)| {
-                                                                    let new_prio = i as i64 * 10;
-                                                                    if a.priority != new_prio { Some((a.id, new_prio)) } else { None }
-                                                                })
-                                                                .collect();
-                                                            let c = client.clone();
-                                                            spawn(async move {
-                                                                for (uid, prio) in updates {
-                                                                    let _ = c.execute(UpdateAddon { id: uid, payload: UpdateAddonRequest { priority: Some(prio), ..Default::default() } }).await;
-                                                                }
-                                                                let v = *refresh.peek() + 1;
-                                                                refresh.set(v);
-                                                            });
-                                                        }
-                                                    },
-                                                    "↑"
-                                                }
-                                                button {
-                                                    class: "btn btn-ghost addon-sort-btn",
-                                                    disabled: addon_idx + 1 >= addon_count,
-                                                    title: "Move down (lower priority)",
-                                                    onclick: {
-                                                        let client = app_state.clone();
-                                                        move |_| {
-                                                            let current = addons.read().clone();
-                                                            if addon_idx + 1 >= current.len() { return; }
-                                                            let mut new_order = current.clone();
-                                                            new_order.swap(addon_idx, addon_idx + 1);
-                                                            let updates: Vec<(Uuid, i64)> = new_order.iter().enumerate()
-                                                                .filter_map(|(i, a)| {
-                                                                    let new_prio = i as i64 * 10;
-                                                                    if a.priority != new_prio { Some((a.id, new_prio)) } else { None }
-                                                                })
-                                                                .collect();
-                                                            let c = client.clone();
-                                                            spawn(async move {
-                                                                for (uid, prio) in updates {
-                                                                    let _ = c.execute(UpdateAddon { id: uid, payload: UpdateAddonRequest { priority: Some(prio), ..Default::default() } }).await;
-                                                                }
-                                                                let v = *refresh.peek() + 1;
-                                                                refresh.set(v);
-                                                            });
-                                                        }
-                                                    },
-                                                    "↓"
-                                                }
-                                            }
-                                            button {
-                                                class: "btn btn-ghost",
-                                                style: "height:28px;font-size:.68rem;padding:0 10px",
-                                                onclick: {
-                                                    let client = app_state.clone();
-                                                    move |_| {
-                                                        if let Some(a) = addons.read().iter().find(|a| a.id == id).cloned() {
-                                                            edit_name_input.set(a.name.clone());
-                                                            let config_map = a.config.as_object()
-                                                                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                                                                .unwrap_or_default();
-                                                            edit_form_values.set(config_map);
-                                                            let res_set: std::collections::HashSet<String> = a.resources
-                                                                .iter()
-                                                                .map(|r| format!("{r}"))
-                                                                .collect();
-                                                            edit_resources.set(res_set);
-                                                            // Empty types = all enabled — pre-check every supported type.
-                                                            let type_set: std::collections::HashSet<String> = if a.types.is_empty() {
-                                                                a.supported_types.iter().map(|t| format!("{t}")).collect()
-                                                            } else {
-                                                                a.types.iter().map(|t| format!("{t}")).collect()
-                                                            };
-                                                            edit_types.set(type_set);
-                                                            edit_is_default.set(a.is_default);
-                                                            let has_catalog = a.resources.contains(&ResourceType::Catalog);
-                                                            edit_catalogs.set(Vec::new());
-                                                            edit_catalog_settings.set(std::collections::HashMap::new());
-                                                            id_to_edit.set(Some(id));
-                                                            if has_catalog {
-                                                                edit_catalogs_loading.set(true);
-                                                                let c = client.clone();
-                                                                spawn(async move {
-                                                                    match c.execute(GetAddonCatalogs { id }).await {
-                                                                        Ok(cats) => {
-                                                                            let settings: std::collections::HashMap<String, (bool, String, String)> = cats
-                                                                                .iter()
-                                                                                .map(|cat| (
-                                                                                    cat.catalog_id.clone(),
-                                                                                    (
-                                                                                        cat.enabled,
-                                                                                        cat.max_items.map(|n| n.to_string()).unwrap_or_default(),
-                                                                                        cat.tags.join(", "),
-                                                                                    ),
-                                                                                ))
-                                                                                .collect();
-                                                                            edit_catalog_settings.set(settings);
-                                                                            edit_catalogs.set(cats);
-                                                                        }
-                                                                        Err(e) => {
-                                                                            error.set(Some(format!("Failed to load catalogs: {e}")));
+                                                        move |e| {
+                                                            e.stop_propagation();
+                                                            if let Some(a) = addons.read().iter().find(|a| a.id == id).cloned() {
+                                                                edit_name_input.set(a.name.clone());
+                                                                let mut config_map: std::collections::HashMap<String, serde_json::Value> = a.config.as_object()
+                                                                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                                                                    .unwrap_or_default();
+                                                                // Fill missing keys with option defaults so switches show the right state.
+                                                                if let Some(meta) = kinds.read().iter().find(|m| m.id == a.kind).cloned() {
+                                                                    for opt in &meta.options {
+                                                                        if !config_map.contains_key(&opt.id) {
+                                                                            if let Some(default) = &opt.default {
+                                                                                config_map.insert(opt.id.clone(), default.clone());
+                                                                            }
                                                                         }
                                                                     }
-                                                                    edit_catalogs_loading.set(false);
-                                                                });
+                                                                }
+                                                                edit_form_values.set(config_map);
+                                                                let res_set: std::collections::HashSet<String> = a.resources
+                                                                    .iter()
+                                                                    .map(|r| format!("{r}"))
+                                                                    .collect();
+                                                                edit_resources.set(res_set);
+                                                                let type_set: std::collections::HashSet<String> = if a.types.is_empty() {
+                                                                    a.supported_types.iter().map(|t| format!("{t}")).collect()
+                                                                } else {
+                                                                    a.types.iter().map(|t| format!("{t}")).collect()
+                                                                };
+                                                                edit_types.set(type_set);
+                                                                edit_is_default.set(a.is_default);
+                                                                edit_http_redirect_stream.set(a.http_redirect_stream);
+                                                                edit_service_filter.set(a.service_filter.join(", "));
+                                                                let has_catalog = a.resources.contains(&ResourceType::Catalog);
+                                                                edit_catalogs.set(Vec::new());
+                                                                edit_catalog_settings.set(std::collections::HashMap::new());
+                                                                id_to_edit.set(Some(id));
+                                                                if has_catalog {
+                                                                    edit_catalogs_loading.set(true);
+                                                                    let c = client.clone();
+                                                                    spawn(async move {
+                                                                        match c.execute(GetAddonCatalogs { id }).await {
+                                                                            Ok(cats) => {
+                                                                                let settings: std::collections::HashMap<String, (bool, String, String)> = cats
+                                                                                    .iter()
+                                                                                    .map(|cat| (
+                                                                                        cat.catalog_id.clone(),
+                                                                                        (
+                                                                                            cat.enabled,
+                                                                                            cat.max_items.map(|n| n.to_string()).unwrap_or_default(),
+                                                                                            cat.tags.join(", "),
+                                                                                        ),
+                                                                                    ))
+                                                                                    .collect();
+                                                                                edit_catalog_settings.set(settings);
+                                                                                edit_catalogs.set(cats);
+                                                                            }
+                                                                            Err(e) => error.set(Some(format!("Failed to load catalogs: {e}"))),
+                                                                        }
+                                                                        edit_catalogs_loading.set(false);
+                                                                    });
+                                                                }
                                                             }
                                                         }
-                                                    }
-                                                },
-                                                "Edit"
-                                            }
-                                            button {
-                                                class: "btn btn-ghost",
-                                                style: "height:28px;font-size:.68rem;padding:0 10px;color:var(--error);border-color:var(--error)",
-                                                onclick: move |_| id_to_delete.set(Some(id)),
-                                                "Delete"
+                                                    },
+                                                    "Edit"
+                                                }
+                                                button {
+                                                    class: "btn btn-ghost",
+                                                    style: "height:28px;font-size:.68rem;padding:0 10px;color:var(--error);border-color:var(--error)",
+                                                    draggable: "false",
+                                                    onpointerdown: move |e| e.stop_propagation(),
+                                                    onmousedown: move |e| e.stop_propagation(),
+                                                    onmouseup: move |e| e.stop_propagation(),
+                                                    onclick: move |e| {
+                                                        e.stop_propagation();
+                                                        id_to_delete.set(Some(id));
+                                                    },
+                                                    "Delete"
+                                                }
                                             }
                                         }
                                     }
+                                })
+                                .collect();
+                            let client = app_state.clone();
+
+                            rsx! {
+                                DragAndDropList {
+                                    key: "{list_key}",
+                                    items,
+                                    aria_label: "Addons",
+                                    on_reorder: move |new_order: Vec<String>| {
+                                        let previous_positions: HashMap<String, usize> = addon_order
+                                            .peek()
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(index, id)| (id.clone(), index))
+                                            .collect();
+                                        let updates: Vec<(Uuid, i64)> = new_order
+                                            .iter()
+                                            .enumerate()
+                                            .filter_map(|(index, id)| {
+                                                let priority = index as i64 * 10;
+                                                (previous_positions.get(id).copied() != Some(index))
+                                                    .then(|| id.parse().ok().map(|id| (id, priority)))
+                                                    .flatten()
+                                            })
+                                            .collect();
+                                        addon_order.set(new_order);
+                                        let client = client.clone();
+                                        let mut reorder_error = error;
+                                        spawn(async move {
+                                            for (id, priority) in updates {
+                                                if let Err(e) = client
+                                                    .execute(UpdateAddon {
+                                                        id,
+                                                        payload: UpdateAddonRequest {
+                                                            priority: Some(priority),
+                                                            ..Default::default()
+                                                        },
+                                                    })
+                                                    .await
+                                                {
+                                                    reorder_error.set(Some(format!(
+                                                        "Failed to update addon order: {e}"
+                                                    )));
+                                                    return;
+                                                }
+                                            }
+                                        });
+                                    },
                                 }
                             }
                         }
-                    }
-                }
-            }
                     }
                 }
             }
@@ -331,13 +375,13 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                     }
                     div { class: "modal-body",
                         if *create_step.read() == 0 {
-                            // ── Step 1: kind picker ──
                             div { class: "addon-kind-list",
                                 for k in kinds.read().clone().into_iter().filter(|k| {
                                     if *active_tab.read() == "user" { !k.supported_resources_user.is_empty() } else { true }
                                 }) {
                                     {
                                         let k_id = k.id.clone();
+                                        let k_id_cfg = k.id.clone();
                                         let k_name = k.display_name.clone();
                                         let is_selected = selected_kind.read().as_deref() == Some(&k.id);
                                         let is_user_tab = *active_tab.read() == "user";
@@ -373,6 +417,15 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                         onclick: move |e| {
                                                             e.stop_propagation();
                                                             name_input.set(k_name.clone());
+                                                            let mut defaults = std::collections::HashMap::new();
+                                                            if let Some(meta) = kinds.read().iter().find(|m| m.id == k_id_cfg).cloned() {
+                                                                for opt in &meta.options {
+                                                                    if let Some(default) = &opt.default {
+                                                                        defaults.insert(opt.id.clone(), default.clone());
+                                                                    }
+                                                                }
+                                                            }
+                                                            form_values.set(defaults);
                                                             create_step.set(1);
                                                         },
                                                         "Configure →"
@@ -384,7 +437,6 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                 }
                             }
                         } else {
-                            // ── Step 2: name + options ──
                             if let Some(meta) = &selected_kind_meta {
                                 div { class: "field-hint", style: "margin-bottom:4px", "{meta.description}" }
                             }
@@ -403,6 +455,9 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                         option: opt,
                                         values: form_values,
                                     }
+                                }
+                                if !meta.options.is_empty() {
+                                    span { class: "field-hint", b { "Changing options might require a metadata refresh." } }
                                 }
                             }
                         }
@@ -437,7 +492,7 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                         let c = client.clone();
                                         spawn(async move {
                                             let payload = CreateAddonRequest {
-                                                preset: AddonPresetRef { kind, config },
+                                                preset: AddonPresetRef { kind, config: config.into() },
                                                 name,
                                                 resources: Vec::new(),
                                                 types: Vec::new(),
@@ -502,6 +557,9 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                             values: edit_form_values,
                                         }
                                     }
+                                    if !meta.options.is_empty() {
+                                        span { class: "field-hint", b { "Changing options might require a metadata refresh." } }
+                                    }
                                 }
                                 // Resources section — options come from the addon row.
                                 if !resource_options.is_empty() {
@@ -515,14 +573,13 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                     let checked = edit_resources.read().contains(&res_str);
                                                     let is_system = addons.read().iter().find(|a| a.id == edit_id).map(|a| a.system).unwrap_or(false);
                                                     rsx! {
-                                                        label { class: "check-row",
-                                                            input {
-                                                                r#type: "checkbox",
+                                                        div { class: "check-row",
+                                                            Switch {
                                                                 checked,
                                                                 disabled: is_system,
-                                                                onchange: move |e| {
+                                                                on_change: move |v| {
                                                                     let mut set = edit_resources.write();
-                                                                    if e.checked() {
+                                                                    if v {
                                                                         set.insert(res_str_check.clone());
                                                                     } else {
                                                                         set.remove(&res_str_check);
@@ -557,14 +614,13 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                             let checked = edit_types.read().contains(&t_str);
                                                             let is_system = addons.read().iter().find(|a| a.id == edit_id).map(|a| a.system).unwrap_or(false);
                                                             rsx! {
-                                                                label { class: "check-row",
-                                                                    input {
-                                                                        r#type: "checkbox",
+                                                                div { class: "check-row",
+                                                                    Switch {
                                                                         checked,
                                                                         disabled: is_system,
-                                                                        onchange: move |e| {
+                                                                        on_change: move |v| {
                                                                             let mut set = edit_types.write();
-                                                                            if e.checked() {
+                                                                            if v {
                                                                                 set.insert(t_str_check.clone());
                                                                             } else {
                                                                                 set.remove(&t_str_check);
@@ -581,6 +637,27 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                         }
                                     } else {
                                         rsx! {}
+                                    }
+                                }
+                                // Stream options (only shown when stream resource is active)
+                                if edit_resources.read().contains("stream") {
+                                    div { class: "form-group",
+                                        ToggleRow {
+                                            label: "Direct stream",
+                                            description: "Send the client directly to the source URL instead of proxying through remux. Only applies to HTTP streams and direct play — transcoding always routes through remux.",
+                                            checked: *edit_http_redirect_stream.read(),
+                                            on_change: move |v| edit_http_redirect_stream.set(v),
+                                        }
+                                    }
+                                    div { class: "form-group",
+                                        label { class: "form-label", "Direct stream service filter" }
+                                        input {
+                                            class: "form-input",
+                                            placeholder: "real-debrid, alldebrid",
+                                            value: "{edit_service_filter}",
+                                            oninput: move |e| edit_service_filter.set(e.value()),
+                                        }
+                                        span { class: "field-hint", "Comma-separated list of service IDs (from streamData.service.id) or addon names (from streamData.addon) to stream directly. Leave empty to apply to all." }
                                     }
                                 }
                                 // Catalogs section (only shown for global addons with catalog resource active)
@@ -617,13 +694,12 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                                     tr {
                                                                         td { class: "catalog-name", "{cat.name}" }
                                                                         td {
-                                                                            input {
-                                                                                r#type: "checkbox",
+                                                                            Switch {
                                                                                 checked: enabled,
-                                                                                onchange: move |e| {
+                                                                                on_change: move |v| {
                                                                                     let mut map = edit_catalog_settings.write();
                                                                                     let entry = map.entry(cid_toggle.clone()).or_default();
-                                                                                    entry.0 = e.checked();
+                                                                                    entry.0 = v;
                                                                                 },
                                                                             }
                                                                         }
@@ -712,6 +788,13 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                             editing.set(true);
                                             let c = client.clone();
                                             let is_default = *edit_is_default.peek();
+                                            let http_redirect_stream = *edit_http_redirect_stream.peek();
+                                            let service_filter: Vec<String> = edit_service_filter
+                                                .peek()
+                                                .split(',')
+                                                .map(|s| s.trim().to_lowercase())
+                                                .filter(|s| !s.is_empty())
+                                                .collect();
                                             spawn(async move {
                                                 let payload = UpdateAddonRequest {
                                                     name: Some(name),
@@ -721,6 +804,8 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                     enabled: None,
                                                     priority: None,
                                                     is_default: Some(is_default),
+                                                    http_redirect_stream: Some(http_redirect_stream),
+                                                    service_filter: Some(service_filter),
                                                 };
                                                 let addon_res = c.execute(UpdateAddon { id: edit_id, payload }).await;
                                                 let cat_res = if !catalog_updates.is_empty() {
@@ -843,10 +928,25 @@ pub(crate) fn AddonOptionField(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    if matches!(option.kind, AddonOptionType::Boolean) {
+        return rsx! {
+            ToggleRow {
+                label,
+                description: desc,
+                checked: current_bool,
+                on_change: move |v| {
+                    let mut map = values.write();
+                    map.insert(id_check.clone(), serde_json::Value::Bool(v));
+                },
+            }
+        };
+    }
+
     rsx! {
         div { class: "form-group",
             label { class: "form-label", "{label}" }
             match &option.kind {
+                AddonOptionType::Boolean => unreachable!(),
                 AddonOptionType::Url | AddonOptionType::String => rsx! {
                     input {
                         class: "form-input",
@@ -891,19 +991,6 @@ pub(crate) fn AddonOptionField(
                                 map.insert(id_num.clone(), serde_json::json!(n));
                             }
                         },
-                    }
-                },
-                AddonOptionType::Boolean => rsx! {
-                    label { class: "form-toggle",
-                        input {
-                            r#type: "checkbox",
-                            checked: current_bool,
-                            onchange: move |e| {
-                                let mut map = values.write();
-                                map.insert(id_check.clone(), serde_json::Value::Bool(e.value() == "true"));
-                            },
-                        }
-                        span { "Enabled" }
                     }
                 },
                 AddonOptionType::Select { options } => rsx! {
