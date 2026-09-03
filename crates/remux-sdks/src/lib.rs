@@ -1020,7 +1020,7 @@ impl From<stremio::MediaType> for remux::MediaType {
         match kind {
             stremio::MediaType::Movie => remux::MediaType::Movie,
             stremio::MediaType::Series => remux::MediaType::Series,
-            _ => remux::MediaType::Other,
+            _ => remux::MediaType::Unknown,
         }
     }
 }
