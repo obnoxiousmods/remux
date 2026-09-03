@@ -971,9 +971,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             digital_release_date: valid_release_date(media.digital_released_at),
             latest_auto_unplayed: media.collection_latest_auto_unplayed,
             latest_sort_digital: media.collection_latest_sort_digital,
-            collection_source: media
-                .collection_source
-                .clone(),
+            collection_source: None,
             collection_default_sort: media
                 .collection_default_sort
                 .clone(),
