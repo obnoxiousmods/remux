@@ -1596,7 +1596,7 @@ async fn stremio_streams(
                         .filename
                         .clone(),
                     file_idx: metadata.file_idx,
-                    trackers,
+                    trackers: trackers.into_iter().map(|t| t.as_ref().to_string()).collect(),
                 }
             } else {
                 let url = s

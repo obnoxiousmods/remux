@@ -229,7 +229,7 @@ async fn try_instance(
         descriptor: crate::stream::StreamDescriptor::http(url),
         name: Some(label.to_string()),
         probe_data: Some(api::MediaSourceInfo {
-            container: mime_to_container(&manifest.mime_type),
+            container: mime_to_container(&manifest.mime_type).map(|c| c.to_string()),
             run_time_ticks: parent
                 .runtime
                 .and_then(|r| r.to_ticks(TickUnit::Seconds)),

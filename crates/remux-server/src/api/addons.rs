@@ -47,10 +47,7 @@ async fn addon_to_dto(addon: Addon, config: &crate::Config) -> AddonDto {
             .clone();
         match p.from_cfg(
             addon.id,
-            addon
-                .preset
-                .config
-                .expose(),
+                &addon.preset.config,
             config,
         ) {
             Ok(caps) => {
@@ -115,8 +112,7 @@ async fn addon_to_dto(addon: Addon, config: &crate::Config) -> AddonDto {
         name: addon.name,
         config: addon
             .preset
-            .config
-            .into_inner(),
+            .config,
         resources: addon.resources,
         types: addon
             .types
@@ -204,9 +200,7 @@ pub async fn get_addon(
     Ok(Json(
         addon_to_dto(
             addon,
-            &state
-                .ctx
-                .config,
+            &state.ctx.config,
         )
         .await,
     ))
@@ -241,10 +235,7 @@ pub async fn create_addon(
     let addon_id = Uuid::new_v4();
     let normalized_config = preset
         .normalize_cfg(
-            payload
-                .preset
-                .config
-                .into_inner(),
+            payload.preset.config,
             &state
                 .ctx
                 .config,
@@ -256,10 +247,7 @@ pub async fn create_addon(
     let caps = preset
         .from_cfg(
             addon_id,
-            payload
-                .preset
-                .config
-                .expose(),
+            &payload.preset.config,
             &state
                 .ctx
                 .config,
@@ -473,10 +461,7 @@ pub async fn update_addon(
     preset
         .from_cfg(
             addon.id,
-            addon
-                .preset
-                .config
-                .expose(),
+            &addon.preset.config,
             &state
                 .ctx
                 .config,

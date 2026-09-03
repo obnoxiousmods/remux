@@ -123,7 +123,6 @@ impl Addon {
     pub fn catalog_states(&self) -> HashMap<String, CatalogState> {
         self.preset
             .config
-            .expose()
             .get("catalogs")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default()
@@ -133,7 +132,6 @@ impl Addon {
         let mut cfg = self
             .preset
             .config
-            .expose()
             .clone();
         cfg["catalogs"] = serde_json::to_value(states).unwrap_or_default();
         self.preset

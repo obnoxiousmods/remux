@@ -1850,6 +1850,7 @@ async fn item_for_user(
             session
                 .device
                 .access_token
+                .expose()
         );
         let sources = media
             .sources

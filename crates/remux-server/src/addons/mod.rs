@@ -915,6 +915,7 @@ pub struct AddonCapabilities {
     pub lyric: Option<Arc<dyn LyricAddon>>,
     pub index: Option<Arc<dyn IndexAddon>>,
     pub metrics: Option<Arc<dyn MetricsAddon>>,
+    pub media_tracker: Option<Arc<dyn media_tracker::MediaTrackerAddon>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,7 +1075,7 @@ fn recognized_manifest_media_kind(
         MT::Artist => MK::Artist,
         MT::Track => MK::Track,
         MT::Events => MK::TvProgram,
-        MT::Unknown(s) => match s.as_str() {
+        MT::Other(s) => match s.as_str() {
             "episode" => MK::Episode,
             "season" => MK::Season,
             "person" => MK::Person,
@@ -1225,6 +1226,23 @@ impl PickCap<dyn SubtitleAddon> for AddonRuntime {
 }
 
 impl AddonService {
+    pub fn media_tracker_for(
+        &self,
+        addon_id: Uuid,
+    ) -> Option<Arc<dyn media_tracker::MediaTrackerAddon>> {
+        self.inner
+            .load()
+            .iter()
+            .find(|r| r.row.id == addon_id && r.row.enabled)
+            .and_then(|r| r.caps.media_tracker.clone())
+    }
+
+    pub fn has_media_tracker(&self) -> bool {
+        self.inner
+            .load()
+            .iter()
+            .any(|r| r.row.enabled && r.caps.media_tracker.is_some())
+    }
     async fn addons_for<T>(
         &self,
         media: &db::Media,
@@ -3906,7 +3924,7 @@ mod tests {
     #[test]
     fn recognized_manifest_media_kind_drops_unrecognized_custom_type() {
         assert_eq!(
-            recognized_manifest_media_kind(sdks::stremio::MediaType::Unknown(
+            recognized_manifest_media_kind(sdks::stremio::MediaType::Other(
                 "anime".to_string()
             )),
             None
@@ -3916,7 +3934,7 @@ mod tests {
             Some(sdks::remux::MediaKind::Series)
         );
         assert_eq!(
-            recognized_manifest_media_kind(sdks::stremio::MediaType::Unknown(
+            recognized_manifest_media_kind(sdks::stremio::MediaType::Other(
                 "episode".to_string()
             )),
             Some(sdks::remux::MediaKind::Episode)

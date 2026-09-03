@@ -726,7 +726,7 @@ fn build_auth_response(
     user_dto.last_activity_date = Some(now);
 
     Json(api::AuthenticationResult {
-        access_token: Some(device.access_token),
+        access_token: Some(device.access_token.expose().clone()),
         server_id: server_id(),
         session_info: Some(session_info),
         user: Some(user_dto),
@@ -833,7 +833,7 @@ pub async fn authenticate_with_quickconnect(
             .version
             .unwrap_or_else(|| "1.0".to_string()),
         user_id: user.id,
-        access_token: get_uuid().to_string(),
+        access_token: get_uuid().to_string().into(),
         last_activity_at: None,
         capabilities: None,
         remote_ip: None,
@@ -1259,7 +1259,8 @@ pub async fn change_password(
         Some(
             &session
                 .device
-                .access_token,
+                .access_token
+                .expose(),
         ),
     )
     .await?;

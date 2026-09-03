@@ -153,8 +153,8 @@ pub async fn add_collection_items(
         )
         .await?
         .into_iter()
-        .filter(|m| m.kind == db::MediaKind::Collection)
-        .map(|m| m.id)
+        .filter(|m| m.1.kind == db::MediaKind::Collection)
+        .map(|m| m.1.id)
         .collect();
         db::Media::set_parent_id(
             &state

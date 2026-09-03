@@ -476,7 +476,8 @@ async fn items_playbackinfo_inner(
             id,
             &session
                 .device
-                .access_token,
+                .access_token
+                .expose(),
             &cfg.device_profile,
             cfg.subtitle_mode,
         );
@@ -506,7 +507,8 @@ async fn items_playbackinfo_inner(
             id,
             &session
                 .device
-                .access_token,
+                .access_token
+                .expose(),
             sub_langs,
             Some(
                 session
@@ -574,7 +576,8 @@ async fn items_playbackinfo_inner(
                     source.id,
                     session
                         .device
-                        .access_token,
+                        .access_token
+                        .expose(),
                 ));
             }
         }

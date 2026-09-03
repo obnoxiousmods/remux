@@ -1166,10 +1166,7 @@ async fn scan_addon(
     tmdb: &Option<sdks::RestClient<sdks::BearerAuth>>,
     addon: &Addon,
 ) -> Result<()> {
-    let cfg = addon
-        .preset
-        .config
-        .expose();
+    let cfg = &addon.preset.config;
     let media_kind = cfg["media_kind"]
         .as_str()
         .unwrap_or("movie")
@@ -1203,7 +1200,7 @@ async fn scan_addon(
     // Local: one Fs operator per root, list from "/", prefix gives absolute stored path.
     // WebDAV: one shared operator, list from each sub-path, no prefix needed.
     let scan_roots: Vec<(opendal::Operator, String, String)> = if is_local {
-        cfg_paths_local(cfg)?
+        cfg_paths_local(&cfg)?
             .into_iter()
             .map(|p| {
                 let op =
@@ -1213,8 +1210,8 @@ async fn scan_addon(
             })
             .collect::<Result<_>>()?
     } else {
-        let op = build_webdav_operator(cfg)?;
-        cfg_paths_webdav(cfg)
+        let op = build_webdav_operator(&cfg)?;
+        cfg_paths_webdav(&cfg)
             .into_iter()
             .map(|p| (op.clone(), p, String::new()))
             .collect()

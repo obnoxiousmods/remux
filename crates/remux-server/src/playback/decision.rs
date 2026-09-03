@@ -121,7 +121,8 @@ fn build_audio_transcode(
             start_time,
             session
                 .device
-                .access_token,
+                .access_token
+                .expose(),
         ),
         container,
         sub_protocol: "http".to_string(),
@@ -231,7 +232,8 @@ fn build_video_transcode(
             start_time,
             session
                 .device
-                .access_token,
+                .access_token
+                .expose(),
         )
     } else {
         format!(
@@ -250,7 +252,8 @@ fn build_video_transcode(
             start_time,
             session
                 .device
-                .access_token,
+                .access_token
+                .expose(),
         )
     };
 

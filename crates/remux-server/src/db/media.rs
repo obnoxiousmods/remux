@@ -248,7 +248,7 @@ impl TryFrom<sdks::stremio::MediaType> for MediaKind {
             sdks::stremio::MediaType::Artist => Ok(MediaKind::Artist),
             sdks::stremio::MediaType::Track => Ok(MediaKind::Track),
             sdks::stremio::MediaType::Events => Ok(MediaKind::TvProgram),
-            sdks::stremio::MediaType::Unknown(s) => match s.as_str() {
+            sdks::stremio::MediaType::Other(s) => match s.as_str() {
                 "episode" => Ok(MediaKind::Episode),
                 "season" => Ok(MediaKind::Season),
                 "person" => Ok(MediaKind::Person),
@@ -264,7 +264,7 @@ impl TryFrom<sdks::stremio::MediaType> for MediaKind {
 /// are not content types and are excluded.
 fn custom_stremio_type(media_type: &sdks::stremio::MediaType) -> Option<String> {
     match media_type {
-        sdks::stremio::MediaType::Unknown(s)
+        sdks::stremio::MediaType::Other(s)
             if !matches!(s.as_str(), "episode" | "season" | "person") =>
         {
             Some(s.clone())
@@ -897,7 +897,7 @@ impl ExternalRatings {
 pub use remux_utils::NonEmptyString;
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExternalIds {
     pub imdb: Option<NonEmptyString>,
     pub series_imdb: Option<NonEmptyString>,
@@ -1206,7 +1206,7 @@ impl ExternalIds {
     pub fn stremio_media_type(&self, kind: &MediaKind) -> sdks::stremio::MediaType {
         self.custom_stremio_type
             .clone()
-            .map(sdks::stremio::MediaType::Unknown)
+            .map(sdks::stremio::MediaType::Other)
             .unwrap_or_else(|| sdks::stremio::MediaType::from(kind))
     }
 }
@@ -1248,6 +1248,8 @@ pub struct MediaFilter {
     pub parent_id: Option<Uuid>,
     /// Filter by multiple parent IDs (OR). Used for programs by channel.
     pub parent_ids: Option<Vec<Uuid>>,
+    pub grandparent_ids: Option<Vec<Uuid>>,
+    pub released_after: Option<NaiveDateTime>,
     pub promoted: Option<bool>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
@@ -1392,6 +1394,8 @@ pub struct Media {
     // meta
     pub description: Option<String>,
     pub released_at: Option<NaiveDateTime>,
+    #[sqlx(default)]
+    pub end_date: Option<NaiveDateTime>,
     pub digital_released_at: Option<NaiveDateTime>,
     #[sqlx(json(nullable))]
     pub trailers: Option<Vec<String>>,
@@ -1517,6 +1521,60 @@ pub struct Media {
 }
 
 impl Media {
+    pub fn series_canonical_key(&self) -> String {
+        self.external_ids
+            .candidate_ids(&MediaKind::Series, None, None, None)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| self.id.to_string())
+    }
+
+    pub fn season_id(series_key: &str, season_idx: i64) -> Uuid {
+        crate::common::stable_media_uuid(&MediaKind::Season, &format!("{series_key}:{season_idx}"))
+    }
+
+    pub fn episode_id(series_key: &str, season_idx: i64, ep_idx: i64) -> Uuid {
+        crate::common::stable_media_uuid(&MediaKind::Episode, &format!("{series_key}:{season_idx}:{ep_idx}"))
+    }
+
+    pub async fn clear_parent_id_scoped(
+        db: &SqlitePool,
+        media_ids: &[Uuid],
+        required_parent_id: &Uuid,
+    ) -> Result<(), sqlx::Error> {
+        for id in media_ids {
+            sqlx::query("UPDATE media SET parent_id = NULL WHERE id = ? AND parent_id = ?")
+                .bind(id)
+                .bind(required_parent_id)
+                .execute(db)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn widen_external_ids(
+        db: &SqlitePool,
+        id: &Uuid,
+        patch: &ExternalIds,
+    ) -> Result<Option<ExternalIds>, sqlx::Error> {
+        let current: Option<sqlx::types::Json<ExternalIds>> = sqlx::query_scalar(
+            "SELECT external_ids FROM media WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+        let Some(current) = current else { return Ok(None); };
+        let mut merged = current.0;
+        merged.merge(patch, false);
+        sqlx::query("UPDATE media SET external_ids = ?, updated_at = ? WHERE id = ?")
+            .bind(sqlx::types::Json(&merged))
+            .bind(Utc::now().naive_utc())
+            .bind(id)
+            .execute(db)
+            .await?;
+        Ok(Some(merged))
+    }
+
     pub fn is_group_container(&self) -> bool {
         self.kind == MediaKind::Collection
             && self.collection_media_kind == Some(CollectionMediaKind::Collection)
@@ -7247,6 +7305,9 @@ impl From<sdks::stremio::Stream> for Media {
             description: source
                 .description
                 .clone(),
+            binge_group: None,
+            stream_addon: None,
+            service_id: None,
             seeders: source.seeders,
             size: source.size,
             duration: source.duration,
@@ -7377,7 +7438,7 @@ impl TryFrom<sdks::stremio::Meta> for Media {
                     }
                     sdks::stremio::Status::Upcoming
                     | sdks::stremio::Status::Planned => MediaStatus::Unreleased,
-                    sdks::stremio::Status::Unknown => MediaStatus::Continuing,
+                    sdks::stremio::Status::Other => MediaStatus::Continuing,
                 });
 
         let media = Media {
@@ -8063,6 +8124,7 @@ fn filter_rule_to_sql(rule: &remux_sdks::remux::FilterRule) -> Option<(String, b
     }
 
     match rule {
+        R::MediaKind { .. } | R::Favorite { .. } | R::Played { .. } => None,
         R::Year { op, value } => {
             let negated = *op == NumericOp::NotEq;
             let sql = match op {
@@ -8514,14 +8576,14 @@ mod tests {
     #[test]
     fn custom_stremio_type_extracts_non_standard_type() {
         assert_eq!(
-            custom_stremio_type(&sdks::stremio::MediaType::Unknown(
+            custom_stremio_type(&sdks::stremio::MediaType::Other(
                 "anime".to_string()
             )),
             Some("anime".to_string())
         );
         assert_eq!(custom_stremio_type(&sdks::stremio::MediaType::Series), None);
         assert_eq!(
-            custom_stremio_type(&sdks::stremio::MediaType::Unknown(
+            custom_stremio_type(&sdks::stremio::MediaType::Other(
                 "episode".to_string()
             )),
             None
@@ -8763,7 +8825,7 @@ mod tests {
         };
         assert_eq!(
             anime_ids.stremio_media_type(&MediaKind::Series),
-            sdks::stremio::MediaType::Unknown("anime".to_string())
+            sdks::stremio::MediaType::Other("anime".to_string())
         );
 
         let standard_ids = ExternalIds::default();

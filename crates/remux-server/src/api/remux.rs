@@ -1052,7 +1052,6 @@ pub async fn remux_meta(
             .find_map(|a| {
                 a.preset
                     .config
-                    .expose()
                     .get("manifest_url")
                     .and_then(|v| {
                         v.as_str()

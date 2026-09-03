@@ -1,6 +1,7 @@
 use axum::{Json, extract::State, response::IntoResponse};
 use axum_extra::extract::Query;
 use remux_macros::get;
+use uuid::Uuid;
 
 use crate::{AppState, api, db::auth};
 use axum_anyhow::ApiResult as Result;
@@ -64,7 +65,7 @@ fn item_to_hint(item: api::BaseItemDto) -> api::SearchHint {
             item.parent_thumb_image_tag
                 .clone()
         });
-    let thumb_item_id = item.parent_thumb_item_id;
+    let thumb_item_id = item.parent_thumb_item_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
 
     let backdrop_tag = item
         .backdrop_image_tags
@@ -78,7 +79,7 @@ fn item_to_hint(item: api::BaseItemDto) -> api::SearchHint {
                         .cloned()
                 })
         });
-    let backdrop_item_id = item.parent_backdrop_item_id;
+    let backdrop_item_id = item.parent_backdrop_item_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
 
     let primary_image_tag = item
         .image_tags
@@ -106,7 +107,7 @@ fn item_to_hint(item: api::BaseItemDto) -> api::SearchHint {
         backdrop_image_tag: backdrop_tag,
         backdrop_image_item_id: backdrop_item_id,
         album: item.album,
-        album_id: item.album_id,
+        album_id: item.album_id.and_then(|id| Uuid::parse_str(&id).ok()),
         album_artist: item.album_artist,
         artists: item.artists,
         ..Default::default()

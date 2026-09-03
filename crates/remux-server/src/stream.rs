@@ -26,7 +26,7 @@ use crate::AppState;
 
 #[nutype(
     validate(predicate = is_tracker_url),
-    derive(Clone, Debug, PartialEq, Eq, Hash, AsRef, Serialize, Deserialize)
+    derive(Clone, Debug, Display, PartialEq, Eq, Hash, AsRef, Serialize, Deserialize)
 )]
 pub struct TrackerUrl(String);
 
@@ -208,6 +208,12 @@ pub struct StreamInfo {
     /// UUID of the addon that produced this stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addon_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binge_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_addon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_id: Option<String>,
     pub seeders: Option<i64>,
     pub size: Option<i64>,
     pub duration: Option<i64>,

@@ -308,6 +308,7 @@ pub async fn init_app(
         db: conn.clone(),
         store: Store::new_weighted(128 * 1024 * 1024),
         metrics: metrics::Metrics::default(),
+        signals: signals::Signals::default(),
         sessions: playback_session::PlaybackSessionManager::new("transcode_sessions"),
         torrent: Arc::new(torrent_mgr),
         ws_tx: tokio::sync::broadcast::channel(128).0,
@@ -409,6 +410,7 @@ pub struct AppContext {
     /// Per-endpoint latency metrics. Collection is gated behind
     /// [`Config::metrics_enabled`]; see [`metrics`].
     pub metrics: metrics::Metrics,
+    pub signals: signals::Signals,
     pub sessions: playback_session::PlaybackSessionManager,
     pub torrent: Arc<torrent::TorrentManager>,
     pub ws_tx: tokio::sync::broadcast::Sender<ws::WsEvent>,
@@ -580,7 +582,11 @@ pub struct Config {
     pub gateway_attribution_origin: String,
     #[serde(default = "default_activity_log_retention_days")]
     pub activity_log_retention_days: u32,
+    #[serde(default = "default_jellyfin_version")]
+    pub jellyfin_version: String,
 }
+
+fn default_jellyfin_version() -> String { "10.11.8".to_string() }
 
 fn default_remuxdb_url() -> Option<String> {
     Some("https://remuxdb.1632022.xyz".to_string())
@@ -724,6 +730,7 @@ impl Default for Config {
             gateway_attribution_key: String::new(),
             gateway_attribution_origin: String::new(),
             activity_log_retention_days: default_activity_log_retention_days(),
+            jellyfin_version: default_jellyfin_version(),
         }
         .resolve()
     }
