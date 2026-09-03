@@ -9,6 +9,8 @@ use hyper_util::{
     client::legacy::{Client as HyperClient, connect::HttpConnector},
     rt::TokioExecutor,
 };
+use nutype::nutype;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     io,
@@ -21,6 +23,22 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::AppState;
+
+#[nutype(
+    validate(predicate = is_tracker_url),
+    derive(Clone, Debug, PartialEq, Eq, Hash, AsRef, Serialize, Deserialize)
+)]
+pub struct TrackerUrl(String);
+
+pub fn is_tracker_url(s: &str) -> bool {
+    let Ok(url) = url::Url::parse(s.trim()) else { return false; };
+    let Some(_) = url.host_str() else { return false; };
+    match url.scheme() {
+        "udp" => url.port().is_some(),
+        "http" | "https" => !url.path().is_empty() && url.path() != "/",
+        _ => false,
+    }
+}
 
 /// Typed representation of how a stream is accessed (transport mechanism).
 ///

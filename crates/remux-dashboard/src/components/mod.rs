@@ -1,5 +1,6 @@
 pub mod button;
 pub mod card;
+pub mod drag_and_drop_list;
 pub mod filters;
 pub mod form;
 pub mod icons;
@@ -16,7 +17,8 @@ pub mod theme_switch;
 pub use button::{Button, ButtonVariant};
 pub use card::Card;
 pub use filters::{FilterRuleEditor, TagChipInput};
-pub use form::{FormActions, FormGroup, ToggleRow};
+pub use drag_and_drop_list::DragAndDropList;
+pub use form::{FormActions, FormGroup, Switch, ToggleRow};
 pub use icons::NavIcon;
 pub use metrics::MetricsCard;
 pub use modal::{Modal, ModalSize};

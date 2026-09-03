@@ -51,6 +51,7 @@ pub mod device_profile;
 mod errors;
 mod keyed_lock;
 pub mod metrics;
+pub mod signals;
 pub mod sdks {
     pub use remux_sdks::*;
 }
@@ -62,6 +63,7 @@ pub mod db;
 #[cfg(feature = "desktop")]
 pub mod embedded_static;
 pub mod intro;
+mod jellyfin_client;
 mod iptv;
 pub mod localization;
 pub mod playback;

@@ -7,6 +7,7 @@ pub mod eclipse;
 pub mod introdb;
 pub mod iptv;
 pub mod lrclib;
+pub mod media_tracker;
 pub mod opendal;
 pub mod probe;
 pub mod squid;
