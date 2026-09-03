@@ -225,6 +225,10 @@ pub struct AddonDto {
     /// Included in the default addon list (users with no override see this addon).
     #[serde(default = "default_true")]
     pub is_default: bool,
+    pub http_redirect_stream: bool,
+    #[serde(default)]
+    pub service_filter: Vec<String>,
+    pub description: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -257,6 +261,8 @@ pub struct UpdateAddonRequest {
     pub enabled: Option<bool>,
     pub priority: Option<i64>,
     pub is_default: Option<bool>,
+    pub http_redirect_stream: Option<bool>,
+    pub service_filter: Option<Vec<String>>,
 }
 
 /// One catalog exposed by an addon, merged with its current config state.
@@ -3519,6 +3525,10 @@ pub enum SetOp {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "field", rename_all = "snake_case")]
 pub enum FilterRule {
+    MediaKind {
+        op: SetOp,
+        values: Vec<String>,
+    },
     Genre {
         op: SetOp,
         values: Vec<String>,
@@ -3552,6 +3562,12 @@ pub enum FilterRule {
         values: Vec<String>,
     },
     HasTrailer {
+        value: bool,
+    },
+    Favorite {
+        value: bool,
+    },
+    Played {
         value: bool,
     },
     Country {
