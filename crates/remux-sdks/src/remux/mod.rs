@@ -3474,7 +3474,7 @@ impl From<stremio::MediaType> for MediaKind {
             stremio::MediaType::Artist => Self::Artist,
             stremio::MediaType::Track => Self::Track,
             stremio::MediaType::Events => Self::TvProgram,
-            stremio::MediaType::Unknown(s) => match s.as_str() {
+            stremio::MediaType::Other(s) => match s.as_str() {
                 "episode" => Self::Episode,
                 "season" => Self::Season,
                 "person" => Self::Person,
