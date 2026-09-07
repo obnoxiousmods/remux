@@ -549,6 +549,12 @@ pub struct Config {
     /// provider cost seconds per song. Defaults to 3.
     #[serde(default = "default_music_stream_addon_timeout_secs")]
     pub music_stream_addon_timeout_secs: u64,
+    /// Per-addon budget (seconds) for a music item once the primary providers
+    /// have all come back empty. Only spent when the alternative is silence,
+    /// and the last-resort providers are genuinely slow — a yt-dlp search plus
+    /// format resolution takes several seconds. Defaults to 20.
+    #[serde(default = "default_music_fallback_stream_addon_timeout_secs")]
+    pub music_fallback_stream_addon_timeout_secs: u64,
     /// Directory for server log files (daily-rolled `remux.log`), surfaced by
     /// the admin dashboard's Logs page. `None` derives `<data_dir>/log` in
     /// [`Config::resolve`]. Kept separate from client-log uploads
@@ -637,6 +643,10 @@ fn default_stream_addon_timeout_secs() -> u64 {
 
 fn default_music_stream_addon_timeout_secs() -> u64 {
     3
+}
+
+fn default_music_fallback_stream_addon_timeout_secs() -> u64 {
+    20
 }
 
 fn default_tmdb_base_url() -> String {
@@ -735,6 +745,8 @@ impl Default for Config {
             addon_http_connect_timeout_secs: default_addon_http_connect_timeout_secs(),
             stream_addon_timeout_secs: default_stream_addon_timeout_secs(),
             music_stream_addon_timeout_secs: default_music_stream_addon_timeout_secs(),
+            music_fallback_stream_addon_timeout_secs:
+                default_music_fallback_stream_addon_timeout_secs(),
             log_dir: None,
             metrics_enabled: false,
             telemetry_enabled: default_telemetry_enabled(),

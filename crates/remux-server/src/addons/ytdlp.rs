@@ -301,6 +301,14 @@ struct YtDlpVideo {
     title: Option<String>,
     #[serde(default)]
     duration: Option<f64>,
+    /// Where the artist actually lives on YouTube: uploads are usually titled
+    /// with just the song, and the artist is the channel.
+    #[serde(default)]
+    uploader: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    artist: Option<String>,
     #[serde(default)]
     formats: Vec<YtDlpFormat>,
 }
@@ -329,6 +337,11 @@ struct YtDlpFormat {
     ext: Option<String>,
     #[serde(default)]
     container: Option<String>,
+    /// Headers this format's CDN requires. YouTube's media hosts reject a
+    /// request that does not carry the browser User-Agent yt-dlp negotiated
+    /// with, so proxying the bare URL gets a 403.
+    #[serde(default)]
+    http_headers: std::collections::HashMap<String, String>,
 }
 
 impl YtDlpFormat {
@@ -476,9 +489,20 @@ impl YtDlpAddon {
                 .artist_name()
                 .as_deref(),
             media.runtime,
-            video
-                .title
-                .as_deref(),
+            CandidateArtist {
+                title: video
+                    .title
+                    .as_deref(),
+                uploader: video
+                    .uploader
+                    .as_deref(),
+                channel: video
+                    .channel
+                    .as_deref(),
+                artist: video
+                    .artist
+                    .as_deref(),
+            },
             video.duration,
         ) {
             return Err(anyhow!(
@@ -881,11 +905,18 @@ impl YtDlpAddon {
                 _ => f.label(),
             };
             crate::stream::StreamInfo {
-                descriptor: crate::stream::StreamDescriptor::http(
-                    f.url
+                // Carry yt-dlp's negotiated headers through to the proxy fetch;
+                // without them the CDN answers 403 and the source looks dead.
+                descriptor: crate::stream::StreamDescriptor::Http {
+                    url: f
+                        .url
                         .clone()
                         .unwrap_or_default(),
-                ),
+                    request_headers: f
+                        .http_headers
+                        .clone(),
+                    response_headers: Default::default(),
+                },
                 name: Some(f.label()),
                 probe_data: Some(api::MediaSourceInfo {
                     container: f
@@ -1005,36 +1036,73 @@ impl SearchAddon for YtDlpAddon {
 /// mix or a full-album upload.
 const DURATION_TOLERANCE_SECS: f64 = 5.0;
 
+/// The artist attribution carried by a search hit.
+///
+/// Checked across every field it can appear in: a YouTube upload is usually
+/// titled with just the song, and the artist is the *channel*. Looking only at
+/// the title rejects the correct result.
+#[derive(Debug, Default, Clone, Copy)]
+struct CandidateArtist<'a> {
+    title: Option<&'a str>,
+    uploader: Option<&'a str>,
+    channel: Option<&'a str>,
+    artist: Option<&'a str>,
+}
+
 /// Whether a YouTube search hit is trustworthy enough to serve as this track.
 ///
-/// Requires the expected title to appear in the candidate (uploads routinely
-/// add "(Official Video)" and the artist name) and, when both are known, the
-/// durations to agree. An unknown duration is not evidence of a mismatch, so it
-/// does not veto on its own — but a title that does not appear at all always
-/// does.
+/// Requires the expected title to appear in the candidate title (uploads
+/// routinely add "(Official Video)"), the expected artist to appear somewhere
+/// in the hit's attribution, and — when both are known — the durations to
+/// agree. An unknown duration is not evidence of a mismatch and does not veto
+/// on its own; a title or artist that appears nowhere always does.
 fn youtube_search_matches(
     expected_title: &str,
     expected_artist: Option<&str>,
     expected_runtime_secs: Option<i64>,
-    candidate_title: Option<&str>,
+    candidate: CandidateArtist<'_>,
     candidate_duration_secs: Option<f64>,
 ) -> bool {
-    let Some(candidate) = candidate_title.map(super::opendal::normalize_music_identity)
+    let normalize = super::opendal::normalize_music_identity;
+    let Some(candidate_title) = candidate
+        .title
+        .map(normalize)
     else {
         return false;
     };
-    let title = super::opendal::normalize_music_identity(expected_title);
-    if title.is_empty() || !candidate.contains(&title) {
+    let title = normalize(expected_title);
+    if title.is_empty() || !candidate_title.contains(&title) {
         return false;
     }
-    // When an artist is known, it must appear too — many different songs share
-    // a short title.
-    if let Some(artist) = expected_artist {
-        let artist = super::opendal::normalize_music_identity(artist);
-        if !artist.is_empty() && !candidate.contains(&artist) {
+
+    if let Some(expected_artist) = expected_artist {
+        let artist = normalize(expected_artist);
+        let attributed = [
+            Some(candidate_title.as_str()),
+            candidate
+                .uploader
+                .as_ref()
+                .map(|s| *s),
+            candidate
+                .channel
+                .as_ref()
+                .map(|s| *s),
+            candidate
+                .artist
+                .as_ref()
+                .map(|s| *s),
+        ];
+        let matched = attributed
+            .into_iter()
+            .flatten()
+            .any(|field| {
+                normalize(field).contains(&artist)
+            });
+        if !artist.is_empty() && !matched {
             return false;
         }
     }
+
     match (expected_runtime_secs, candidate_duration_secs) {
         (Some(expected), Some(actual)) => {
             (actual - expected as f64).abs() <= DURATION_TOLERANCE_SECS
@@ -1068,7 +1136,18 @@ impl StreamAddon for YtDlpAddon {
 
 #[cfg(test)]
 mod tests {
-    use super::{YtDlpAddon, youtube_search_matches};
+    use super::{CandidateArtist, YtDlpAddon, youtube_search_matches};
+
+    /// A hit whose title carries the song only, artist in the channel — the
+    /// shape YouTube actually returns.
+    fn hit(title: &'static str, channel: &'static str) -> CandidateArtist<'static> {
+        CandidateArtist {
+            title: Some(title),
+            uploader: Some(channel),
+            channel: Some(channel),
+            artist: None,
+        }
+    }
     use crate::addons::StreamAddon;
     use crate::db;
 
@@ -1102,8 +1181,26 @@ mod tests {
             "When the Day Met the Night",
             Some("Panic! At The Disco"),
             Some(293),
-            Some("Panic! At The Disco - When the Day Met the Night (Official Audio)"),
+            hit(
+                "Panic! At The Disco - When the Day Met the Night (Official Audio)",
+                "P!ATD",
+            ),
             Some(293.0),
+        ));
+    }
+
+    #[test]
+    fn the_artist_is_found_in_the_channel_when_the_title_omits_it() {
+        // The real shape of the search hit for the track that regressed this:
+        // title "When the Day Met the Night", channel "Panic! At The Disco",
+        // duration 294 against an expected 293. Requiring the artist in the
+        // *title* rejected the correct result.
+        assert!(youtube_search_matches(
+            "When the Day Met the Night",
+            Some("Panic! At The Disco"),
+            Some(293),
+            hit("When the Day Met the Night", "Panic! At The Disco"),
+            Some(294.0),
         ));
     }
 
@@ -1113,7 +1210,10 @@ mod tests {
             "When the Day Met the Night",
             Some("Panic! At The Disco"),
             Some(293),
-            Some("Panic! At The Disco - I Write Sins Not Tragedies"),
+            hit(
+                "Panic! At The Disco - I Write Sins Not Tragedies",
+                "Panic! At The Disco",
+            ),
             Some(186.0),
         ));
     }
@@ -1124,7 +1224,7 @@ mod tests {
             "Victorious",
             Some("Panic! At The Disco"),
             Some(179),
-            Some("Someone Else - Victorious"),
+            hit("Someone Else - Victorious", "Someone Else"),
             Some(179.0),
         ));
     }
@@ -1137,7 +1237,7 @@ mod tests {
             "Victorious",
             Some("Panic! At The Disco"),
             Some(179),
-            Some("Panic! At The Disco - Victorious (Live)"),
+            hit("Victorious (Live)", "Panic! At The Disco"),
             Some(240.0),
         ));
         // A few seconds of lead-in silence is not a mismatch.
@@ -1145,7 +1245,7 @@ mod tests {
             "Victorious",
             Some("Panic! At The Disco"),
             Some(179),
-            Some("Panic! At The Disco - Victorious"),
+            hit("Victorious", "Panic! At The Disco"),
             Some(183.0),
         ));
     }
@@ -1156,7 +1256,7 @@ mod tests {
             "Victorious",
             Some("Panic! At The Disco"),
             None,
-            Some("Panic! At The Disco - Victorious"),
+            hit("Victorious", "Panic! At The Disco"),
             None,
         ));
     }
@@ -1167,7 +1267,7 @@ mod tests {
             "Victorious",
             Some("Panic! At The Disco"),
             Some(179),
-            None,
+            CandidateArtist::default(),
             Some(179.0),
         ));
     }

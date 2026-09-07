@@ -287,9 +287,24 @@ async fn items_playbackinfo_inner(
         .config
         .port;
     let probe_started = std::time::Instant::now();
-    let probed = service
+    // Candidates can also run out here, when every one of them fails to probe.
+    // Same condition, same answer — this path alone produced 2,998 spurious
+    // 500s in the production logs.
+    let probed = match service
         .probe_candidates()
-        .await?;
+        .await
+    {
+        Ok(probed) => probed,
+        Err(e) if NoPlayableSources::is_cause_of(&e) => {
+            debug!(item_id = %id, error = %e, "playbackinfo: no probeable sources");
+            return Ok(Json(api::PlaybackInfoResponse {
+                media_sources: vec![],
+                play_session_id: Some(play_session_id),
+                error_code: Some(api::PlaybackErrorCode::NoCompatibleStream),
+            }));
+        }
+        Err(e) => return Err(e.context_internal("Something went wrong")),
+    };
     let probe_ms = probe_started
         .elapsed()
         .as_secs_f64()
@@ -913,6 +928,24 @@ async fn videos_stream_inner(
     .await
     .map_err(stream_lookup_error)?;
 
+    // An audio source must be advertised as `audio/*`. The byte path below
+    // reports whatever the underlying source declares, which for some local
+    // files is `application/octet-stream` — enough for a strict music client to
+    // refuse the stream.
+    // Decided from the probe rather than the item kind: `lookup` returns the
+    // resolved *source* row, whose kind is Stream, not Track.
+    let audio_content_type = media
+        .probe_data
+        .as_ref()
+        .filter(|probe| probe_is_audio_only(probe))
+        .and_then(|probe| {
+            audio_content_type_for(
+                probe
+                    .container
+                    .as_deref(),
+            )
+        });
+
     let si = media
         .stream_info
         .context_not_found("media source has no URL")?;
@@ -943,7 +976,12 @@ async fn videos_stream_inner(
                 .serve(&state, &headers)
                 .await?
         };
-        return Ok(resp.into_response());
+        let mut resp = resp.into_response();
+        if let Some(content_type) = audio_content_type {
+            resp.headers_mut()
+                .insert(http::header::CONTENT_TYPE, content_type);
+        }
+        return Ok(resp);
     }
 
     let url = descriptor.server_input(
@@ -1219,6 +1257,57 @@ struct ClientAudioLimits<'a> {
     max_bit_depth: Option<i64>,
 }
 
+/// Codecs that appear as a "video" stream but are really embedded artwork.
+const COVER_ART_CODECS: [&str; 5] = ["mjpeg", "png", "bmp", "gif", "webp"];
+
+/// Whether this source carries audio and no actual video.
+///
+/// A tagged music file embeds its cover as an mjpeg *video* stream, so a bare
+/// "has no video stream" test rejects most of the library's music.
+fn probe_is_audio_only(probe: &api::MediaSourceInfo) -> bool {
+    let has_audio = probe
+        .media_streams
+        .iter()
+        .any(|stream| stream.type_ == Some(api::MediaStreamType::Audio));
+    if !has_audio {
+        return false;
+    }
+    probe
+        .media_streams
+        .iter()
+        .filter(|stream| stream.type_ == Some(api::MediaStreamType::Video))
+        .all(|stream| {
+            stream
+                .codec
+                .as_deref()
+                .is_some_and(|codec| {
+                    COVER_ART_CODECS.contains(&codec.to_ascii_lowercase().as_str())
+                })
+        })
+}
+
+/// The `audio/*` MIME type for a source container, when one is known.
+///
+/// Returns `None` rather than guessing, so a genuinely unknown container keeps
+/// whatever the byte path reported instead of being mislabelled.
+fn audio_content_type_for(container: Option<&str>) -> Option<http::HeaderValue> {
+    let container = container?
+        .to_ascii_lowercase();
+    let mime = match container.as_str() {
+        "flac" => "audio/flac",
+        "mp3" | "mpeg" | "mpga" => "audio/mpeg",
+        "m4a" | "m4b" | "mp4" | "mov,mp4,m4a,3gp,3g2,mj2" => "audio/mp4",
+        "ogg" => "audio/ogg",
+        "opus" => "audio/opus",
+        "wav" => "audio/wav",
+        "aac" | "adts" => "audio/aac",
+        "webm" | "matroska,webm" => "audio/webm",
+        "wv" => "audio/x-wavpack",
+        _ => return None,
+    };
+    Some(http::HeaderValue::from_static(mime))
+}
+
 /// Whether the client can already play the source as-is.
 ///
 /// Jellyfin's universal endpoint direct-plays when the source matches what the
@@ -1415,7 +1504,7 @@ pub async fn audio_universal(
             codec = ?source.codec,
             "universal audio: direct play"
         );
-        return videos_stream_inner(
+        let response = videos_stream_inner(
             headers,
             state,
             Some(
@@ -1436,8 +1525,11 @@ pub async fn audio_universal(
                 ..Default::default()
             },
         )
-        .await
-        .map(IntoResponse::into_response);
+        .await?
+        .into_response();
+        // `videos_stream_inner` already normalises an audio source's
+        // Content-Type, so nothing more is needed here.
+        return Ok(response);
     }
 
     let descriptor = media
@@ -1615,6 +1707,69 @@ mod tests {
             audio_download_format(Some("WAV"), None),
             ("wav", "pcm_s16le", "audio/wav")
         );
+    }
+
+    #[test]
+    fn cover_art_does_not_make_a_music_file_look_like_video() {
+        use super::probe_is_audio_only;
+        use crate::api::{MediaSourceInfo, MediaStream, MediaStreamType};
+
+        let stream = |type_, codec: &str| MediaStream {
+            type_: Some(type_),
+            codec: Some(codec.to_string()),
+            ..Default::default()
+        };
+
+        // A tagged FLAC: audio plus an embedded 800x800 mjpeg cover.
+        let tagged_music = MediaSourceInfo {
+            container: Some("flac".into()),
+            media_streams: vec![
+                stream(MediaStreamType::Audio, "flac"),
+                stream(MediaStreamType::Video, "mjpeg"),
+            ],
+            ..Default::default()
+        };
+        assert!(probe_is_audio_only(&tagged_music));
+
+        // A real video is not audio, however it is containerised.
+        let video = MediaSourceInfo {
+            container: Some("mp4".into()),
+            media_streams: vec![
+                stream(MediaStreamType::Audio, "aac"),
+                stream(MediaStreamType::Video, "h264"),
+            ],
+            ..Default::default()
+        };
+        assert!(!probe_is_audio_only(&video));
+
+        // Neither is something with no audio at all.
+        let silent = MediaSourceInfo {
+            media_streams: vec![stream(MediaStreamType::Video, "mjpeg")],
+            ..Default::default()
+        };
+        assert!(!probe_is_audio_only(&silent));
+    }
+
+    #[test]
+    fn direct_play_always_advertises_an_audio_content_type() {
+        // The byte path reports the source's own type, which for some local
+        // files is application/octet-stream — a music client is entitled to
+        // audio/* from the audio endpoint.
+        use super::audio_content_type_for;
+        assert_eq!(
+            audio_content_type_for(Some("flac")).unwrap(),
+            "audio/flac"
+        );
+        assert_eq!(audio_content_type_for(Some("MP3")).unwrap(), "audio/mpeg");
+        // ffprobe reports mp4 audio under its demuxer's full name.
+        assert_eq!(
+            audio_content_type_for(Some("mov,mp4,m4a,3gp,3g2,mj2")).unwrap(),
+            "audio/mp4"
+        );
+        // Unknown containers keep whatever the byte path reported rather than
+        // being mislabelled.
+        assert!(audio_content_type_for(Some("something-new")).is_none());
+        assert!(audio_content_type_for(None).is_none());
     }
 
     #[test]

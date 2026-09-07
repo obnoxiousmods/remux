@@ -73,12 +73,26 @@ fn resolves_by_tier(kind: &db::MediaKind) -> bool {
 ///
 /// A music client resolves song by song, so the video-sized budget made a dead
 /// provider cost that budget on *every* track — including tracks a local addon
-/// had already answered in milliseconds.
-fn stream_addon_timeout(kind: &db::MediaKind, config: &crate::Config) -> Duration {
-    if resolves_by_tier(kind) {
+/// had already answered in milliseconds. The primary music tier is therefore
+/// kept tight.
+///
+/// Fallback tiers get a longer budget: they only run when every primary
+/// provider came back empty, so the user is already waiting and the alternative
+/// is silence. The last-resort providers are also genuinely slow — a yt-dlp
+/// search plus format resolution takes several seconds, which the primary
+/// budget would cut off every time.
+fn stream_addon_timeout(
+    kind: &db::MediaKind,
+    config: &crate::Config,
+    is_primary_tier: bool,
+) -> Duration {
+    if !resolves_by_tier(kind) {
+        return Duration::from_secs(config.stream_addon_timeout_secs);
+    }
+    if is_primary_tier {
         Duration::from_secs(config.music_stream_addon_timeout_secs)
     } else {
-        Duration::from_secs(config.stream_addon_timeout_secs)
+        Duration::from_secs(config.music_fallback_stream_addon_timeout_secs)
     }
 }
 
@@ -2746,7 +2760,6 @@ impl AddonService {
             .addons_for::<dyn StreamAddon>(media, &ctx.db, user_id)
             .await;
 
-        let timeout = stream_addon_timeout(&media.kind, &ctx.config);
         let considered = addons.len();
         let addons = self.gate_unhealthy(addons);
         debug!(
@@ -2754,7 +2767,6 @@ impl AddonService {
             media_kind = ?media.kind,
             addon_count = addons.len(),
             skipped_unhealthy = considered - addons.len(),
-            timeout_secs = timeout.as_secs(),
             tiered = resolves_by_tier(&media.kind),
             "resolving streams"
         );
@@ -2778,7 +2790,12 @@ impl AddonService {
                     .collect(),
             );
             let mut resolved = Vec::new();
-            for tier in &tiers {
+            for (index, tier) in tiers
+                .iter()
+                .enumerate()
+            {
+                let timeout =
+                    stream_addon_timeout(&media.kind, &ctx.config, index == 0);
                 let (streams, reports) = first_non_empty(
                     tier.iter()
                         .map(|r| resolve_one(r, media, ctx, identity.as_ref(), timeout))
@@ -2793,6 +2810,7 @@ impl AddonService {
             }
             resolved
         } else {
+            let timeout = stream_addon_timeout(&media.kind, &ctx.config, true);
             let results = futures::future::join_all(
                 addons
                     .iter()
@@ -3768,15 +3786,34 @@ mod tests {
         let config = crate::Config {
             stream_addon_timeout_secs: 10,
             music_stream_addon_timeout_secs: 3,
+            music_fallback_stream_addon_timeout_secs: 20,
             ..Default::default()
         };
         assert_eq!(
-            stream_addon_timeout(&db::MediaKind::Track, &config),
+            stream_addon_timeout(&db::MediaKind::Track, &config, true),
             Duration::from_secs(3)
         );
+        // Video never tiers, so it keeps its budget either way.
+        for primary in [true, false] {
+            assert_eq!(
+                stream_addon_timeout(&db::MediaKind::Movie, &config, primary),
+                Duration::from_secs(10)
+            );
+        }
+    }
+
+    #[test]
+    fn a_music_fallback_tier_gets_longer_than_the_primary_tier() {
+        // The primary tier is local and answers in milliseconds; a last-resort
+        // provider needs seconds, and by then the alternative is silence.
+        let config = crate::Config {
+            music_stream_addon_timeout_secs: 3,
+            music_fallback_stream_addon_timeout_secs: 20,
+            ..Default::default()
+        };
         assert_eq!(
-            stream_addon_timeout(&db::MediaKind::Movie, &config),
-            Duration::from_secs(10)
+            stream_addon_timeout(&db::MediaKind::Track, &config, false),
+            Duration::from_secs(20)
         );
     }
 

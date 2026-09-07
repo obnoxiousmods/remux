@@ -751,9 +751,15 @@ impl StreamService {
         }
 
         if results.is_empty() {
-            return Err(anyhow::anyhow!(
-                "stream probe failed - no usable catalog sources found"
-            ));
+            // Candidates existed but every one failed to probe, so there is
+            // still nothing to play. Same user-visible condition as having no
+            // candidates at all, and it must report the same way — this path
+            // alone produced 2,998 spurious 500s in the production logs.
+            return Err(NoPlayableSources::with_detail(
+                self.item_id,
+                "every candidate source failed to probe",
+            )
+            .into());
         }
 
         Ok(ProbedStreams {

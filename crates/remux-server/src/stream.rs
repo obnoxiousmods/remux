@@ -1145,10 +1145,14 @@ pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
 }
 
 pub fn mime_from_path(path: &std::path::Path) -> &'static str {
-    match path
+    // Lowercased: real libraries contain `Too Long.MP3`, and a case-sensitive
+    // match served those as `application/octet-stream`, which strict music
+    // clients refuse to play.
+    let extension = path
         .extension()
         .and_then(|e| e.to_str())
-    {
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
         Some("mp4") | Some("m4v") => "video/mp4",
         Some("mkv") => "video/x-matroska",
         Some("avi") => "video/x-msvideo",
@@ -1160,8 +1164,11 @@ pub fn mime_from_path(path: &std::path::Path) -> &'static str {
         Some("aac") => "audio/aac",
         Some("ogg") => "audio/ogg",
         Some("opus") => "audio/opus",
-        Some("m4a") => "audio/mp4",
+        Some("m4a") | Some("m4b") => "audio/mp4",
         Some("wav") => "audio/wav",
+        Some("wma") => "audio/x-ms-wma",
+        Some("wv") => "audio/x-wavpack",
+        Some("aiff") | Some("aif") => "audio/aiff",
         _ => "application/octet-stream",
     }
 }
@@ -1188,6 +1195,23 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_uppercase_extension_still_gets_its_real_mime_type() {
+        use super::mime_from_path;
+        use std::path::Path;
+
+        // A real library file: `Daft Punk - … - Too Long.MP3`. The
+        // case-sensitive match served it as application/octet-stream, which a
+        // strict music client refuses.
+        assert_eq!(mime_from_path(Path::new("/m/Too Long.MP3")), "audio/mpeg");
+        assert_eq!(mime_from_path(Path::new("/m/a.FLAC")), "audio/flac");
+        assert_eq!(mime_from_path(Path::new("/m/a.mp3")), "audio/mpeg");
+        assert_eq!(
+            mime_from_path(Path::new("/m/none")),
+            "application/octet-stream"
+        );
+    }
     use super::{
         HttpSource, StreamInfo, numbered_segment_url, parse_range, segmented_ranges,
         tidal_segment_zero_url,
