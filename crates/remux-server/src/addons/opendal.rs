@@ -354,7 +354,7 @@ struct LocalTrackCandidate {
 /// (`'` versus `’`) and dash glyphs. Do this narrow normalization in Rust and
 /// still require artist + album + track title (and track number when known),
 /// so similarly named recordings on other albums are never conflated.
-fn normalize_music_identity(value: &str) -> String {
+pub(super) fn normalize_music_identity(value: &str) -> String {
     value
         .trim()
         .chars()

@@ -1333,6 +1333,51 @@ pub struct MediaFilter {
     /// when empty.
     pub exclude_childless: bool,
     pub exclude_ids: Option<Vec<Uuid>>,
+    /// Declares that returning every matching row is intended, silencing the
+    /// unbounded-query warning. Set it on background work that genuinely
+    /// enumerates the library.
+    pub unbounded: bool,
+}
+
+/// Whether this filter asks only for live-TV channels, which selects a
+/// channel-number ORDER BY.
+///
+/// `all` is vacuously true on an empty vec, so `kind: Some(vec![])` used to
+/// qualify — taking the channel ordering while contributing no WHERE predicate
+/// at all, i.e. `SELECT * FROM media WHERE 1=1` ordered by channel number. On a
+/// real library that returned 1,514,646 rows in 70 s during an ordinary browse.
+fn is_channel_query_for(filter: &MediaFilter) -> bool {
+    filter
+        .kind
+        .as_ref()
+        .is_some_and(|kinds| {
+            !kinds.is_empty()
+                && kinds
+                    .iter()
+                    .all(|k| matches!(k, MediaKind::TvChannel))
+        })
+}
+
+impl MediaFilter {
+    /// Whether this filter restricts rows by identity or position in the tree,
+    /// which structurally bounds how many rows it can return regardless of
+    /// pagination.
+    pub fn is_structurally_scoped(&self) -> bool {
+        self.id
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty())
+            || self
+                .parent_id
+                .is_some()
+            || self
+                .parent_ids
+                .as_ref()
+                .is_some_and(|ids| !ids.is_empty())
+            || self
+                .grandparent_ids
+                .as_ref()
+                .is_some_and(|ids| !ids.is_empty())
+    }
 }
 
 /// Normalise any country string to an ISO 3166-1 alpha-2 code (e.g. "US").
@@ -4076,14 +4121,7 @@ impl Media {
         }
 
         // Apply ORDER BY driven by the sort_by field, with per-kind fallbacks.
-        let is_channel_query = filter
-            .kind
-            .as_ref()
-            .map(|k| {
-                k.iter()
-                    .all(|k| matches!(k, MediaKind::TvChannel))
-            })
-            .unwrap_or(false);
+        let is_channel_query = is_channel_query_for(filter);
 
         if !filter
             .sort_by
@@ -4443,11 +4481,26 @@ impl Media {
             records_qb
                 .push(" LIMIT ")
                 .push_bind(limit);
-        } else if filter
-            .offset
-            .is_some()
-        {
-            records_qb.push(" LIMIT -1");
+        } else {
+            if filter
+                .offset
+                .is_some()
+            {
+                records_qb.push(" LIMIT -1");
+            }
+            // A query with neither a row limit nor any structural scope selects
+            // the whole table. That is almost always a caller mistake, but
+            // truncating it here would silently corrupt the background tasks
+            // that legitimately enumerate the library — so warn loudly and let
+            // it through. `unbounded` marks the callers that mean it.
+            if !filter.unbounded && !filter.is_structurally_scoped() {
+                warn!(
+                    kind = ?filter.kind,
+                    sort_by = ?filter.sort_by,
+                    "media query has neither a limit nor a structural scope; \
+                     it will scan the whole table"
+                );
+            }
         }
         if let Some(offset) = &filter.offset {
             records_qb
@@ -8463,6 +8516,66 @@ pub(crate) fn build_genre_relations_from_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_kind_list_is_not_a_channel_query() {
+        // `all` is vacuously true on an empty vec. Treating `Some(vec![])` as a
+        // channel query gave it the channel ORDER BY with no WHERE predicate,
+        // i.e. a full scan of the media table.
+        let empty = MediaFilter {
+            kind: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(!is_channel_query_for(&empty));
+
+        let channels = MediaFilter {
+            kind: Some(vec![MediaKind::TvChannel]),
+            ..Default::default()
+        };
+        assert!(is_channel_query_for(&channels));
+
+        let mixed = MediaFilter {
+            kind: Some(vec![MediaKind::TvChannel, MediaKind::Movie]),
+            ..Default::default()
+        };
+        assert!(!is_channel_query_for(&mixed));
+
+        assert!(!is_channel_query_for(&MediaFilter::default()));
+    }
+
+    #[test]
+    fn structural_scope_recognises_identity_and_tree_filters() {
+        let id = uuid::Uuid::nil();
+        assert!(!MediaFilter::default().is_structurally_scoped());
+        assert!(
+            !MediaFilter {
+                id: Some(vec![]),
+                ..Default::default()
+            }
+            .is_structurally_scoped(),
+            "an empty id list scopes nothing"
+        );
+        for scoped in [
+            MediaFilter {
+                id: Some(vec![id]),
+                ..Default::default()
+            },
+            MediaFilter {
+                parent_id: Some(id),
+                ..Default::default()
+            },
+            MediaFilter {
+                parent_ids: Some(vec![id]),
+                ..Default::default()
+            },
+            MediaFilter {
+                grandparent_ids: Some(vec![id]),
+                ..Default::default()
+            },
+        ] {
+            assert!(scoped.is_structurally_scoped());
+        }
+    }
     use crate::db::MediaIdRaw;
 
     /// `stremio_meta_episode` is the per-episode fast path used by meta refresh;

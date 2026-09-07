@@ -798,9 +798,12 @@ pub async fn items_file(
     )
     .await?
     .into_response();
-    if let Ok(val) =
-        http::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", safe))
-    {
+    // Stock Jellyfin sends both forms: the ASCII `filename` for old clients and
+    // the RFC 5987 `filename*` so non-ASCII titles survive.
+    let encoded = urlencoding::encode(&filename);
+    if let Ok(val) = http::HeaderValue::from_str(&format!(
+        "attachment; filename=\"{safe}\"; filename*=UTF-8''{encoded}"
+    )) {
         response
             .headers_mut()
             .insert(http::header::CONTENT_DISPOSITION, val);
@@ -1154,57 +1157,197 @@ struct UniversalAudioQuery {
     play_session_id: Option<String>,
     #[serde(alias = "mediaSourceId")]
     media_source_id: Option<Uuid>,
+    /// Containers the *client* can already play, comma-separated, each
+    /// optionally `container|codec` (Jellyfin sends e.g.
+    /// `opus,webm|opus,mp3,aac,m4a|aac,flac,wav,ogg`).
+    ///
+    /// Leaving this unread is why every source was transcoded: with no client
+    /// capability to consult, `TranscodingContainer` fell through to its `mp3`
+    /// default and a lossless FLAC was re-encoded on every play.
+    container: Option<String>,
     #[serde(alias = "transcodingContainer")]
     transcoding_container: Option<String>,
+    #[serde(alias = "transcodingProtocol")]
+    transcoding_protocol: Option<String>,
     #[serde(alias = "audioCodec")]
     audio_codec: Option<String>,
     #[serde(alias = "audioBitRate")]
     audio_bit_rate: Option<i32>,
+    #[serde(alias = "maxStreamingBitrate")]
+    max_streaming_bitrate: Option<i64>,
     #[serde(alias = "maxAudioChannels")]
     max_audio_channels: Option<i32>,
+    #[serde(alias = "transcodingAudioChannels")]
+    transcoding_audio_channels: Option<i32>,
+    #[serde(alias = "maxAudioSampleRate")]
+    max_audio_sample_rate: Option<i64>,
+    #[serde(alias = "maxAudioBitDepth")]
+    max_audio_bit_depth: Option<i64>,
     #[serde(alias = "startTimeTicks")]
     start_time_ticks: Option<i64>,
+    #[serde(alias = "deviceId")]
+    device_id: Option<String>,
+    #[serde(alias = "userId")]
+    user_id: Option<Uuid>,
+    #[serde(alias = "enableRemoteMedia")]
+    enable_remote_media: Option<bool>,
+    #[serde(alias = "enableAudioVbrEncoding")]
+    enable_audio_vbr_encoding: Option<bool>,
+    #[serde(alias = "enableRedirection")]
+    enable_redirection: Option<bool>,
+    #[serde(alias = "breakOnNonKeyFrames")]
+    break_on_non_key_frames: Option<bool>,
 }
 
+/// What the source actually is, for the direct-play decision.
+#[derive(Debug, Default, Clone, Copy)]
+struct SourceAudio<'a> {
+    container: Option<&'a str>,
+    codec: Option<&'a str>,
+    bitrate: Option<i64>,
+    sample_rate: Option<i64>,
+    bit_depth: Option<i64>,
+}
+
+/// What the client says it can accept.
+#[derive(Debug, Default, Clone, Copy)]
+struct ClientAudioLimits<'a> {
+    /// Raw `Container` value; empty or absent means the client declared nothing.
+    containers: Option<&'a str>,
+    max_bitrate: Option<i64>,
+    max_sample_rate: Option<i64>,
+    max_bit_depth: Option<i64>,
+}
+
+/// Whether the client can already play the source as-is.
+///
+/// Jellyfin's universal endpoint direct-plays when the source matches what the
+/// client declared and stays inside its caps; only otherwise does it transcode.
+/// Remux always transcoded, so every lossless track was re-encoded to mp3 and
+/// served without range support.
+///
+/// A client that declares nothing gets a transcode, matching Jellyfin: an
+/// unknown decoder is not a reason to hand over a FLAC.
+fn universal_direct_play(source: &SourceAudio, limits: &ClientAudioLimits) -> bool {
+    let Some(source_container) = source
+        .container
+        .map(str::to_ascii_lowercase)
+    else {
+        return false;
+    };
+    let Some(declared) = limits
+        .containers
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    else {
+        return false;
+    };
+
+    let source_codec = source
+        .codec
+        .map(str::to_ascii_lowercase);
+    let container_supported = declared
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            (!entry.is_empty()).then_some(entry)
+        })
+        .any(|entry| {
+            // `container|codec` constrains the codec too; a bare token does not.
+            let mut parts = entry.splitn(2, '|');
+            let container = parts
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if container != source_container {
+                return false;
+            }
+            match parts.next() {
+                None => true,
+                Some(codec) => source_codec
+                    .as_deref()
+                    .is_some_and(|c| {
+                        codec
+                            .trim()
+                            .to_ascii_lowercase()
+                            == c
+                    }),
+            }
+        });
+    if !container_supported {
+        return false;
+    }
+
+    // A cap only rules direct play out when the source is *known* to exceed it;
+    // an unknown value must not force a needless re-encode.
+    let within = |cap: Option<i64>, actual: Option<i64>| match (cap, actual) {
+        (Some(cap), Some(actual)) => actual <= cap,
+        _ => true,
+    };
+    within(limits.max_bitrate, source.bitrate)
+        && within(limits.max_sample_rate, source.sample_rate)
+        && within(limits.max_bit_depth, source.bit_depth)
+}
+
+/// Picks the (container, encoder, MIME) triple for a universal-audio transcode.
+///
+/// Infallible on purpose. This used to reject any combination outside its
+/// whitelist with a 400 — `mp4`+`aac`, which stock Jellyfin clients send, was
+/// missing, and that alone broke universal audio for six users across 59
+/// requests. A convenience endpoint must never fail on an unrecognised client
+/// *hint*; an unknown combination degrades to mp3, which every client plays.
 fn audio_download_format(
     container: Option<&str>,
     codec: Option<&str>,
-) -> anyhow::Result<(&'static str, &'static str, &'static str)> {
+) -> (&'static str, &'static str, &'static str) {
+    const DEFAULT: (&str, &str, &str) = ("mp3", "libmp3lame", "audio/mpeg");
+
     let container = container
         .unwrap_or("mp3")
         .to_ascii_lowercase();
     let codec = codec
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| match container.as_str() {
-            "ogg" | "opus" => "opus".to_string(),
-            "m4a" | "aac" => "aac".to_string(),
+            "ogg" | "opus" | "webm" => "opus".to_string(),
+            "m4a" | "m4b" | "mp4" | "aac" => "aac".to_string(),
             "flac" => "flac".to_string(),
             "wav" => "pcm_s16le".to_string(),
             _ => "mp3".to_string(),
         });
 
     match (container.as_str(), codec.as_str()) {
-        ("ogg" | "opus", "opus" | "libopus") => Ok(("ogg", "libopus", "audio/ogg")),
-        ("mp3", "mp3" | "libmp3lame") => Ok(("mp3", "libmp3lame", "audio/mpeg")),
-        ("m4a", "aac") => Ok(("m4a", "aac", "audio/mp4")),
-        ("aac", "aac") => Ok(("aac", "aac", "audio/aac")),
-        ("flac", "flac") => Ok(("flac", "flac", "audio/flac")),
-        ("wav", "pcm_s16le") => Ok(("wav", "pcm_s16le", "audio/wav")),
-        _ => anyhow::bail!(
-            "unsupported audio download combination: container={container}, codec={codec}"
-        ),
+        ("ogg" | "opus", "opus" | "libopus") => ("ogg", "libopus", "audio/ogg"),
+        ("webm" | "webma", "opus" | "libopus") => ("webm", "libopus", "audio/webm"),
+        ("mp3", "mp3" | "libmp3lame") => ("mp3", "libmp3lame", "audio/mpeg"),
+        ("m4a" | "m4b", "aac") => ("m4a", "aac", "audio/mp4"),
+        ("mp4", "aac") => ("mp4", "aac", "audio/mp4"),
+        ("m4a" | "m4b" | "mp4", "alac") => ("m4a", "alac", "audio/mp4"),
+        ("aac", "aac") => ("aac", "aac", "audio/aac"),
+        ("flac", "flac") => ("flac", "flac", "audio/flac"),
+        ("wav", "pcm_s16le" | "pcm") => ("wav", "pcm_s16le", "audio/wav"),
+        _ => {
+            debug!(
+                %container,
+                %codec,
+                "universal audio: unrecognised container/codec hint, falling back to mp3"
+            );
+            DEFAULT
+        }
     }
 }
 
 #[get("/audio/{id}/universal")]
 pub async fn audio_universal(
+    headers: headers::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Path(id): Path<Uuid>,
     Query(q): Query<UniversalAudioQuery>,
-) -> Result<impl IntoResponse> {
+) -> Result<axum::response::Response> {
     let _play_session_id = q
         .play_session_id
+        .clone()
         .unwrap_or_else(|| {
             common::get_uuid()
                 .as_simple()
@@ -1215,8 +1358,7 @@ pub async fn audio_universal(
             .as_deref(),
         q.audio_codec
             .as_deref(),
-    )
-    .context_bad_request("unsupported audio download format")?;
+    );
 
     let media = StreamService::lookup(
         &state.ctx,
@@ -1236,6 +1378,68 @@ pub async fn audio_universal(
     )
     .await
     .map_err(stream_lookup_error)?;
+
+    // Direct play whenever the client already handles the source. Delegating to
+    // `videos_stream_inner` reuses the range-capable byte path that serves
+    // opendal/local/http/torrent descriptors, so seeking works and a lossless
+    // file is not needlessly re-encoded.
+    let probe = media
+        .probe_data
+        .as_ref();
+    let audio_stream = probe.and_then(|p| p.audio_stream());
+    let source = SourceAudio {
+        container: probe.and_then(|p| {
+            p.container
+                .as_deref()
+        }),
+        codec: audio_stream.and_then(|st| {
+            st.codec
+                .as_deref()
+        }),
+        bitrate: probe.and_then(|p| p.bitrate),
+        sample_rate: audio_stream.and_then(|st| st.sample_rate),
+        bit_depth: audio_stream.and_then(|st| st.bit_depth),
+    };
+    let limits = ClientAudioLimits {
+        containers: q
+            .container
+            .as_deref(),
+        max_bitrate: q.max_streaming_bitrate,
+        max_sample_rate: q.max_audio_sample_rate,
+        max_bit_depth: q.max_audio_bit_depth,
+    };
+    if universal_direct_play(&source, &limits) {
+        debug!(
+            item_id = %id,
+            container = ?source.container,
+            codec = ?source.codec,
+            "universal audio: direct play"
+        );
+        return videos_stream_inner(
+            headers,
+            state,
+            Some(
+                session
+                    .user
+                    .id,
+            ),
+            id,
+            api::VideoStreamQuery {
+                static_: Some(true),
+                media_source_id: q.media_source_id,
+                device_id: Some(
+                    session
+                        .device
+                        .id
+                        .clone(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .map(IntoResponse::into_response);
+    }
+
     let descriptor = media
         .stream_info
         .as_ref()
@@ -1265,10 +1469,6 @@ pub async fn audio_universal(
                 .codec
                 .clone()
         });
-    let title = media
-        .title
-        .clone();
-
     let params = crate::playback::engine::ProgressiveTranscodeParams {
         input_url,
         container: container.to_string(),
@@ -1279,11 +1479,16 @@ pub async fn audio_universal(
         max_width: None,
         max_height: None,
         video_bitrate: None,
+        // Prefer the explicit AudioBitRate, else fall back to the client's
+        // overall MaxStreamingBitrate cap, which was previously ignored.
         audio_bitrate: q
             .audio_bit_rate
+            .map(i64::from)
+            .or(q.max_streaming_bitrate)
             .and_then(|value| u32::try_from(value).ok()),
         audio_channels: q
-            .max_audio_channels
+            .transcoding_audio_channels
+            .or(q.max_audio_channels)
             .and_then(|value| u32::try_from(value).ok()),
         audio_stream_index: None,
         subtitle_stream_index: None,
@@ -1317,19 +1522,18 @@ pub async fn audio_universal(
     let body = Body::from_stream(crate::playback::engine::start_progressive_transcode(
         params,
     )?);
-    let safe_title = title.replace(['"', '\\', '\r', '\n'], "");
-
+    // No Content-Disposition: this is a streaming endpoint, and marking it as an
+    // attachment made clients treat playback as a download.
+    // `/items/{id}/download` is the endpoint that legitimately does that.
+    // `Accept-Ranges: none` stays — a live transcode genuinely cannot seek, and
+    // it matches the stock Jellyfin contract fixture.
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, content_type)
         .header(http::header::ACCEPT_RANGES, "none")
         .header(http::header::CACHE_CONTROL, "no-cache, no-store")
-        .header(
-            http::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{safe_title}.{container}\""),
-        )
         .body(body)
-        .expect("valid audio download response"))
+        .expect("valid audio stream response"))
 }
 
 /// Bitrate test endpoint - returns a body of the requested size for bandwidth measurement.
@@ -1360,7 +1564,184 @@ mod tests {
     use http::{StatusCode, header::HeaderValue};
     use serde_json::json;
 
-    use super::{NoPlayableSources, stream_lookup_error};
+    use super::{
+        ClientAudioLimits, NoPlayableSources, SourceAudio, UniversalAudioQuery,
+        audio_download_format, stream_lookup_error, universal_direct_play,
+    };
+
+    fn flac_source() -> SourceAudio<'static> {
+        SourceAudio {
+            container: Some("flac"),
+            codec: Some("flac"),
+            bitrate: Some(1_085_498),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+        }
+    }
+
+    #[test]
+    fn mp4_aac_no_longer_400s() {
+        // 59 requests across 6 real users hit `400 unsupported audio download
+        // combination: container=mp4, codec=aac` because this pair was missing.
+        assert_eq!(
+            audio_download_format(Some("mp4"), Some("aac")),
+            ("mp4", "aac", "audio/mp4")
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_hint_degrades_to_mp3_instead_of_failing() {
+        assert_eq!(
+            audio_download_format(Some("nonsense"), Some("rubbish")),
+            ("mp3", "libmp3lame", "audio/mpeg")
+        );
+        assert_eq!(
+            audio_download_format(None, None),
+            ("mp3", "libmp3lame", "audio/mpeg")
+        );
+    }
+
+    #[test]
+    fn known_containers_still_map_to_their_own_encoders() {
+        assert_eq!(
+            audio_download_format(Some("flac"), None),
+            ("flac", "flac", "audio/flac")
+        );
+        assert_eq!(
+            audio_download_format(Some("ogg"), None),
+            ("ogg", "libopus", "audio/ogg")
+        );
+        assert_eq!(
+            audio_download_format(Some("WAV"), None),
+            ("wav", "pcm_s16le", "audio/wav")
+        );
+    }
+
+    #[test]
+    fn a_client_that_lists_the_source_container_direct_plays() {
+        let limits = ClientAudioLimits {
+            containers: Some("mp3,aac,flac,wav"),
+            ..Default::default()
+        };
+        assert!(universal_direct_play(&flac_source(), &limits));
+    }
+
+    #[test]
+    fn a_client_that_cannot_decode_the_source_still_transcodes() {
+        let limits = ClientAudioLimits {
+            containers: Some("mp3,aac"),
+            ..Default::default()
+        };
+        assert!(!universal_direct_play(&flac_source(), &limits));
+    }
+
+    #[test]
+    fn a_client_that_declares_nothing_gets_a_transcode() {
+        // Matches Jellyfin: an unknown decoder is not a reason to hand over a
+        // lossless file.
+        for containers in [None, Some(""), Some("  ")] {
+            let limits = ClientAudioLimits {
+                containers,
+                ..Default::default()
+            };
+            assert!(!universal_direct_play(&flac_source(), &limits));
+        }
+    }
+
+    #[test]
+    fn a_container_pipe_codec_entry_constrains_the_codec_too() {
+        // Jellyfin sends entries like `webm|opus`.
+        let source = SourceAudio {
+            container: Some("webm"),
+            codec: Some("vorbis"),
+            ..Default::default()
+        };
+        let limits = ClientAudioLimits {
+            containers: Some("mp3,webm|opus"),
+            ..Default::default()
+        };
+        assert!(!universal_direct_play(&source, &limits));
+
+        let opus = SourceAudio {
+            codec: Some("opus"),
+            ..source
+        };
+        assert!(universal_direct_play(&opus, &limits));
+    }
+
+    #[test]
+    fn a_cap_the_source_exceeds_forces_a_transcode() {
+        let containers = Some("flac");
+        assert!(!universal_direct_play(
+            &flac_source(),
+            &ClientAudioLimits {
+                containers,
+                max_bitrate: Some(320_000),
+                ..Default::default()
+            }
+        ));
+        assert!(!universal_direct_play(
+            &flac_source(),
+            &ClientAudioLimits {
+                containers,
+                max_sample_rate: Some(22_050),
+                ..Default::default()
+            }
+        ));
+        assert!(!universal_direct_play(
+            &flac_source(),
+            &ClientAudioLimits {
+                containers,
+                max_bit_depth: Some(8),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn an_unknown_source_value_does_not_force_a_needless_transcode() {
+        let source = SourceAudio {
+            container: Some("flac"),
+            codec: Some("flac"),
+            bitrate: None,
+            sample_rate: None,
+            bit_depth: None,
+        };
+        assert!(universal_direct_play(
+            &source,
+            &ClientAudioLimits {
+                containers: Some("flac"),
+                max_bitrate: Some(320_000),
+                max_sample_rate: Some(48_000),
+                max_bit_depth: Some(16),
+            }
+        ));
+    }
+
+    #[test]
+    fn universal_query_accepts_both_pascal_and_camel_case() {
+        // jellyfin-web sends PascalCase; several clients send camelCase.
+        let pascal: UniversalAudioQuery = serde_urlencoded::from_str(
+            "Container=flac,mp3&TranscodingContainer=mp4&AudioCodec=aac\
+             &MaxStreamingBitrate=320000&MaxAudioSampleRate=48000&MaxAudioBitDepth=16\
+             &EnableRedirection=true",
+        )
+        .expect("PascalCase query should deserialize");
+        assert_eq!(pascal.container.as_deref(), Some("flac,mp3"));
+        assert_eq!(pascal.transcoding_container.as_deref(), Some("mp4"));
+        assert_eq!(pascal.max_streaming_bitrate, Some(320_000));
+        assert_eq!(pascal.max_audio_sample_rate, Some(48_000));
+        assert_eq!(pascal.max_audio_bit_depth, Some(16));
+        assert_eq!(pascal.enable_redirection, Some(true));
+
+        let camel: UniversalAudioQuery = serde_urlencoded::from_str(
+            "transcodingContainer=mp4&audioCodec=aac&maxStreamingBitrate=192000",
+        )
+        .expect("camelCase query should deserialize");
+        assert_eq!(camel.transcoding_container.as_deref(), Some("mp4"));
+        assert_eq!(camel.max_streaming_bitrate, Some(192_000));
+    }
+
 
     #[test]
     fn an_unresolvable_source_is_a_404_not_a_500() {
@@ -1418,14 +1799,19 @@ mod tests {
     #[test]
     fn finamp_ogg_opus_download_format_is_progressive_audio() {
         assert_eq!(
-            super::audio_download_format(Some("ogg"), Some("opus")).unwrap(),
+            super::audio_download_format(Some("ogg"), Some("opus")),
             ("ogg", "libopus", "audio/ogg")
         );
     }
 
     #[test]
-    fn rejects_mismatched_universal_audio_format() {
-        assert!(super::audio_download_format(Some("ogg"), Some("aac")).is_err());
+    fn a_mismatched_universal_audio_format_falls_back_instead_of_rejecting() {
+        // Previously a 400. Rejecting an unrecognised client *hint* broke
+        // playback outright; mp3 is a format every client can decode.
+        assert_eq!(
+            super::audio_download_format(Some("ogg"), Some("aac")),
+            ("mp3", "libmp3lame", "audio/mpeg")
+        );
     }
 
     #[tokio::test]

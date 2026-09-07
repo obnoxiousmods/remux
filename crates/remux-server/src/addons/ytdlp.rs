@@ -296,6 +296,11 @@ struct YtDlpPlaylist {
 struct YtDlpVideo {
     #[serde(default)]
     webpage_url: Option<String>,
+    /// Needed to verify a *search* hit before serving it as the track.
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    duration: Option<f64>,
     #[serde(default)]
     formats: Vec<YtDlpFormat>,
 }
@@ -462,6 +467,26 @@ impl YtDlpAddon {
         let video = self
             .dump_json(&query)
             .await?;
+        // Search is a last resort, so it has to be held to a higher bar than
+        // "YouTube returned something". Serving a live version, a cover, or an
+        // unrelated song is worse than reporting the track unavailable.
+        if !youtube_search_matches(
+            &media.title,
+            media
+                .artist_name()
+                .as_deref(),
+            media.runtime,
+            video
+                .title
+                .as_deref(),
+            video.duration,
+        ) {
+            return Err(anyhow!(
+                "yt-dlp search hit {:?} does not match {:?}",
+                video.title,
+                media.title
+            ));
+        }
         video
             .webpage_url
             .ok_or_else(|| anyhow!("yt-dlp search returned no webpage_url for query"))
@@ -975,22 +1000,59 @@ impl SearchAddon for YtDlpAddon {
     }
 }
 
+/// Tolerance for a duration match, in seconds. Wide enough for differing
+/// encodes and a little lead-in silence, tight enough to reject an extended
+/// mix or a full-album upload.
+const DURATION_TOLERANCE_SECS: f64 = 5.0;
+
+/// Whether a YouTube search hit is trustworthy enough to serve as this track.
+///
+/// Requires the expected title to appear in the candidate (uploads routinely
+/// add "(Official Video)" and the artist name) and, when both are known, the
+/// durations to agree. An unknown duration is not evidence of a mismatch, so it
+/// does not veto on its own — but a title that does not appear at all always
+/// does.
+fn youtube_search_matches(
+    expected_title: &str,
+    expected_artist: Option<&str>,
+    expected_runtime_secs: Option<i64>,
+    candidate_title: Option<&str>,
+    candidate_duration_secs: Option<f64>,
+) -> bool {
+    let Some(candidate) = candidate_title.map(super::opendal::normalize_music_identity)
+    else {
+        return false;
+    };
+    let title = super::opendal::normalize_music_identity(expected_title);
+    if title.is_empty() || !candidate.contains(&title) {
+        return false;
+    }
+    // When an artist is known, it must appear too — many different songs share
+    // a short title.
+    if let Some(artist) = expected_artist {
+        let artist = super::opendal::normalize_music_identity(artist);
+        if !artist.is_empty() && !candidate.contains(&artist) {
+            return false;
+        }
+    }
+    match (expected_runtime_secs, candidate_duration_secs) {
+        (Some(expected), Some(actual)) => {
+            (actual - expected as f64).abs() <= DURATION_TOLERANCE_SECS
+        }
+        _ => true,
+    }
+}
+
 #[async_trait]
 impl StreamAddon for YtDlpAddon {
     fn supports(&self, media: &db::Media) -> bool {
+        // Any track. Previously this required a `youtube_id` that had to have
+        // been resolved by something else, which meant yt-dlp could never act
+        // as a fallback for the catalog tracks that most need one — a
+        // Deezer-sourced row carries only `deezer_track`. `resolve_watch_url`
+        // already searches by artist+title, and `youtube_search_matches` keeps
+        // that search honest.
         media.kind == db::MediaKind::Track
-            && (media
-                .external_ids
-                .youtube_id
-                .is_some()
-                || media
-                    .stream_info
-                    .as_ref()
-                    .and_then(|si| {
-                        si.descriptor
-                            .as_http_url()
-                    })
-                    .is_some())
     }
 
     async fn get_streams(
@@ -1006,7 +1068,110 @@ impl StreamAddon for YtDlpAddon {
 
 #[cfg(test)]
 mod tests {
+    use super::{YtDlpAddon, youtube_search_matches};
+    use crate::addons::StreamAddon;
     use crate::db;
+
+    #[test]
+    fn a_deezer_only_track_is_now_eligible_for_the_ytdlp_fallback() {
+        // Previously rejected for lacking a youtube_id, which is exactly the
+        // case that needs a fallback.
+        let addon = YtDlpAddon {
+            cookies: None,
+            executable: "yt-dlp".into(),
+            bgutil_script_path: "".into(),
+            cache_dir: "".into(),
+        };
+        let deezer_track = db::Media {
+            kind: db::MediaKind::Track,
+            title: "When the Day Met the Night".into(),
+            ..Default::default()
+        };
+        assert!(StreamAddon::supports(&addon, &deezer_track));
+
+        let album = db::Media {
+            kind: db::MediaKind::Album,
+            ..Default::default()
+        };
+        assert!(!StreamAddon::supports(&addon, &album));
+    }
+
+    #[test]
+    fn a_search_hit_matches_through_the_usual_upload_decoration() {
+        assert!(youtube_search_matches(
+            "When the Day Met the Night",
+            Some("Panic! At The Disco"),
+            Some(293),
+            Some("Panic! At The Disco - When the Day Met the Night (Official Audio)"),
+            Some(293.0),
+        ));
+    }
+
+    #[test]
+    fn a_different_song_by_the_same_artist_is_rejected() {
+        assert!(!youtube_search_matches(
+            "When the Day Met the Night",
+            Some("Panic! At The Disco"),
+            Some(293),
+            Some("Panic! At The Disco - I Write Sins Not Tragedies"),
+            Some(186.0),
+        ));
+    }
+
+    #[test]
+    fn the_right_title_by_the_wrong_artist_is_rejected() {
+        assert!(!youtube_search_matches(
+            "Victorious",
+            Some("Panic! At The Disco"),
+            Some(179),
+            Some("Someone Else - Victorious"),
+            Some(179.0),
+        ));
+    }
+
+    #[test]
+    fn a_duration_mismatch_rejects_extended_and_live_versions() {
+        // An extended mix or a live cut carries the right title and artist, so
+        // duration is the only thing that catches it.
+        assert!(!youtube_search_matches(
+            "Victorious",
+            Some("Panic! At The Disco"),
+            Some(179),
+            Some("Panic! At The Disco - Victorious (Live)"),
+            Some(240.0),
+        ));
+        // A few seconds of lead-in silence is not a mismatch.
+        assert!(youtube_search_matches(
+            "Victorious",
+            Some("Panic! At The Disco"),
+            Some(179),
+            Some("Panic! At The Disco - Victorious"),
+            Some(183.0),
+        ));
+    }
+
+    #[test]
+    fn an_unknown_duration_does_not_veto_a_good_title_match() {
+        assert!(youtube_search_matches(
+            "Victorious",
+            Some("Panic! At The Disco"),
+            None,
+            Some("Panic! At The Disco - Victorious"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn a_missing_candidate_title_is_never_trusted() {
+        assert!(!youtube_search_matches(
+            "Victorious",
+            Some("Panic! At The Disco"),
+            Some(179),
+            None,
+            Some(179.0),
+        ));
+    }
+
 
     fn track(artist_name: Option<&str>, description: Option<&str>) -> db::Media {
         db::Media {
