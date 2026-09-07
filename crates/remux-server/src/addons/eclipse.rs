@@ -79,7 +79,7 @@ fn eclipse_from_cfg(
         .to_string();
     let manifest_url = StremioManifestUrl::try_new(raw_url)
         .map_err(|e| anyhow!("Invalid manifest_url: {e}"))?;
-    let client = super::make_http_client();
+    let client = super::make_http_client(config);
     let addon = Arc::new(EclipseAddon {
         manifest_url,
         client,
@@ -285,6 +285,22 @@ async fn wait_for_worker_slot() {
 /// hard error — the previous behaviour turned a transient 429 into a permanent
 /// "no source", which the caller swallowed and served to the client as a 500 /
 /// Finamp `-1008`.
+/// Whether a failed worker response is worth another attempt.
+///
+/// Retrying a permanent answer is not merely wasteful, it is the difference
+/// between a fast failure and a stalled one: with five attempts and a 1.5 s
+/// backoff behind the rate gate, a decommissioned worker consumed the caller's
+/// entire resolution budget on every track before reporting the 404 it returned
+/// in milliseconds the first time.
+fn is_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+const WORKER_ATTEMPTS: u32 = 5;
+const WORKER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
 async fn worker_get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
@@ -293,17 +309,37 @@ async fn worker_get_json<T: serde::de::DeserializeOwned>(
         .acquire()
         .await
         .expect("worker concurrency semaphore is never closed");
-    let resp = remux_utils::retry!(attempts: 5, delay: 1500, {
+
+    let mut last_err = None;
+    for attempt in 0..WORKER_ATTEMPTS {
         wait_for_worker_slot().await;
-        client
+        match client
             .get(url)
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
-    })?;
-    resp.json::<T>()
-        .await
-        .map_err(Into::into)
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return resp
+                        .json::<T>()
+                        .await
+                        .map_err(Into::into);
+                }
+                if !is_retryable(status) {
+                    // Permanent: a deleted worker, a revoked manifest token, a
+                    // track the provider does not carry. Say so immediately.
+                    return Err(anyhow!("worker responded {status}"));
+                }
+                last_err = Some(anyhow!("worker responded {status}"));
+            }
+            Err(e) => last_err = Some(e.into()),
+        }
+        if attempt + 1 < WORKER_ATTEMPTS {
+            tokio::time::sleep(WORKER_RETRY_DELAY * (1 << attempt.min(10))).await;
+        }
+    }
+    Err(last_err.expect("at least one attempt is always made"))
 }
 
 async fn eclipse_streams(
@@ -364,7 +400,38 @@ async fn eclipse_streams(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_stream_url;
+    use super::{is_retryable, normalize_stream_url};
+    use reqwest::StatusCode;
+
+    #[test]
+    fn permanent_worker_answers_are_not_retried() {
+        // A deleted Cloudflare Worker answers 404 in milliseconds. Retrying it
+        // five times behind the rate gate is what turned an instant, honest
+        // failure into a multi-second stall on every track.
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+        ] {
+            assert!(!is_retryable(status), "{status} should be permanent");
+        }
+    }
+
+    #[test]
+    fn transient_worker_answers_are_retried() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(is_retryable(status), "{status} should be retried");
+        }
+    }
 
     #[test]
     fn normalizes_duplicated_absolute_media_url() {

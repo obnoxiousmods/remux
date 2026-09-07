@@ -160,3 +160,79 @@ pub async fn insert_test_source(ctx: &AppContext) -> db::Media {
         .expect("insert_test_source failed");
     media
 }
+
+/// Registers an in-process media-tracker addon: inserts the `addons` row and
+/// installs a runtime carrying `tracker`, so `AddonService::media_tracker_for`
+/// resolves it. Preset instantiation cannot build a stub, hence the direct
+/// runtime injection.
+pub async fn register_media_tracker(
+    ctx: &AppContext,
+    name: &str,
+    tracker: std::sync::Arc<dyn crate::addons::media_tracker::MediaTrackerAddon>,
+) -> crate::addons::Addon {
+    let now = Utc::now().naive_utc();
+    let addon = crate::addons::Addon {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        preset: remux_sdks::remux::AddonPresetRef {
+            kind: "test-media-tracker".to_string(),
+            config: Default::default(),
+        },
+        resources: vec![],
+        types: vec![],
+        enabled: true,
+        priority: 0,
+        created_at: now,
+        updated_at: now,
+        system: false,
+        is_default: true,
+        http_redirect_stream: false,
+        service_filter: vec![],
+    };
+    addon
+        .insert(&ctx.db)
+        .await
+        .expect("register_media_tracker: addon insert failed");
+
+    ctx.addons
+        .push_runtime(crate::addons::AddonRuntime {
+            row: addon.clone(),
+            caps: crate::addons::AddonCapabilities {
+                media_tracker: Some(tracker),
+                ..Default::default()
+            },
+        });
+    addon
+}
+
+/// Inserts a minimal saved Movie row. Use when a test needs a real `media_id`
+/// to reference and does not care about playback fields.
+pub async fn seed_movie(ctx: &AppContext) -> db::Media {
+    let now = Utc::now().naive_utc();
+    // `Media::validate` requires a Movie to carry a canonical external id AND
+    // to use the stable UUID derived from it, so the id cannot be random.
+    let mut media = db::Media {
+        title: "Test Movie".to_string(),
+        kind: db::MediaKind::Movie,
+        external_ids: db::ExternalIds {
+            imdb: db::NonEmptyString::try_new(format!("tt{:08}", rand_suffix())).ok(),
+            ..Default::default()
+        },
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    media.id = Uuid::from(&media.media_id_raw());
+    media
+        .save(&ctx.db)
+        .await
+        .expect("seed_movie failed");
+    media
+}
+
+/// Cheap per-call entropy for unique test identifiers.
+fn rand_suffix() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}

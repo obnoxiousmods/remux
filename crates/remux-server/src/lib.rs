@@ -538,6 +538,17 @@ pub struct Config {
     /// Connect timeout (seconds) for the shared addon HTTP client. Defaults to 8.
     #[serde(default = "default_addon_http_connect_timeout_secs")]
     pub addon_http_connect_timeout_secs: u64,
+    /// Per-addon budget (seconds) for one stream resolution of a video item.
+    /// Torrent indexers are legitimately slow, so this stays generous.
+    /// Defaults to 10.
+    #[serde(default = "default_stream_addon_timeout_secs")]
+    pub stream_addon_timeout_secs: u64,
+    /// Per-addon budget (seconds) for one stream resolution of a music item
+    /// (track, album, artist). Music clients resolve song by song, so a
+    /// video-sized budget makes a track list unusable and lets a single dead
+    /// provider cost seconds per song. Defaults to 3.
+    #[serde(default = "default_music_stream_addon_timeout_secs")]
+    pub music_stream_addon_timeout_secs: u64,
     /// Directory for server log files (daily-rolled `remux.log`), surfaced by
     /// the admin dashboard's Logs page. `None` derives `<data_dir>/log` in
     /// [`Config::resolve`]. Kept separate from client-log uploads
@@ -618,6 +629,14 @@ fn default_addon_http_timeout_secs() -> u64 {
 
 fn default_addon_http_connect_timeout_secs() -> u64 {
     8
+}
+
+fn default_stream_addon_timeout_secs() -> u64 {
+    10
+}
+
+fn default_music_stream_addon_timeout_secs() -> u64 {
+    3
 }
 
 fn default_tmdb_base_url() -> String {
@@ -714,6 +733,8 @@ impl Default for Config {
             group_local_music_limit: None,
             addon_http_timeout_secs: default_addon_http_timeout_secs(),
             addon_http_connect_timeout_secs: default_addon_http_connect_timeout_secs(),
+            stream_addon_timeout_secs: default_stream_addon_timeout_secs(),
+            music_stream_addon_timeout_secs: default_music_stream_addon_timeout_secs(),
             log_dir: None,
             metrics_enabled: false,
             telemetry_enabled: default_telemetry_enabled(),

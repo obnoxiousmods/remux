@@ -46,10 +46,27 @@ use crate::{
         session::{TranscodeSession, TranscodeState},
     },
     sdks,
-    services::{MediaResolveService, ProbeResult, StreamService, StreamServiceConfig},
+    services::{
+        MediaResolveService, NoPlayableSources, ProbeResult, StreamService,
+        StreamServiceConfig,
+    },
     torrent,
 };
 use axum_anyhow::ApiResult as Result;
+
+/// Maps a stream-resolution failure to a status the client can act on.
+///
+/// An item whose providers are all empty or down is a missing resource, not a
+/// server fault — stock Jellyfin answers 404 when a file is gone, and 404 is
+/// what music clients render as "unavailable" instead of inventing a transcode
+/// or permission error. Everything else keeps its 500.
+fn stream_lookup_error(err: anyhow::Error) -> axum_anyhow::ApiError {
+    if NoPlayableSources::is_cause_of(&err) {
+        err.context_not_found("no playable source is currently available for this item")
+    } else {
+        err.context_internal("Something went wrong")
+    }
+}
 
 #[post("/items/{id}/playbackinfo")]
 pub async fn items_playbackinfo(
@@ -194,9 +211,28 @@ async fn items_playbackinfo_inner(
         .original_language
         .clone();
     let source_refresh_started = Instant::now();
-    service
+    if let Err(e) = service
         .load(media)
-        .await?;
+        .await
+    {
+        if NoPlayableSources::is_cause_of(&e) {
+            // Stock Jellyfin never 500s here: it answers 200 with whatever
+            // sources it has plus an ErrorCode. Clients render that as "no
+            // compatible streams", which is the truth, instead of treating the
+            // whole server as broken and retrying in a tight loop.
+            debug!(item_id = %id, "playbackinfo: no playable sources");
+            return Ok(Json(api::PlaybackInfoResponse {
+                media_sources: vec![],
+                play_session_id: Some(
+                    common::get_uuid()
+                        .as_simple()
+                        .to_string(),
+                ),
+                error_code: Some(api::PlaybackErrorCode::NoCompatibleStream),
+            }));
+        }
+        return Err(e.context_internal("Something went wrong"));
+    }
     let source_refresh_ms = source_refresh_started
         .elapsed()
         .as_secs_f64()
@@ -871,7 +907,8 @@ async fn videos_stream_inner(
             .as_deref(),
         user_id,
     )
-    .await?;
+    .await
+    .map_err(stream_lookup_error)?;
 
     let si = media
         .stream_info
@@ -1197,7 +1234,8 @@ pub async fn audio_universal(
                 .id,
         ),
     )
-    .await?;
+    .await
+    .map_err(stream_lookup_error)?;
     let descriptor = media
         .stream_info
         .as_ref()
@@ -1321,6 +1359,56 @@ pub struct BitrateTestQuery {
 mod tests {
     use http::{StatusCode, header::HeaderValue};
     use serde_json::json;
+
+    use super::{NoPlayableSources, stream_lookup_error};
+
+    #[test]
+    fn an_unresolvable_source_is_a_404_not_a_500() {
+        let err = stream_lookup_error(NoPlayableSources::new(uuid::Uuid::nil()).into());
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn an_unresolvable_source_stays_a_404_when_it_has_been_given_context() {
+        // The failure travels up through several `?`s, so the mapper has to
+        // find it by downcast rather than by inspecting the outermost error.
+        let err: anyhow::Error =
+            NoPlayableSources::with_detail(uuid::Uuid::nil(), "filtered out").into();
+        assert!(NoPlayableSources::is_cause_of(&err));
+        assert_eq!(stream_lookup_error(err).status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn any_other_failure_is_still_a_500() {
+        let err = stream_lookup_error(anyhow::anyhow!("database is on fire"));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn playbackinfo_reports_no_compatible_stream_and_omits_it_on_success() {
+        let unavailable = crate::api::PlaybackInfoResponse {
+            media_sources: vec![],
+            play_session_id: Some("session".into()),
+            error_code: Some(crate::api::PlaybackErrorCode::NoCompatibleStream),
+        };
+        let json = serde_json::to_value(&unavailable).unwrap();
+        assert_eq!(json["ErrorCode"], "NoCompatibleStream");
+        assert_eq!(json["MediaSources"], serde_json::json!([]));
+
+        // The happy path must stay byte-identical to stock Jellyfin, which
+        // omits ErrorCode entirely.
+        let ok = crate::api::PlaybackInfoResponse {
+            media_sources: vec![],
+            play_session_id: Some("session".into()),
+            error_code: None,
+        };
+        let json = serde_json::to_value(&ok).unwrap();
+        assert!(
+            json.get("ErrorCode")
+                .is_none(),
+            "ErrorCode must be absent, not null, on success"
+        );
+    }
 
     use crate::integration_test::{
         AUTH_HEADER, auth_header_with_token, authenticated_server, insert_test_source,

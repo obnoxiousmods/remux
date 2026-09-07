@@ -46,7 +46,7 @@ impl AddonPreset for LrcLibPreset {
         config: &crate::Config,
     ) -> Result<AddonCapabilities> {
         let addon = Arc::new(LrcLibAddon {
-            client: super::make_http_client(),
+            client: super::make_http_client(config),
         });
         Ok(AddonCapabilities {
             kind: Some(addon.clone()),

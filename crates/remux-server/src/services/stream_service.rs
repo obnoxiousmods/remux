@@ -10,6 +10,44 @@ use remux_sdks::{
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+/// Every candidate source for an item failed to resolve: no provider had it, or
+/// the ones that did are down.
+///
+/// A distinct type rather than a bare `anyhow!` string so handlers can answer
+/// truthfully. This used to surface as `500 Something went wrong`, which is a
+/// claim that the *server* broke — clients then invented their own explanations
+/// for it ("Not allowed to transcode audio" in Manet, `-1008` in Finamp) and
+/// sent users chasing the wrong problem.
+#[derive(Debug, thiserror::Error)]
+#[error("no playable sources for {item_id}{detail}")]
+pub struct NoPlayableSources {
+    pub item_id: Uuid,
+    /// Trailing parenthetical; empty when there is nothing more to say.
+    detail: String,
+}
+
+impl NoPlayableSources {
+    pub fn new(item_id: Uuid) -> Self {
+        Self {
+            item_id,
+            detail: String::new(),
+        }
+    }
+
+    pub fn with_detail(item_id: Uuid, detail: &str) -> Self {
+        Self {
+            item_id,
+            detail: format!(" ({detail})"),
+        }
+    }
+
+    /// Whether `err` is, or wraps, this failure.
+    pub fn is_cause_of(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<Self>()
+            .is_some()
+    }
+}
+
 /// Result of probing a single stream candidate.
 pub(crate) struct ProbeResult {
     /// Probed source info with id/name/path/remux already stamped.
@@ -223,10 +261,11 @@ impl StreamService {
         };
 
         if streams.is_empty() {
-            return Err(anyhow::anyhow!(
-                "no playable sources for {} (no streams from addon, or filtered out by grouping/stream policy)",
-                self.item_id
-            ));
+            return Err(NoPlayableSources::with_detail(
+                self.item_id,
+                "no streams from addon, or filtered out by grouping/stream policy",
+            )
+            .into());
         }
         self.stream = streams
             .first()
@@ -339,16 +378,12 @@ impl StreamService {
                                 .into_iter()
                                 .next()
                         })
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("no playable sources for {}", item_id)
-                        })
+                        .ok_or_else(|| NoPlayableSources::new(item_id).into())
                 } else {
                     sources
                         .into_iter()
                         .next()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("no playable sources for {}", item_id)
-                        })
+                        .ok_or_else(|| NoPlayableSources::new(item_id).into())
                 }
             }
             _ => Ok(media),

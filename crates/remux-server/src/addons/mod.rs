@@ -4,6 +4,7 @@
 pub mod addon;
 pub mod deezer;
 pub mod eclipse;
+pub mod health;
 pub mod introdb;
 pub mod iptv;
 pub mod lrclib;
@@ -42,8 +43,6 @@ use remux_sdks::remuxdb;
 pub use remux_sdks::remux::AddonPresetRef;
 use remux_sdks::remux::{LyricDto, MediaSegments, RemoteLyricInfoDto};
 
-const STREAM_ADDON_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-
 async fn wait_for_stream_addon<F>(
     future: F,
     timeout: Duration,
@@ -54,6 +53,170 @@ where
     tokio::time::timeout(timeout, future)
         .await
         .ok()
+}
+
+/// Whether this media kind resolves through priority *fallback tiers* rather
+/// than by aggregating every provider.
+///
+/// Music plays one source, so the highest-priority provider that answers wins
+/// and the rest are never contacted. Movies and episodes deliberately collect
+/// every source — the client picks a quality/release — so they must keep
+/// aggregating; see the dedup in [`AddonService::get_streams`]'s callers.
+fn resolves_by_tier(kind: &db::MediaKind) -> bool {
+    matches!(
+        kind,
+        db::MediaKind::Track | db::MediaKind::Album | db::MediaKind::Artist
+    )
+}
+
+/// Per-addon budget for one stream resolution.
+///
+/// A music client resolves song by song, so the video-sized budget made a dead
+/// provider cost that budget on *every* track — including tracks a local addon
+/// had already answered in milliseconds.
+fn stream_addon_timeout(kind: &db::MediaKind, config: &crate::Config) -> Duration {
+    if resolves_by_tier(kind) {
+        Duration::from_secs(config.music_stream_addon_timeout_secs)
+    } else {
+        Duration::from_secs(config.stream_addon_timeout_secs)
+    }
+}
+
+/// Groups items into contiguous runs of equal priority, preserving input order.
+///
+/// Callers pass addons in resolution order (`Addon::list` sorts `priority ASC`,
+/// and a per-user override imposes its own order), so each run is one fallback
+/// tier: its members race, and the next tier is consulted only if this one
+/// yields nothing.
+fn priority_tiers<T>(items: Vec<(i64, T)>) -> Vec<Vec<T>> {
+    let mut tiers: Vec<Vec<T>> = Vec::new();
+    let mut current: Option<i64> = None;
+    for (priority, item) in items {
+        if current != Some(priority) {
+            current = Some(priority);
+            tiers.push(Vec::new());
+        }
+        tiers
+            .last_mut()
+            .expect("a tier is pushed before the first item")
+            .push(item);
+    }
+    tiers
+}
+
+/// Races `futures` and returns the first non-empty result, dropping the peers
+/// that have not finished.
+///
+/// Dropping is real cancellation here: the futures are plain
+/// [`tokio::time::timeout`] wrappers, not spawned tasks, so a winner stops the
+/// losers instead of merely ignoring them.
+///
+/// A cancelled peer reports no outcome by design — it neither succeeded nor
+/// failed, so feeding it to the circuit breaker would slander a provider for
+/// merely being slower than the winner.
+async fn first_non_empty<T, R, F>(futures: Vec<F>) -> (Vec<T>, Vec<R>)
+where
+    F: std::future::Future<Output = (Vec<T>, R)>,
+{
+    let mut pending: futures::stream::FuturesUnordered<F> = futures
+        .into_iter()
+        .collect();
+    let mut reports = Vec::new();
+    while let Some((result, report)) = futures::StreamExt::next(&mut pending).await {
+        reports.push(report);
+        if !result.is_empty() {
+            return (result, reports);
+        }
+    }
+    (Vec::new(), reports)
+}
+
+/// Resolves one addon's streams, bounded by `timeout`, tagging each result with
+/// its source. An addon that errors or times out contributes nothing rather
+/// than failing the whole resolution.
+async fn resolve_one(
+    runtime: &AddonRuntime,
+    media: &db::Media,
+    ctx: &AppContext,
+    identity: Option<&AddonRequestIdentity>,
+    timeout: Duration,
+) -> (Vec<crate::stream::StreamInfo>, (Uuid, health::Outcome)) {
+    let name = &runtime
+        .row
+        .name;
+    let t = Instant::now();
+    let id_prefixes = runtime
+        .resource_id_prefixes(&ResourceType::Stream)
+        .map(|p| p.to_vec());
+    match wait_for_stream_addon(
+        runtime
+            .stream
+            .as_ref()
+            .expect("addons_for only yields addons with a stream capability")
+            .get_streams_for_user(media, ctx, identity, id_prefixes.as_deref()),
+        timeout,
+    )
+    .await
+    {
+        Some(Ok(mut streams)) => {
+            let elapsed = t.elapsed();
+            if streams.is_empty() {
+                debug!(addon = %name, ?elapsed, "addon: no streams");
+            } else {
+                debug!(addon = %name, count = streams.len(), ?elapsed, "addon: streams found");
+                let addon_id = runtime
+                    .row
+                    .id;
+                for s in &mut streams {
+                    s.source = Some(name.clone());
+                    s.addon_id = Some(addon_id);
+                }
+            }
+            let outcome = if streams.is_empty() {
+                health::Outcome::Empty
+            } else {
+                health::Outcome::Ok
+            };
+            (
+                streams,
+                (
+                    runtime
+                        .row
+                        .id,
+                    outcome,
+                ),
+            )
+        }
+        Some(Err(e)) => {
+            warn!(addon = %name, error = %e, elapsed = ?t.elapsed(), "stream addon failed");
+            (
+                vec![],
+                (
+                    runtime
+                        .row
+                        .id,
+                    health::Outcome::Failed,
+                ),
+            )
+        }
+        None => {
+            warn!(
+                addon = %name,
+                timeout_secs = timeout.as_secs(),
+                elapsed = ?t.elapsed(),
+                "stream addon timed out"
+            );
+            (
+                vec![],
+                (
+                    runtime
+                        .row
+                        .id,
+                    health::Outcome::TimedOut,
+                ),
+            )
+        }
+    }
 }
 
 pub use remux_sdks::{
@@ -619,9 +782,28 @@ impl From<crate::stream::StreamInfo> for db::Media {
 pub struct AddonPresetRegistration(pub fn() -> Box<dyn AddonPreset>);
 inventory::collect!(AddonPresetRegistration);
 
-pub(super) fn make_http_client() -> reqwest::Client {
+/// Request and connect budgets for the shared addon HTTP client.
+///
+/// Split out from [`make_http_client`] because `reqwest`'s builder is opaque —
+/// there is no way to read a timeout back off a built client, so the mapping
+/// from config to durations is what gets tested.
+pub(super) fn addon_client_timeouts(config: &crate::Config) -> (Duration, Duration) {
+    (
+        Duration::from_secs(config.addon_http_timeout_secs),
+        Duration::from_secs(config.addon_http_connect_timeout_secs),
+    )
+}
+
+pub(super) fn make_http_client(config: &crate::Config) -> reqwest::Client {
+    // Without these, a hung upstream could only ever be stopped by the caller's
+    // own resolution timeout, so one stalled host held a request open for the
+    // entire budget. `addon_http_timeout_secs` had been a config field nothing
+    // read.
+    let (timeout, connect_timeout) = addon_client_timeouts(config);
     reqwest::Client::builder()
         .user_agent("remux-server/1.0")
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
         .build()
         .expect("failed to build HTTP client")
 }
@@ -1103,6 +1285,12 @@ fn kind_in_type_list(kind: &db::MediaKind, list: &[db::MediaKind]) -> bool {
 #[derive(Clone)]
 pub struct AddonService {
     inner: Arc<ArcSwap<Vec<AddonRuntime>>>,
+    /// Per-addon circuit-breaker state, keyed by addon id. Deliberately held
+    /// here rather than in the request-scoped `Store` LRU: this is
+    /// read-modify-write counter state that must not be evicted, and it has to
+    /// survive [`Self::reload`] (which replaces `inner` wholesale) so a config
+    /// change does not hand a dead provider a fresh budget on every track.
+    health: Arc<dashmap::DashMap<Uuid, health::AddonHealth>>,
 }
 
 #[async_trait]
@@ -1330,6 +1518,7 @@ impl AddonService {
         let runtimes = Self::load_runtimes(db, config).await?;
         Ok(Self {
             inner: Arc::new(ArcSwap::from_pointee(runtimes)),
+            health: Arc::default(),
         })
     }
 
@@ -1409,6 +1598,24 @@ impl AddonService {
             }
         }
         Ok(runtimes)
+    }
+
+    /// Appends an already-built runtime to the live list.
+    ///
+    /// Test-support only. Production runtimes come from [`Self::load_runtimes`],
+    /// which instantiates addons from registered presets and therefore cannot
+    /// produce an in-process stub. Note that the next [`Self::reload`] drops
+    /// anything added this way.
+    #[doc(hidden)]
+    pub fn push_runtime(&self, runtime: AddonRuntime) {
+        let mut runtimes = self
+            .inner
+            .load()
+            .as_ref()
+            .clone();
+        runtimes.push(runtime);
+        self.inner
+            .store(Arc::new(runtimes));
     }
 
     pub async fn reload(&self, db: &SqlitePool, config: &crate::Config) -> Result<()> {
@@ -2465,6 +2672,52 @@ impl AddonService {
         subs
     }
 
+    /// Drops addons whose breaker is open, so a provider known to be down costs
+    /// nothing instead of its full timeout on every single track.
+    ///
+    /// A half-open breaker passes through: that one request is the probe whose
+    /// outcome decides whether the provider comes back.
+    fn gate_unhealthy(&self, addons: Vec<AddonRuntime>) -> Vec<AddonRuntime> {
+        let now = Instant::now();
+        addons
+            .into_iter()
+            .filter(|r| {
+                let gate = self
+                    .health
+                    .get(
+                        &r.row
+                            .id,
+                    )
+                    .map_or(health::Gate::Allow, |h| h.gate(now));
+                match gate {
+                    health::Gate::Allow => true,
+                    health::Gate::Probe => {
+                        debug!(addon = %r.row.name, "addon: probing after outage");
+                        true
+                    }
+                    health::Gate::Skip { retry_in } => {
+                        debug!(
+                            addon = %r.row.name,
+                            retry_in_secs = retry_in.as_secs(),
+                            "addon skipped: circuit open"
+                        );
+                        false
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn record_health(&self, reports: Vec<(Uuid, health::Outcome)>) {
+        let now = Instant::now();
+        for (addon_id, outcome) in reports {
+            self.health
+                .entry(addon_id)
+                .or_default()
+                .record(outcome, now);
+        }
+    }
+
     pub async fn get_streams(
         &self,
         media: &db::Media,
@@ -2493,75 +2746,73 @@ impl AddonService {
             .addons_for::<dyn StreamAddon>(media, &ctx.db, user_id)
             .await;
 
+        let timeout = stream_addon_timeout(&media.kind, &ctx.config);
+        let considered = addons.len();
+        let addons = self.gate_unhealthy(addons);
         debug!(
             media_id = %media.id,
             media_kind = ?media.kind,
             addon_count = addons.len(),
+            skipped_unhealthy = considered - addons.len(),
+            timeout_secs = timeout.as_secs(),
+            tiered = resolves_by_tier(&media.kind),
             "resolving streams"
         );
 
-        let tasks: Vec<_> = addons
-            .into_iter()
-            .map(|r| {
-                let identity = identity.clone();
-                async move {
-                let name = &r.row.name;
-                let t = std::time::Instant::now();
-                let id_prefixes = r
-                    .resource_id_prefixes(&ResourceType::Stream)
-                    .map(|p| p.to_vec());
-                match wait_for_stream_addon(
-                    r.stream
-                        .as_ref()
-                        .unwrap()
-                        .get_streams_for_user(
-                            media,
-                            ctx,
-                            identity.as_ref(),
-                            id_prefixes.as_deref(),
-                        ),
-                    STREAM_ADDON_FETCH_TIMEOUT,
+        let streams = if resolves_by_tier(&media.kind) {
+            // Music plays exactly one source. Race each priority tier and take
+            // the first provider that answers; only descend to the next tier
+            // when the whole current one comes back empty. This is what keeps a
+            // locally-available track instant instead of making it wait out the
+            // slowest remote resolver in the same tier.
+            let tiers = priority_tiers(
+                addons
+                    .into_iter()
+                    .map(|r| {
+                        (
+                            r.row
+                                .priority,
+                            r,
+                        )
+                    })
+                    .collect(),
+            );
+            let mut resolved = Vec::new();
+            for tier in &tiers {
+                let (streams, reports) = first_non_empty(
+                    tier.iter()
+                        .map(|r| resolve_one(r, media, ctx, identity.as_ref(), timeout))
+                        .collect(),
                 )
-                .await
-                {
-                    Some(Ok(mut streams)) => {
-                        let elapsed = t.elapsed();
-                        if streams.is_empty() {
-                            debug!(addon = %name, ?elapsed, "addon: no streams");
-                        } else {
-                            debug!(addon = %name, count = streams.len(), ?elapsed, "addon: streams found");
-                            let addon_id = r.row.id;
-                            for s in &mut streams {
-                                s.source = Some(name.clone());
-                                s.addon_id = Some(addon_id);
-                            }
-                        }
-                        streams
-                    }
-                    Some(Err(e)) => {
-                        warn!(addon = %name, error = %e, elapsed = ?t.elapsed(), "stream addon failed");
-                        vec![]
-                    }
-                    None => {
-                        warn!(
-                            addon = %name,
-                            timeout_secs = STREAM_ADDON_FETCH_TIMEOUT.as_secs(),
-                            elapsed = ?t.elapsed(),
-                            "stream addon timed out"
-                        );
-                        vec![]
-                    }
+                .await;
+                self.record_health(reports);
+                resolved = streams;
+                if !resolved.is_empty() {
+                    break;
                 }
-                }
-            })
-            .collect();
-        let all: Vec<db::Media> = futures::future::join_all(tasks)
-            .await
+            }
+            resolved
+        } else {
+            let results = futures::future::join_all(
+                addons
+                    .iter()
+                    .map(|r| resolve_one(r, media, ctx, identity.as_ref(), timeout)),
+            )
+            .await;
+            let (streams, reports): (Vec<_>, Vec<_>) = results
+                .into_iter()
+                .unzip();
+            self.record_health(reports);
+            streams
+                .into_iter()
+                .flatten()
+                .collect()
+        };
+
+        Ok(streams
             .into_iter()
-            .flatten()
             .map(db::Media::from)
-            .collect();
-        Ok(all)
+            .collect())
     }
 
     fn stream_dedup_key(s: &db::Media) -> Option<String> {
@@ -3383,6 +3634,151 @@ pub fn make_media_id(addon_id: Uuid, local_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priority_tiers_groups_contiguous_equal_priorities() {
+        let tiers = priority_tiers(vec![
+            (-30, "opendal-a"),
+            (-30, "opendal-b"),
+            (0, "spotiflac"),
+            (0, "ytdlp"),
+            (10, "last-resort"),
+        ]);
+        assert_eq!(
+            tiers,
+            vec![
+                vec!["opendal-a", "opendal-b"],
+                vec!["spotiflac", "ytdlp"],
+                vec!["last-resort"],
+            ]
+        );
+    }
+
+    #[test]
+    fn priority_tiers_handles_empty_and_singleton_input() {
+        assert!(priority_tiers::<&str>(vec![]).is_empty());
+        assert_eq!(priority_tiers(vec![(0, "only")]), vec![vec!["only"]]);
+    }
+
+    #[test]
+    fn priority_tiers_does_not_merge_non_adjacent_equal_priorities() {
+        // A per-user override reorders addons, so equal priorities can appear
+        // apart. Merging them would resurrect the "wait for everyone" bug for
+        // the addon the user deliberately demoted.
+        let tiers = priority_tiers(vec![(0, "a"), (-30, "b"), (0, "c")]);
+        assert_eq!(tiers, vec![vec!["a"], vec!["b"], vec!["c"]]);
+    }
+
+    #[tokio::test]
+    async fn first_non_empty_returns_without_awaiting_unfinished_peers() {
+        let started = std::time::Instant::now();
+        let (winner, reports) = first_non_empty(vec![
+            futures::future::FutureExt::boxed(async {
+                std::future::pending::<()>().await;
+                unreachable!("the pending peer must be dropped, not awaited")
+            }),
+            futures::future::FutureExt::boxed(async { (vec!["ready"], "fast") }),
+        ])
+        .await;
+        assert_eq!(winner, vec!["ready"]);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a ready provider must not wait on a hung peer"
+        );
+        assert_eq!(
+            reports,
+            vec!["fast"],
+            "a cancelled peer must not be reported — it neither succeeded nor failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_non_empty_skips_empty_results_and_reports_every_finisher() {
+        let (winner, reports) = first_non_empty(vec![
+            futures::future::FutureExt::boxed(async { (Vec::<&str>::new(), "empty") }),
+            futures::future::FutureExt::boxed(async { (vec!["second"], "hit") }),
+        ])
+        .await;
+        assert_eq!(winner, vec!["second"]);
+        assert_eq!(reports.len(), 2);
+        assert!(reports.contains(&"empty") && reports.contains(&"hit"));
+    }
+
+    #[tokio::test]
+    async fn first_non_empty_is_empty_when_every_future_is_empty() {
+        // This is what lets the caller fall through to the next tier.
+        let (result, reports) = first_non_empty(vec![
+            futures::future::FutureExt::boxed(async { (Vec::<&str>::new(), 1) }),
+            futures::future::FutureExt::boxed(async { (Vec::<&str>::new(), 2) }),
+        ])
+        .await;
+        assert!(result.is_empty());
+        assert_eq!(
+            reports.len(),
+            2,
+            "an exhausted tier still reports its health"
+        );
+
+        let (empty, reports) = first_non_empty(Vec::<
+            futures::future::BoxFuture<'_, (Vec<&str>, ())>,
+        >::new())
+        .await;
+        assert!(empty.is_empty() && reports.is_empty());
+    }
+
+    #[test]
+    fn music_kinds_resolve_by_tier_and_video_kinds_aggregate() {
+        for kind in [
+            db::MediaKind::Track,
+            db::MediaKind::Album,
+            db::MediaKind::Artist,
+        ] {
+            assert!(
+                resolves_by_tier(&kind),
+                "{kind:?} should use fallback tiers"
+            );
+        }
+        for kind in [
+            db::MediaKind::Movie,
+            db::MediaKind::Episode,
+            db::MediaKind::TvChannel,
+        ] {
+            assert!(
+                !resolves_by_tier(&kind),
+                "{kind:?} must keep aggregating every source"
+            );
+        }
+    }
+
+    #[test]
+    fn the_addon_http_client_gets_its_configured_budgets() {
+        let config = crate::Config {
+            addon_http_timeout_secs: 20,
+            addon_http_connect_timeout_secs: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            addon_client_timeouts(&config),
+            (Duration::from_secs(20), Duration::from_secs(8))
+        );
+    }
+
+    #[test]
+    fn music_gets_a_tighter_addon_budget_than_video() {
+        let config = crate::Config {
+            stream_addon_timeout_secs: 10,
+            music_stream_addon_timeout_secs: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            stream_addon_timeout(&db::MediaKind::Track, &config),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            stream_addon_timeout(&db::MediaKind::Movie, &config),
+            Duration::from_secs(10)
+        );
+    }
 
     #[tokio::test]
     async fn stream_addon_fetch_is_bounded_without_losing_ready_results() {
