@@ -275,6 +275,96 @@ Status values: `fixed`, `implemented`, `investigating`, `deferred`, and `not a c
   file that has since been deleted from disk (stale opendal index — a scan-refresh
   concern, not a resolution bug).
 
+### One dead provider made all music playback fail
+
+- **Status:** fixed, deployed, and live-verified 2026-09-07 (commits `72ddfcfa`, `208e771c`,
+  `25ab71c4`).
+- **Clients observed:** Feishin 1.15.1; the same shape reaches Finamp, Manet and Discrete.
+- **Evidence:** user `tv`, 2026-09-03 14:04. Seven local opendal addons answered
+  `no streams` in under 10 ms, then `stream addon timed out addon=Monochrome
+  timeout_secs=10`, then `500 no playable sources`, then four client retries each
+  answered instantly from the 45-second negative cache.
+- **Root cause, layered:**
+  - **Monochrome is gone.** `MONOCHROME_URL` (`addons/eclipse.rs`) returns HTTP 404 with
+    the Cloudflare body `error code: 1042`. Per-day success across retained logs: Aug 28
+    3/3, Aug 30 0/1, Aug 31 0/2, Sep 1 0/2, Sep 3 0/4. 919 `no playable sources` in total.
+  - **The priority tiering documented above did not exist in the code.** `get_streams` was
+    a flat `futures::future::join_all` over every stream addon, so every resolution waited
+    for the slowest provider — a track a local addon answered in 3 ms still cost the full
+    10 s.
+  - **A permanent 404 was retried five times** at 1.5 s behind `WORKER_CONCURRENCY` and the
+    750 ms rate gate, which is precisely what consumed that budget.
+  - **`make_http_client` set no timeouts at all**, leaving `Config::addon_http_timeout_secs`
+    a field nothing read.
+  - **No fallback could fire.** SpotiFLAC's `addons.resources` omits `stream`, so
+    `PickCap::<dyn StreamAddon>::pick` rejects it before any capability check; yt-dlp's
+    `StreamCap::supports` required an `external_ids.youtube_id` that a Deezer-sourced track
+    never carries.
+- **Change:** music resolves through priority fallback tiers (equal-priority providers race,
+  first non-empty wins, unfinished peers dropped, next tier only on exhaustion); movies and
+  episodes still aggregate every source. A per-addon circuit breaker
+  (`addons/health.rs`) opens after three consecutive failures for a doubling window capped
+  at 15 minutes, with a single half-open probe — an `Empty` result is explicitly *not* a
+  failure, since local addons answer empty for most tracks. Music gets a 3 s primary budget;
+  fallback tiers get 20 s, because yt-dlp needs ~2.5 s just to search and is only reached
+  when the alternative is silence. yt-dlp now accepts any track and resolves by search,
+  guarded by `youtube_search_matches` (title, artist across title/uploader/channel/artist,
+  duration within 5 s) and carrying yt-dlp's per-format `http_headers` into the descriptor.
+- **Verification:** against a copy of the production library, PlaybackInfo for a local track
+  fell from ~10 s to **49 ms**; a 30-track local sample went 29/30 → **30/30** and the
+  Panic! At The Disco tracks that have a local file are **31/31**, all decode-verified.
+
+### `no playable sources` was a 500
+
+- **Status:** fixed, deployed, and live-verified 2026-09-07.
+- **Evidence:** clients mistranslate a 500 — Manet reports "Not allowed to transcode audio",
+  Finamp `-1008` — sending users after the wrong problem. Two distinct paths produced it:
+  `StreamService::load` (919 occurrences) and `probe_candidates` exhausting every candidate
+  (**2,998** occurrences, more than three times the first).
+- **Change:** a typed `NoPlayableSources` error. `PlaybackInfo` now answers `200` with
+  `ErrorCode: NoCompatibleStream`, as stock Jellyfin does; the byte endpoints answer 404.
+  `log_api_error` drops 4xx to `debug`, so the spurious ERROR lines disappear on their own.
+
+### `/Audio/{id}/universal` rejected stock Jellyfin clients and re-encoded everything
+
+- **Status:** fixed, deployed, and live-verified 2026-09-07. Supersedes the 2026-07-16 entry
+  below: the 307 redirect it describes is no longer in the code, and the behaviour that
+  replaced it had regressed further.
+- **Evidence:** `400 unsupported audio download combination: container=mp4, codec=aac` —
+  the pair stock clients send — **59 times across 6 distinct users** (lakmani 24, maddog 14,
+  Legendmax 10, timiditit 8, silly 2, Willy7683 1).
+- **Root cause:** `audio_download_format` was a strict whitelist missing `mp4`/`aac`, and the
+  handler never read Jellyfin's `Container` (the client's supported-container list), so
+  `TranscodingContainer` fell through to its `mp3` default and every lossless file was
+  re-encoded — served `Accept-Ranges: none` and, worse, `Content-Disposition: attachment`.
+- **Change:** the full Jellyfin parameter set is parsed; direct play delegates to
+  `videos_stream_inner`'s range-capable byte path when the source matches what the client
+  declared and stays inside its caps; the format map is infallible and degrades to mp3;
+  the attachment disposition is gone from the streaming endpoint, and
+  `/items/{id}/download` gained the RFC 5987 `filename*` form.
+
+### Audio served as `application/octet-stream`
+
+- **Status:** fixed, deployed, and harness-proven 2026-09-07.
+- **Evidence:** `Daft Punk - … - Too Long.MP3` failed the harness on two endpoints.
+  `mime_from_path` matched extensions case-sensitively, so an uppercase extension fell
+  through to `application/octet-stream`, which strict music clients refuse.
+- **Change:** lowercased (plus m4b/wma/wv/aiff), and the byte path now normalises an audio
+  source's Content-Type from its probe. Note the gate is `probe_is_audio_only`, not "has no
+  video stream": a tagged music file carries its cover art as an mjpeg *video* stream, so
+  the naive test rejects most of the library's music.
+
+### Unrelated production bugs found while fixing the above
+
+- **The media INSERT listed 46 columns against 47 value placeholders** (left over from
+  `d9e53201`). It broke playlist creation in production — user `shadow`, three attempts on
+  2026-09-05 — and 80 unit tests. The lib test target now compiles: 537 → 655 passing,
+  92 → 12 failing, the residual 12 pre-existing and unrelated.
+- **A 70-second full-table scan.** `is_channel_query` used `kinds.iter().all(...)`, which is
+  vacuously true on an empty vec, so `kind: Some(vec![])` took the channel `ORDER BY` while
+  contributing no `WHERE` predicate: `SELECT * FROM media WHERE 1=1` ordered by channel
+  number, observed returning **1,514,646 rows in 70.4 s** during an ordinary music browse.
+
 ## Verification checklist
 
 - Capture the exact request and serialized response from Remux.
