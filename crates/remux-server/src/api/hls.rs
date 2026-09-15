@@ -61,11 +61,10 @@ async fn wait_for_transcode_path(
     }
 }
 
-async fn wait_for_variant_playlist_with_min_segments(
+async fn wait_for_variant_playlist(
     session: &Arc<tokio::sync::RwLock<TranscodeSession>>,
     path: &std::path::Path,
     timeout: std::time::Duration,
-    minimum_segments: usize,
 ) -> String {
     let (output_tx, state_tx) = {
         let session = session.read().await;
@@ -76,7 +75,6 @@ async fn wait_for_variant_playlist_with_min_segments(
         state_tx.subscribe(),
         path,
         timeout,
-        minimum_segments,
     )
     .await
 }
@@ -86,16 +84,11 @@ async fn wait_for_variant_playlist_signals(
     mut state_rx: tokio::sync::watch::Receiver<TranscodeState>,
     path: &std::path::Path,
     timeout: std::time::Duration,
-    minimum_segments: usize,
 ) -> String {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Ok(text) = tokio::fs::read_to_string(path).await {
-            let segment_count = text.matches("#EXTINF:").count();
-            let completed = text.contains("#EXT-X-ENDLIST") && segment_count > 0;
-            if text.contains("#EXT-X-TARGETDURATION")
-                && (segment_count >= minimum_segments || completed)
-            {
+            if text.contains("#EXT-X-TARGETDURATION") {
                 return text;
             }
         }
@@ -1265,16 +1258,12 @@ async fn variant_hls_video_inner(
         // local-zero timeline expected by clients that acknowledged
         // StartTimeTicks. Segment-driven recovery can still preserve a
         // requested local MEDIA-SEQUENCE.
-        // Poll until ffmpeg has opened the playlist and written enough complete
-        // segments to give a browser decoder startup runway. Waiting for two
-        // segments on VOD avoids starting at the edge of a six-second window,
-        // where hls.js can report a stall before the next segment arrives.
+        // Poll until ffmpeg has opened the playlist and written its header.
         let playlist_wait_started_at = std::time::Instant::now();
-        let content = wait_for_variant_playlist_with_min_segments(
+        let content = wait_for_variant_playlist(
             &session,
             &playlist_path,
             std::time::Duration::from_secs(15),
-            if is_live { 1 } else { 2 },
         )
         .await;
 
@@ -1485,7 +1474,6 @@ mod local_tests {
             state_rx,
             &missing,
             std::time::Duration::from_secs(5),
-            1,
         )
         .await;
 
