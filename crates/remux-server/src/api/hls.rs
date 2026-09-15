@@ -61,29 +61,22 @@ async fn wait_for_transcode_path(
     }
 }
 
-async fn wait_for_variant_playlist(
+async fn wait_for_variant_playlist_with_min_segments(
     session: &Arc<tokio::sync::RwLock<TranscodeSession>>,
     path: &std::path::Path,
     timeout: std::time::Duration,
+    minimum_segments: usize,
 ) -> String {
     let (output_tx, state_tx) = {
-        let session = session
-            .read()
-            .await;
-        (
-            session
-                .output_tx
-                .clone(),
-            session
-                .state_tx
-                .clone(),
-        )
+        let session = session.read().await;
+        (session.output_tx.clone(), session.state_tx.clone())
     };
     wait_for_variant_playlist_signals(
         output_tx.subscribe(),
         state_tx.subscribe(),
         path,
         timeout,
+        minimum_segments,
     )
     .await
 }
@@ -93,11 +86,16 @@ async fn wait_for_variant_playlist_signals(
     mut state_rx: tokio::sync::watch::Receiver<TranscodeState>,
     path: &std::path::Path,
     timeout: std::time::Duration,
+    minimum_segments: usize,
 ) -> String {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Ok(text) = tokio::fs::read_to_string(path).await {
-            if text.contains("#EXT-X-TARGETDURATION") {
+            let segment_count = text.matches("#EXTINF:").count();
+            let completed = text.contains("#EXT-X-ENDLIST") && segment_count > 0;
+            if text.contains("#EXT-X-TARGETDURATION")
+                && (segment_count >= minimum_segments || completed)
+            {
                 return text;
             }
         }
@@ -1267,17 +1265,16 @@ async fn variant_hls_video_inner(
         // local-zero timeline expected by clients that acknowledged
         // StartTimeTicks. Segment-driven recovery can still preserve a
         // requested local MEDIA-SEQUENCE.
-        // Poll until ffmpeg has opened the playlist and written its header:
-        // the muxer emits #EXT-X-TARGETDURATION at open, while the first
-        // #EXTINF only appears when the first full segment closes. Clients
-        // poll EVENT playlists, so serving the header lets the decoder mount
-        // one segment earlier without inventing boundaries ffmpeg will never
-        // create.
+        // Poll until ffmpeg has opened the playlist and written enough complete
+        // segments to give a browser decoder startup runway. Waiting for two
+        // segments on VOD avoids starting at the edge of a six-second window,
+        // where hls.js can report a stall before the next segment arrives.
         let playlist_wait_started_at = std::time::Instant::now();
-        let content = wait_for_variant_playlist(
+        let content = wait_for_variant_playlist_with_min_segments(
             &session,
             &playlist_path,
             std::time::Duration::from_secs(15),
+            if is_live { 1 } else { 2 },
         )
         .await;
 
@@ -1488,6 +1485,7 @@ mod local_tests {
             state_rx,
             &missing,
             std::time::Duration::from_secs(5),
+            1,
         )
         .await;
 
