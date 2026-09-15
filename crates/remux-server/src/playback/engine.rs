@@ -2025,6 +2025,7 @@ pub async fn start_transcode(
             );
 
             let ffmpeg_failed = matches!(&result, Some(Ok(s)) if !s.success());
+            let input_source_failure = is_input_source_failure(&stderr_out);
 
             // Only blame the encoder when ffmpeg's stderr actually implicates it.
             // A missing output directory or unreadable input can fail a session
@@ -2059,10 +2060,24 @@ pub async fn start_transcode(
                 .read()
                 .await
                 .stopped;
-            if ffmpeg_failed
+            let incomplete_input_failure = if input_source_failure {
+                let runtime_ticks = session_clone.read().await.runtime_ticks;
+                let produced_ticks = std::fs::read_to_string(params.output_dir.join("main.m3u8"))
+                    .ok()
+                    .map(|playlist| cumulative_segment_ticks(
+                        &playlist,
+                        u32::MAX,
+                        params.segment_length,
+                    ))
+                    .unwrap_or(0);
+                runtime_ticks > 0 && produced_ticks + (params.segment_length as i64 * 10_000_000) < runtime_ticks
+            } else {
+                false
+            };
+            if (ffmpeg_failed || incomplete_input_failure)
                 && !params.is_live
                 && input_restarts < MAX_INPUT_RESTARTS
-                && is_input_source_failure(&stderr_out)
+                && input_source_failure
                 && max_segment_index(&params.output_dir).is_some()
                 && !session_stopped
             {
