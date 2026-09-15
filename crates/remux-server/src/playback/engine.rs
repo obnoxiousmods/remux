@@ -2060,20 +2060,14 @@ pub async fn start_transcode(
                 .read()
                 .await
                 .stopped;
-            let incomplete_input_failure = if input_source_failure {
-                let runtime_ticks = session_clone.read().await.runtime_ticks;
-                let produced_ticks = std::fs::read_to_string(params.output_dir.join("main.m3u8"))
-                    .ok()
-                    .map(|playlist| cumulative_segment_ticks(
-                        &playlist,
-                        u32::MAX,
-                        params.segment_length,
-                    ))
-                    .unwrap_or(0);
-                runtime_ticks > 0 && produced_ticks + (params.segment_length as i64 * 10_000_000) < runtime_ticks
-            } else {
-                false
-            };
+            // Some Jellyfin-compatible clients do not send runtime_ticks on
+            // the HLS request.  In that case a remote read error can still
+            // produce a successful ffmpeg exit, but the playlist is only a
+            // partial VOD.  Any produced segment is enough to distinguish
+            // this from a startup failure; the bounded retry count prevents
+            // looping forever if the source is genuinely exhausted.
+            let incomplete_input_failure =
+                input_source_failure && max_segment_index(&params.output_dir).is_some();
             if (ffmpeg_failed || incomplete_input_failure)
                 && !params.is_live
                 && input_restarts < MAX_INPUT_RESTARTS
