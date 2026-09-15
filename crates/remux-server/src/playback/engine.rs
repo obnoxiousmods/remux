@@ -1734,6 +1734,11 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         "event".into(),
         "-hls_list_size".into(),
         "0".into(),
+        // Publish completed files atomically. Without temp_file, a client can
+        // fetch a playlist or segment while FFmpeg is still writing it,
+        // turning a transient write into a decoder stall/retry.
+        "-hls_flags".into(),
+        "temp_file".into(),
     ]);
 
     if is_hevc_copy {
@@ -3458,6 +3463,7 @@ mod tests {
         assert_eq!(arg_after(&args, "-c:v"), Some("copy"));
         assert_eq!(arg_after(&args, "-c:a"), Some("aac"));
         assert_eq!(arg_after(&args, "-f"), Some("hls"));
+        assert_eq!(arg_after(&args, "-hls_flags"), Some("temp_file"));
         // Default TS segments — no fmp4 flag
         assert!(!args_contains(&args, "-hls_segment_type"));
         // Playlist and segment paths
