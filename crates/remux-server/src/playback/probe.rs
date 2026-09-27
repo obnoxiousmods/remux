@@ -1093,13 +1093,8 @@ fn select_candidates(
             }
             true
         })
-        // In group-cascade mode (restrict_resolution=false) try all candidates;
-        // otherwise honour the configured retry cap.
-        .take(if restrict_resolution {
-            max_retries
-        } else {
-            usize::MAX
-        })
+        // A different resolution does not create another recovery budget.
+        .take(max_retries)
         .filter_map(|c| {
             let url = c
                 .stream_info
@@ -1155,6 +1150,16 @@ where
     let mut attempts = 0usize;
 
     for (stream, url_opt) in all_to_try {
+        if let Some(crate::stream::StreamDescriptor::Http { url, .. }) = stream
+            .stream_info
+            .as_ref()
+            .map(|info| &info.descriptor)
+        {
+            if crate::stream::gateway_budget_backoff(url).is_some() {
+                debug!(stream_id = %stream.id, "skipping source during shared gateway backoff");
+                continue;
+            }
+        }
         let is_retry = stream.id != primary.id;
         let url = match url_opt {
             Some(u) => u,
@@ -1500,7 +1505,7 @@ mod probe_tests {
     }
 
     #[test]
-    fn cascade_mode_ignores_retry_cap() {
+    fn cascade_mode_honors_retry_cap() {
         let primary = http_media("http://a.example.com");
         let others: Vec<_> = (0..5)
             .map(|i| http_media(&format!("http://s{i}.example.com")))
@@ -1509,7 +1514,7 @@ mod probe_tests {
             .chain(others)
             .collect();
         let result = select_candidates(&primary, &all, true, 1, false, 3000);
-        assert_eq!(result.len(), 5);
+        assert_eq!(result.len(), 1);
     }
 
     // ── probe_with_fallback ───────────────────────────────────────────────────
@@ -1659,7 +1664,7 @@ mod probe_tests {
     }
 
     #[tokio::test]
-    async fn cascade_mode_tries_all_streams() {
+    async fn cascade_mode_stops_at_retry_budget() {
         let db = test_db().await;
         let sources: Vec<_> = (0..4)
             .map(|i| http_media(&format!("http://s{i}.example.com")))
@@ -1670,7 +1675,7 @@ mod probe_tests {
             Some("http://s0.example.com".to_string()),
             10,
             true,
-            1, // max_retries=1, but restrict_resolution=false → cascade
+            1, // One fallback, including when resolution is unrestricted.
             &sources,
             false,
             3000,
@@ -1685,7 +1690,7 @@ mod probe_tests {
         .await;
         let err = format!("{:?}", result.unwrap_err());
         assert!(
-            err.contains("tried 4 of 4 streams"),
+            err.contains("tried 2 of 4 streams"),
             "unexpected error: {err}"
         );
     }

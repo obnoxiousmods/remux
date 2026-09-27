@@ -31,11 +31,21 @@ use crate::AppState;
 pub struct TrackerUrl(String);
 
 pub fn is_tracker_url(s: &str) -> bool {
-    let Ok(url) = url::Url::parse(s.trim()) else { return false; };
-    let Some(_) = url.host_str() else { return false; };
+    let Ok(url) = url::Url::parse(s.trim()) else {
+        return false;
+    };
+    let Some(_) = url.host_str() else {
+        return false;
+    };
     match url.scheme() {
-        "udp" => url.port().is_some(),
-        "http" | "https" => !url.path().is_empty() && url.path() != "/",
+        "udp" => url
+            .port()
+            .is_some(),
+        "http" | "https" => {
+            !url.path()
+                .is_empty()
+                && url.path() != "/"
+        }
         _ => false,
     }
 }
@@ -374,6 +384,66 @@ pub struct HttpSource {
     pub response_headers: std::collections::HashMap<String, String>,
 }
 
+// Only the explicitly global gateway budget refusal belongs here. Per-user,
+// per-title and ordinary provider failures must never block another viewer.
+static GATEWAY_BUDGET_BACKOFF: LazyLock<std::sync::Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+pub(crate) fn gateway_budget_backoff(url: &str) -> Option<Duration> {
+    let origin = url::Url::parse(url)
+        .ok()?
+        .origin()
+        .ascii_serialization();
+    let mut backoffs = GATEWAY_BUDGET_BACKOFF
+        .lock()
+        .ok()?;
+    let now = Instant::now();
+    backoffs.retain(|_, until| *until > now);
+    backoffs
+        .get(&origin)
+        .map(|until| until.saturating_duration_since(now))
+}
+
+fn record_gateway_budget_backoff(url: &str, headers: &HeaderMap) {
+    if headers
+        .get("x-obnoxioustv-error")
+        .and_then(|v| {
+            v.to_str()
+                .ok()
+        })
+        != Some("provider_budget_exhausted")
+    {
+        return;
+    }
+    let Some(seconds) = headers
+        .get(http::header::RETRY_AFTER)
+        .and_then(|v| {
+            v.to_str()
+                .ok()
+        })
+        .and_then(|v| {
+            v.parse::<u64>()
+                .ok()
+        })
+    else {
+        return;
+    };
+    let Ok(url) = url::Url::parse(url) else {
+        return;
+    };
+    let Ok(mut backoffs) = GATEWAY_BUDGET_BACKOFF.lock() else {
+        return;
+    };
+    backoffs.retain(|_, until| *until > Instant::now());
+    if backoffs.len() < 256 {
+        backoffs.insert(
+            url.origin()
+                .ascii_serialization(),
+            Instant::now() + Duration::from_secs(seconds.min(3600)),
+        );
+    }
+}
+
 #[derive(Clone)]
 struct SegmentedMp4Layout {
     discovered_at: Instant,
@@ -628,6 +698,15 @@ impl HttpSource {
     }
 
     async fn serve_http(&self, headers: &HeaderMap) -> Result<Response> {
+        if let Some(remaining) = gateway_budget_backoff(&self.url) {
+            return Ok(Response::builder()
+                .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header(http::header::CACHE_CONTROL, "no-store")
+                .header(http::header::RETRY_AFTER, remaining.as_secs().max(1).to_string())
+                .body(Body::from(r#"{"error":"Provider bandwidth safety budget is exhausted","code":"provider_budget_exhausted"}"#))
+                .expect("valid gateway backoff response"));
+        }
         let client = STREAM_PROXY_CLIENT.clone();
         // Retry loop for rate-limited upstreams (429) and transient server errors.
         // Gateway services like stremio.obby.ca proxy to debrid APIs that throttle.
@@ -661,7 +740,17 @@ impl HttpSource {
             };
 
             let status = upstream.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RETRIES
+            let explicit_backoff = upstream
+                .headers()
+                .contains_key(http::header::RETRY_AFTER);
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                record_gateway_budget_backoff(&self.url, upstream.headers());
+            }
+            // Let the caller honor the gateway's deadline. Retrying after 500ms
+            // cannot resolve a refusal that explicitly requests minutes.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                && attempt < MAX_RETRIES
+                && !explicit_backoff
             {
                 let delay = std::time::Duration::from_secs(1u64 << attempt);
                 tracing::info!(
@@ -674,7 +763,7 @@ impl HttpSource {
                 tokio::time::sleep(delay).await;
                 continue;
             }
-            if status.is_server_error() && attempt < MAX_RETRIES {
+            if status.is_server_error() && attempt < MAX_RETRIES && !explicit_backoff {
                 let delay =
                     std::time::Duration::from_millis(500 * (attempt as u64 + 1));
                 tracing::info!(
@@ -1006,6 +1095,9 @@ fn copy_stream_response_headers(
                 | "accept-ranges"
                 | "content-range"
                 | "last-modified"
+                | "retry-after"
+                | "cache-control"
+                | "x-obnoxioustv-error"
         ) {
             output.insert(name, value.clone());
         }
@@ -1023,6 +1115,116 @@ fn copy_stream_response_headers(
         ) {
             output.insert(name, value);
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_backoff_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn shared_budget_refusal_does_not_hit_gateway_for_next_source() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = axum::Router::new().fallback(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async {
+                Response::builder()
+                    .status(503)
+                    .header("retry-after", "60")
+                    .header("x-obnoxioustv-error", "provider_budget_exhausted")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"code":"provider_budget_exhausted"}"#))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener
+            .local_addr()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap()
+        });
+        for path in ["first", "second"] {
+            let source = HttpSource {
+                url: format!("http://{address}/{path}"),
+                request_headers: Default::default(),
+                response_headers: Default::default(),
+            };
+            let response = source
+                .serve_http(&HeaderMap::new())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                response
+                    .headers()
+                    .contains_key("retry-after")
+            );
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+        GATEWAY_BUDGET_BACKOFF
+            .lock()
+            .unwrap()
+            .remove(&format!("http://{address}"));
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_forwarded_without_retrying_or_blocking_other_titles() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = axum::Router::new().fallback(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async {
+                Response::builder()
+                    .status(503)
+                    .header("retry-after", "30")
+                    .body(Body::from("title unavailable"))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener
+            .local_addr()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap()
+        });
+        for path in ["first", "second"] {
+            let source = HttpSource {
+                url: format!("http://{address}/{path}"),
+                request_headers: Default::default(),
+                response_headers: Default::default(),
+            };
+            let response = source
+                .serve_http(&HeaderMap::new())
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["retry-after"], "30");
+            assert!(gateway_budget_backoff(&source.url).is_none());
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn expired_backoff_does_not_block_playback() {
+        let origin = "https://expired-budget.example";
+        GATEWAY_BUDGET_BACKOFF
+            .lock()
+            .unwrap()
+            .insert(origin.into(), Instant::now() - Duration::from_secs(1));
+        assert!(gateway_budget_backoff(&format!("{origin}/video")).is_none());
     }
 }
 
