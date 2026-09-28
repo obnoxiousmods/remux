@@ -184,3 +184,53 @@ healthy detailed events are sampled out (sample rate zero). Body observation
 checks distinguish complete delivery, body error and cancellation. Formatting
 was run for both changed Rust crates; `git diff --check` and Python script syntax
 validation passed.
+
+## Deployed release and live verification
+
+Deployed through `deploy/remux-canonical-deploy.sh` from a clean canonical tree:
+
+* Code commit: `e5243dad5b5f499df0e99ba0215c8b443be44410`.
+* Release: `/opt/remux/releases/e5243dad5b5f499df0e99ba0215c8b443be44410-2026-09-28T052900Z`.
+* Executable SHA-256: `c48e2af4ee547b7ed135993de734bd2d08e56c18ebed9676549fb12fa8d8b6a5`.
+* Dashboard index SHA-256: `4629f58715bc83e3dbf487c448d5d9f7dc0dc4f607cb2a2f9e355617cc2159f6`.
+
+The release integrity check confirms that the running executable matches the
+immutable manifest. The service is active. Deployment completed on 27 September
+Pacific time (28 September UTC).
+
+Loopback HTTP verification on the deployed service passed **20/20 full direct
+files**, **60/60 exact range checks**, and **20/20 complete HLS recordings**.
+The first queue contains 10.6 minutes of audio across all four nonempty local
+providers; the additional queue contains 40.9 minutes of typical-length tracks.
+HLS delivered **527 segments** in total. Each concatenated recording passed strict
+FFmpeg decoding and a duration comparison. Before the public HTTPS check, the
+post-deployment body telemetry window recorded **819 complete transfers and zero
+body-error/truncated/cancelled outcomes**. Journal checks found no panics or
+transcode failures in that window. These are transfer/decode checks, not a claim
+of listening completion or real-device Finamp/Manet acceptance.
+
+The three failing remote music providers were disabled through the admin API:
+**SpotiFLAC, Monochrome, and yt-dlp**. All three updates returned HTTP 200 and the
+database flags were independently verified false. Their configurations were
+preserved; previous enabled states are backed up privately in
+`/tmp/remux-music-proof-private/provider-enabled-before.json`. No unqualified
+remote source was added. Remote-only tracks therefore remain unavailable with
+these upstreams. Re-enabling one requires a fresh complete-recording test; a
+working manifest or a first-byte response is insufficient.
+
+The three empty local providers point to existing but empty directories
+(`/1TB/music`, `/1TB3/music`, `/10TB2/music`). Their import configurations remain
+available for future files; they are not counted as proven playback sources.
+
+The post-deployment evidence is committed separately from the deployed code so
+that the audit can contain the actual release hash and live results.
+
+Public HTTPS verification through `https://remux.obnoxious.lol` also passed the
+**10-track, 40.9-minute queue**: ten complete files, thirty exact byte-range
+comparisons, and ten complete HLS decodes through nginx/TLS. No HTTP 429 occurred
+in those probes. Loopback results alone were not used to claim public-route
+success. This run originates from the server host; cellular/client-network
+conditions remain untested.
+
+Credential-free aggregate results and hashes of the original private reports are
+in [music-verification-2026-09-27.json](music-verification-2026-09-27.json).

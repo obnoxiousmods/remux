@@ -1,0 +1,123 @@
+{
+  "observed_at_utc": "2026-09-28T05:42:05.745011+00:00",
+  "deployed_commit": "e5243dad5b5f499df0e99ba0215c8b443be44410",
+  "binary_sha256": "c48e2af4ee547b7ed135993de734bd2d08e56c18ebed9676549fb12fa8d8b6a5",
+  "tests": {
+    "passed": 681,
+    "known_baseline_failures": 2
+  },
+  "results": [
+    {
+      "report": "baseline-direct",
+      "artifact_sha256": "8b3cbb873c45cf9e20e967fadeb92557e733746995d0f84387fde49c040e0e24",
+      "recordings": 10,
+      "passed": 10,
+      "range_checks": 30,
+      "hls_segments": 0,
+      "decoded_seconds": 636.132,
+      "median_verification_seconds": 0.298,
+      "failures": []
+    },
+    {
+      "report": "baseline-hls",
+      "artifact_sha256": "f1ef81faea31f407f6ff5072450f854c669476f56c187baf4eb063d6cc46bf07",
+      "recordings": 1,
+      "passed": 0,
+      "range_checks": 0,
+      "hls_segments": 0,
+      "decoded_seconds": 0,
+      "median_verification_seconds": 0.01,
+      "failures": [
+        "HTTP 404"
+      ]
+    },
+    {
+      "report": "baseline-typical-direct",
+      "artifact_sha256": "a03641d3aad31810e877db4a873f80d3a2ac44a520762c6e9839dac13af51167",
+      "recordings": 10,
+      "passed": 10,
+      "range_checks": 30,
+      "hls_segments": 0,
+      "decoded_seconds": 2452.739,
+      "median_verification_seconds": 0.578,
+      "failures": []
+    },
+    {
+      "report": "after-direct",
+      "artifact_sha256": "3892091b72e94bbc6101c4c82817c2840e247649683c54feb41472853fff8c74",
+      "recordings": 10,
+      "passed": 10,
+      "range_checks": 30,
+      "hls_segments": 0,
+      "decoded_seconds": 636.132,
+      "median_verification_seconds": 0.223,
+      "failures": []
+    },
+    {
+      "report": "after-typical-direct",
+      "artifact_sha256": "6ddb7ba26902778d61fab77faa6160a93538bd80aeb970ab4861033e7ac3d524",
+      "recordings": 10,
+      "passed": 10,
+      "range_checks": 30,
+      "hls_segments": 0,
+      "decoded_seconds": 2452.739,
+      "median_verification_seconds": 0.402,
+      "failures": []
+    },
+    {
+      "report": "after-hls",
+      "artifact_sha256": "3e07bd9e0ad8aa3f92edbbd1ec104c1a157820610f79adf8dd59a96bff9757f8",
+      "recordings": 10,
+      "passed": 10,
+      "range_checks": 0,
+      "hls_segments": 113,
+      "decoded_seconds": 635.832,
+      "median_verification_seconds": 1.546,
+      "failures": []
+    },
+    {
+      "report": "after-typical-hls",
+      "artifact_sha256": "efcac80ff8a1265cc8dd69bf6aead7bc0613bdea0e8d168c63229c9a2ea0a3b8",
+      "recordings": 10,
+      "passed": 10,
+      "range_checks": 0,
+      "hls_segments": 414,
+      "decoded_seconds": 2452.213,
+      "median_verification_seconds": 5.34,
+      "failures": []
+    },
+    {
+      "report": "public-typical-direct",
+      "artifact_sha256": "d097dbdd6c8b88b1d5e2a894b87d022ed7ba83dd03ecca45bedf5eb0d29b07ac",
+      "recordings": 10,
+      "passed": 10,
+      "range_checks": 30,
+      "hls_segments": 0,
+      "decoded_seconds": 2452.739,
+      "median_verification_seconds": 0.5,
+      "failures": []
+    },
+    {
+      "report": "public-typical-hls",
+      "artifact_sha256": "b49fab7fa18ff68759af6735d70611f5c6cf47a1c090af2d74259d7dbc03c659",
+      "recordings": 10,
+      "passed": 10,
+      "range_checks": 0,
+      "hls_segments": 414,
+      "decoded_seconds": 2452.213,
+      "median_verification_seconds": 5.547,
+      "failures": []
+    }
+  ],
+  "disabled_remote_music_providers": [
+    "SpotiFLAC",
+    "Monochrome",
+    "yt-dlp"
+  ],
+  "limitations": [
+    "Real iOS Finamp/Manet devices were unavailable.",
+    "No public remote source passed complete-recording qualification.",
+    "Production music rate limiting was not demonstrated; controlled HTTP 429 handling was tested.",
+    "Verification timings include full download, range comparisons and decoding, and are not controlled latency benchmarks."
+  ]
+}
