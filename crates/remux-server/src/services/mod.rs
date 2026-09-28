@@ -9,3 +9,5 @@ pub(crate) use resolve::ResolvedItem;
 pub(crate) use stream_service::{
     NoPlayableSources, ProbeResult, ProbedStreams, StreamService, StreamServiceConfig,
 };
+
+pub(crate) mod music_cache;

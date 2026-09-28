@@ -4561,12 +4561,15 @@ pub struct HlsVideoQuery {
     #[serde(alias = "mediaSourceId")]
     pub media_source_id: Option<Uuid>,
     pub video_codec: Option<String>,
+    #[serde(alias = "audioCodec")]
     pub audio_codec: Option<String>,
     pub segment_length: Option<i32>,
+    #[serde(alias = "startTimeTicks")]
     pub start_time_ticks: Option<i64>,
     pub max_width: Option<i32>,
     pub max_height: Option<i32>,
     pub video_bit_rate: Option<i32>,
+    #[serde(alias = "audioBitRate")]
     pub audio_bit_rate: Option<i32>,
     pub audio_stream_index: Option<i32>,
     pub subtitle_stream_index: Option<i32>,
@@ -4582,6 +4585,10 @@ pub struct HlsVideoQuery {
     /// Length of this segment in ticks.
     #[serde(alias = "actualSegmentLengthTicks")]
     pub actual_segment_length_ticks: Option<i64>,
+    #[serde(alias = "audioSampleRate")]
+    pub audio_sample_rate: Option<u32>,
+    #[serde(alias = "maxAudioChannels")]
+    pub max_audio_channels: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

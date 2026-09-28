@@ -97,7 +97,12 @@ impl AddonPreset for YtDlpPreset {
             });
         let addon = Arc::new(YtDlpAddon {
             cookies,
-            executable: PathBuf::from("yt-dlp"),
+            executable: config
+                .ytdlp_executable
+                .clone(),
+            extra_args: config
+                .ytdlp_extra_args
+                .clone(),
             bgutil_script_path: config
                 .bgutil_script_path
                 .clone(),
@@ -154,6 +159,7 @@ inventory::submit! {
 pub struct YtDlpAddon {
     cookies: Option<String>,
     executable: PathBuf,
+    extra_args: Vec<String>,
     bgutil_script_path: PathBuf,
     cache_dir: PathBuf,
 }
@@ -167,14 +173,6 @@ impl YtDlpAddon {
                 .into_owned(),
         ]
     }
-}
-
-fn ytdlp_extra_args() -> Vec<String> {
-    std::env::var("YTDLP_EXTRA_ARGS")
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect()
 }
 
 impl YtDlpAddon {
@@ -411,7 +409,16 @@ fn normalize_codec(codec: &str) -> &str {
 
 impl YtDlpAddon {
     async fn dump_json(&self, url_or_query: &str) -> Result<YtDlpVideo> {
+        self.dump_videos(url_or_query)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("yt-dlp returned no videos"))
+    }
+
+    async fn dump_videos(&self, url_or_query: &str) -> Result<Vec<YtDlpVideo>> {
         let output = Command::new(&self.executable)
+            .kill_on_drop(true)
             .hide_console()
             .args([
                 "--dump-json",
@@ -422,7 +429,7 @@ impl YtDlpAddon {
             ])
             .args(self.cookies_args())
             .args(self.cache_args())
-            .args(ytdlp_extra_args())
+            .args(&self.extra_args)
             .args(self.bgutil_args())
             .output()
             .await
@@ -437,22 +444,20 @@ impl YtDlpAddon {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let line = stdout
+        stdout
             .lines()
-            .find(|l| {
-                !l.trim()
+            .filter(|line| {
+                !line
+                    .trim()
                     .is_empty()
             })
-            .ok_or_else(|| {
-                anyhow!("yt-dlp produced no output for '{}'", url_or_query)
-            })?;
-
-        serde_json::from_str(line).with_context(|| {
-            format!("failed to parse yt-dlp JSON for '{}'", url_or_query)
-        })
+            .map(|line| {
+                serde_json::from_str(line).context("failed to parse yt-dlp video JSON")
+            })
+            .collect()
     }
 
-    async fn resolve_watch_url(&self, media: &db::Media) -> Result<String> {
+    async fn resolve_video(&self, media: &db::Media) -> Result<YtDlpVideo> {
         if let Some(url) = media
             .stream_info
             .as_ref()
@@ -461,7 +466,9 @@ impl YtDlpAddon {
                     .as_http_url()
             })
         {
-            return Ok(url.to_owned());
+            return self
+                .dump_json(url)
+                .await;
         }
         if let Some(id) = &media
             .external_ids
@@ -470,50 +477,42 @@ impl YtDlpAddon {
             if id.len() == 11
                 && id
                     .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
-                return Ok(format!("https://www.youtube.com/watch?v={}", id));
+                return self
+                    .dump_json(&format!("https://www.youtube.com/watch?v={id}"))
+                    .await;
             }
         }
-        let query = format!("ytsearch1:{}", media.track_search_query());
-        debug!(?query, "searching YouTube for track");
-        let video = self
-            .dump_json(&query)
-            .await?;
-        // Search is a last resort, so it has to be held to a higher bar than
-        // "YouTube returned something". Serving a live version, a cover, or an
-        // unrelated song is worse than reporting the track unavailable.
-        if !youtube_search_matches(
-            &media.title,
-            media
-                .artist_name()
-                .as_deref(),
-            media.runtime,
-            CandidateArtist {
-                title: video
-                    .title
-                    .as_deref(),
-                uploader: video
-                    .uploader
-                    .as_deref(),
-                channel: video
-                    .channel
-                    .as_deref(),
-                artist: video
-                    .artist
-                    .as_deref(),
-            },
-            video.duration,
-        ) {
-            return Err(anyhow!(
-                "yt-dlp search hit {:?} does not match {:?}",
-                video.title,
-                media.title
-            ));
-        }
-        video
-            .webpage_url
-            .ok_or_else(|| anyhow!("yt-dlp search returned no webpage_url for query"))
+        let query = format!("ytsearch3:{}", media.track_search_query());
+        // One extraction supplies both identity evidence and negotiated formats.
+        // Reject a bad first result without discarding later exact recordings.
+        self.dump_videos(&query)
+            .await?
+            .into_iter()
+            .find(|video| {
+                youtube_search_matches(
+                    &media.title,
+                    media.artist_name(),
+                    media.runtime,
+                    CandidateArtist {
+                        title: video
+                            .title
+                            .as_deref(),
+                        uploader: video
+                            .uploader
+                            .as_deref(),
+                        channel: video
+                            .channel
+                            .as_deref(),
+                        artist: video
+                            .artist
+                            .as_deref(),
+                    },
+                    video.duration,
+                )
+            })
+            .ok_or_else(|| super::RecordingUnavailable.into())
     }
 
     async fn run_flat_playlist(
@@ -523,6 +522,7 @@ impl YtDlpAddon {
     ) -> Result<YtDlpPlaylist> {
         let limit_str = limit.to_string();
         let output = Command::new(&self.executable)
+            .kill_on_drop(true)
             .hide_console()
             .args([
                 "--dump-single-json",
@@ -535,7 +535,7 @@ impl YtDlpAddon {
             ])
             .args(self.cookies_args())
             .args(self.cache_args())
-            .args(ytdlp_extra_args())
+            .args(&self.extra_args)
             .args(self.bgutil_args())
             .output()
             .await
@@ -588,6 +588,7 @@ impl YtDlpAddon {
             })?;
 
         let output = Command::new(&self.executable)
+            .kill_on_drop(true)
             .hide_console()
             .args([
                 "--dump-json",
@@ -599,7 +600,7 @@ impl YtDlpAddon {
             ])
             .args(self.cookies_args())
             .args(self.cache_args())
-            .args(ytdlp_extra_args())
+            .args(&self.extra_args)
             .args(self.bgutil_args())
             .output()
             .await
@@ -740,6 +741,7 @@ impl YtDlpAddon {
         );
 
         let output = Command::new(&self.executable)
+            .kill_on_drop(true)
             .hide_console()
             .args([
                 "--dump-single-json",
@@ -750,7 +752,7 @@ impl YtDlpAddon {
             ])
             .args(self.cookies_args())
             .args(self.cache_args())
-            .args(ytdlp_extra_args())
+            .args(&self.extra_args)
             .args(self.bgutil_args())
             .output()
             .await
@@ -803,6 +805,7 @@ impl YtDlpAddon {
                 let cookies_args = cookies_args.clone();
                 async move {
                     let output = Command::new(&exe)
+                        .kill_on_drop(true)
                         .hide_console()
                         .args([
                             "--dump-single-json",
@@ -812,7 +815,7 @@ impl YtDlpAddon {
                             &url,
                         ])
                         .args(&cookies_args)
-                        .args(ytdlp_extra_args())
+                        .args(&self.extra_args)
                         .args(self.bgutil_args())
                         .output()
                         .await
@@ -890,12 +893,16 @@ impl YtDlpAddon {
         &self,
         media: &db::Media,
     ) -> Result<Vec<crate::stream::StreamInfo>> {
-        let url = self
-            .resolve_watch_url(media)
-            .await?;
-        let video = self
-            .dump_json(&url)
-            .await?;
+        let video = match self
+            .resolve_video(media)
+            .await
+        {
+            Ok(video) => video,
+            Err(error) if error.is::<super::RecordingUnavailable>() => {
+                return Ok(vec![]);
+            }
+            Err(error) => return Err(error),
+        };
 
         let to_source = |f: &YtDlpFormat| -> crate::stream::StreamInfo {
             let codec = f.normalized_codec();
@@ -1095,9 +1102,7 @@ fn youtube_search_matches(
         let matched = attributed
             .into_iter()
             .flatten()
-            .any(|field| {
-                normalize(field).contains(&artist)
-            });
+            .any(|field| normalize(field).contains(&artist));
         if !artist.is_empty() && !matched {
             return false;
         }
@@ -1158,6 +1163,7 @@ mod tests {
         let addon = YtDlpAddon {
             cookies: None,
             executable: "yt-dlp".into(),
+            extra_args: Vec::new(),
             bgutil_script_path: "".into(),
             cache_dir: "".into(),
         };
@@ -1271,7 +1277,6 @@ mod tests {
             Some(179.0),
         ));
     }
-
 
     fn track(artist_name: Option<&str>, description: Option<&str>) -> db::Media {
         db::Media {

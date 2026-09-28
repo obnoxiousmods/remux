@@ -351,7 +351,7 @@ pub async fn track(
             .to_string()
     });
     let started = Instant::now();
-    let response = next
+    let mut response = next
         .run(req)
         .await;
     if let Some(template) = template {
@@ -366,6 +366,23 @@ pub async fn track(
                 .record(method, &template, elapsed, status);
         }
         if telemetry_enabled {
+            if method == "GET"
+                && response
+                    .status()
+                    .is_success()
+                && (template.starts_with("/audio/") || template.ends_with("/file"))
+            {
+                response = observe_music_body(
+                    response,
+                    state
+                        .ctx
+                        .db
+                        .clone(),
+                    template.clone(),
+                    item_id_from_path(&request_path),
+                    playback_key.clone(),
+                );
+            }
             let latency_ms = elapsed.as_secs_f64() * 1_000.0;
             let slow = latency_ms
                 >= state
@@ -378,10 +395,13 @@ pub async fn track(
                 .config
                 .telemetry_sample_rate
                 .clamp(0.0, 1.0);
-            let sampled = (HEALTHY_SAMPLE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            let sampled = (HEALTHY_SAMPLE_SEQUENCE
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_mul(6181)
                 % 10_000)
                 < (sample_rate * 10_000.0).round() as u64;
-            if failed || slow || sampled {
+            {
+                let retain_detail = failed || slow || sampled;
                 let db = state
                     .ctx
                     .db
@@ -460,7 +480,8 @@ pub async fn track(
                             )
                         })
                     });
-                    let _ = sqlx::query(
+                    if retain_detail {
+                        let _ = sqlx::query(
                         "INSERT INTO telemetry_request_events \
                          (method, route_template, status, latency_ms, sample_reason, device_id, device_name, client_name, client_version, user_id, user_name, item_id, item_name, playback_key, error_category) \
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -482,6 +503,7 @@ pub async fn track(
                     .bind(if failed { Some(format!("http-{status}")) } else { None })
                     .execute(&db)
                     .await;
+                    }
                     let status_class = format!("{}xx", status / 100);
                     let _ = sqlx::query(
                         "INSERT INTO telemetry_hourly_rollups \
@@ -495,7 +517,7 @@ pub async fn track(
                          latency_lt_5000=latency_lt_5000+excluded.latency_lt_5000, latency_lt_10000=latency_lt_10000+excluded.latency_lt_10000, \
                          latency_ge_10000=latency_ge_10000+excluded.latency_ge_10000"
                     ).bind(&template).bind(method).bind(&context.device_name).bind(&context.client_name)
-                     .bind(&user_name).bind(&item_name).bind(status_class).bind(reason)
+                     .bind(&user_name).bind(&item_name).bind(status_class).bind("complete")
                      .bind(if failed { 1_i64 } else { 0_i64 }).bind(latency_ms).bind(latency_ms)
                      .bind(i64::from(latency_ms < 100.0)).bind(i64::from((100.0..500.0).contains(&latency_ms)))
                      .bind(i64::from((500.0..1000.0).contains(&latency_ms))).bind(i64::from((1000.0..2500.0).contains(&latency_ms)))
@@ -534,6 +556,114 @@ pub async fn track(
         }
     }
     response
+}
+
+/// Headers being accepted is not evidence that the client received the body.
+/// This observes server delivery only; client listening completion is separate.
+struct MusicBodyObservation {
+    db: sqlx::SqlitePool,
+    route: String,
+    item: Option<String>,
+    key: String,
+    started: Instant,
+    expected: Option<u64>,
+    bytes: u64,
+    outcome: &'static str,
+}
+impl Drop for MusicBodyObservation {
+    fn drop(&mut self) {
+        let elapsed_ms = self
+            .started
+            .elapsed()
+            .as_secs_f64()
+            * 1000.0;
+        let details = serde_json::json!({"route": self.route, "bytes": self.bytes,
+            "expected_bytes": self.expected, "outcome": self.outcome, "source": "server-body"}).to_string();
+        let db = self
+            .db
+            .clone();
+        let item = self
+            .item
+            .clone();
+        let key = self
+            .key
+            .clone();
+        let outcome = self.outcome;
+        tracing::info!(item_id = ?item, bytes = self.bytes, expected_bytes = ?self.expected, outcome, elapsed_ms, "music response body ended");
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = sqlx::query("INSERT INTO telemetry_playback_events (playback_key,event,elapsed_ms,item_id,error_category,details_json) VALUES (?, 'server-body-ended', ?, ?, ?, ?)")
+                    .bind(key).bind(elapsed_ms).bind(item)
+                    .bind(if outcome == "complete" { None } else { Some(outcome) }).bind(details).execute(&db).await;
+            });
+        }
+    }
+}
+fn observe_music_body(
+    response: Response,
+    db: sqlx::SqlitePool,
+    route: String,
+    item: Option<String>,
+    key: Option<String>,
+) -> Response {
+    use futures_util::StreamExt;
+    use http_body::Body as _;
+    let mut response = response;
+    // Preserve fixed-size response framing when wrapping a String/Bytes body.
+    // Losing its size hint turns playlists into chunked responses and can make
+    // strict HLS demuxers treat the end of a finished playlist as an I/O error.
+    if !response
+        .headers()
+        .contains_key(axum::http::header::CONTENT_LENGTH)
+        && let Some(length) = response
+            .body()
+            .size_hint()
+            .exact()
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_LENGTH, length.into());
+    }
+    let expected = response
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|h| {
+            h.to_str()
+                .ok()
+        })
+        .and_then(|s| {
+            s.parse()
+                .ok()
+        });
+    let observation = MusicBodyObservation {
+        db,
+        route,
+        item,
+        key: key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        started: Instant::now(),
+        expected,
+        bytes: 0,
+        outcome: "cancelled",
+    };
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::stream! {
+        // Move the whole Drop guard into the generator, rather than allowing
+        // disjoint capture of just its counters and dropping it at headers.
+        let mut observation = observation;
+        let mut data = body.into_data_stream();
+        while let Some(chunk) = data.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    observation.bytes += bytes.len() as u64;
+                    if observation.expected == Some(observation.bytes) { observation.outcome = "complete"; }
+                    yield Ok::<_, axum::Error>(bytes);
+                }
+                Err(error) => { observation.outcome = "body-error"; yield Err(error); return; }
+            }
+        }
+        observation.outcome = if observation.expected.is_none_or(|n| n == observation.bytes) { "complete" } else { "truncated" };
+    };
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
 /// Retention is deliberately opportunistic and hourly: no extra scheduler is
@@ -791,6 +921,63 @@ pub fn perf_span(name: &'static str) -> PerfSpan {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn body_observations_distinguish_delivery_failure_and_cancellation() {
+        use futures_util::StreamExt;
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE telemetry_playback_events (playback_key TEXT, event TEXT, elapsed_ms REAL, item_id TEXT, error_category TEXT, details_json TEXT)").execute(&db).await.unwrap();
+        for expected in ["complete", "body-error", "cancelled"] {
+            let body = match expected {
+                "complete" => axum::body::Body::from("abc"),
+                "body-error" => {
+                    axum::body::Body::from_stream(futures_util::stream::iter(vec![
+                        Err::<bytes::Bytes, _>(std::io::Error::other("fixture")),
+                    ]))
+                }
+                _ => axum::body::Body::from_stream(
+                    futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"a"))
+                    })
+                    .chain(futures_util::stream::pending()),
+                ),
+            };
+            let response = super::observe_music_body(
+                axum::response::Response::new(body),
+                db.clone(),
+                "/audio/{id}/stream".into(),
+                None,
+                Some(expected.into()),
+            );
+            if expected == "cancelled" {
+                let mut stream = response
+                    .into_body()
+                    .into_data_stream();
+                assert!(
+                    stream
+                        .next()
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+                drop(stream);
+            } else {
+                let _ = axum::body::to_bytes(response.into_body(), 100).await;
+            }
+            let details = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(value) = sqlx::query_scalar::<_, String>("SELECT details_json FROM telemetry_playback_events WHERE playback_key = ?").bind(expected).fetch_optional(&db).await.unwrap() { break value; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            let details: serde_json::Value = serde_json::from_str(&details).unwrap();
+            assert_eq!(details["outcome"], expected);
+        }
+    }
+
     use super::*;
     use std::time::Duration;
 

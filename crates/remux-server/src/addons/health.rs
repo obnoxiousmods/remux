@@ -31,6 +31,7 @@ const MAX_OPEN: Duration = Duration::from_secs(15 * 60);
 /// What one resolution attempt produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
+    Cancelled,
     /// Returned usable streams.
     Ok,
     /// Answered correctly with nothing to offer.
@@ -59,11 +60,17 @@ pub enum Gate {
 #[derive(Debug, Clone, Default)]
 pub struct AddonHealth {
     consecutive_failures: u32,
+    pub(crate) probe_in_flight: bool,
     open_until: Option<Instant>,
 }
 
 impl AddonHealth {
     pub fn gate(&self, now: Instant) -> Gate {
+        if self.probe_in_flight {
+            return Gate::Skip {
+                retry_in: Duration::from_secs(1),
+            };
+        }
         match self.open_until {
             Some(until) if until > now => Gate::Skip {
                 retry_in: until - now,
@@ -75,6 +82,7 @@ impl AddonHealth {
 
     pub fn record(&mut self, outcome: Outcome, now: Instant) {
         match outcome {
+            Outcome::Cancelled => {}
             Outcome::Ok | Outcome::Empty => {
                 self.consecutive_failures = 0;
                 self.open_until = None;

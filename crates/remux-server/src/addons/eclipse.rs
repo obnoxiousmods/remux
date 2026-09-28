@@ -25,14 +25,18 @@ struct EclipseTrack {
     id: String,
     title: String,
     artist: String,
+    #[serde(default)]
     album: String,
-    duration: i64,
+    duration: Option<i64>,
 }
 
 #[derive(Deserialize)]
 struct EclipseStreamResponse {
     url: String,
+    #[serde(default)]
     quality: String,
+    #[serde(default, rename = "expiresAt")]
+    expires_at: Option<serde_json::Value>,
 }
 
 /// Some Eclipse-compatible resolvers occasionally prefix an absolute media URL
@@ -190,6 +194,38 @@ impl AddonPreset for SpotiFLACPreset {
     }
 }
 
+/// Any operator-supplied Eclipse-compatible resolver uses the same verified
+/// playback path; no service is implicitly trusted or enabled by this preset.
+pub struct EclipsePreset;
+inventory::submit! { AddonPresetRegistration(|| Box::new(EclipsePreset)) }
+impl AddonPreset for EclipsePreset {
+    fn id(&self) -> &'static str {
+        "eclipse"
+    }
+    fn metadata(&self) -> AddonMetadata {
+        AddonMetadata {
+            id: "eclipse".into(), display_name: "Eclipse-compatible music source".into(),
+            description: "Resolve music from a configured Eclipse manifest; complete audio is verified before playback.".into(),
+            icon: None,
+            supported_resources: vec![AddonMetadata::simple_resource(ResourceType::Stream)],
+            supported_types: vec![MediaKind::Track],
+            supported_resources_user: vec![ResourceType::Stream],
+            supported_types_user: vec![MediaKind::Track],
+            options: vec![AddonOption { id: "manifest_url".into(), name: "Manifest URL".into(),
+                description: Some("An accessible Eclipse-compatible music manifest.".into()), required: true,
+                default: None, kind: AddonOptionType::Url }],
+        }
+    }
+    fn from_cfg(
+        &self,
+        _id: Uuid,
+        cfg: &serde_json::Value,
+        config: &crate::Config,
+    ) -> Result<AddonCapabilities> {
+        eclipse_from_cfg("", cfg, config)
+    }
+}
+
 pub struct EclipseAddon {
     manifest_url: StremioManifestUrl,
     client: reqwest::Client,
@@ -247,44 +283,62 @@ impl StreamAddon for EclipseAddon {
     }
 }
 
-/// Bounds concurrent requests to the stream-resolver worker.
-///
-/// Most tracks carry no stored source and are resolved live through an external
-/// worker that rate-limits (HTTP 429) under load. When a client opens a full
-/// album or queue, remux would otherwise fire many resolutions at once and
-/// self-inflict 429s that surface to the client as playback failures (Finamp
-/// reports these as `-1008 resource unavailable`). Capping in-flight worker
-/// requests keeps resolution under the worker's limit while retaining useful
-/// parallelism. Mirrors the `DB_WRITE_SEMAPHORE` pattern in the db layer.
+/// One gate per resolver origin. Accounts on an origin share its server limit;
+/// independent providers do not block each other. Tokens never enter logs.
+#[derive(Default)]
+struct WorkerGate {
+    next: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+}
+static WORKER_GATES: std::sync::LazyLock<dashmap::DashMap<String, Arc<WorkerGate>>> =
+    std::sync::LazyLock::new(Default::default);
 static WORKER_CONCURRENCY: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 
-/// Space request starts across all tracks. A concurrency cap alone still lets
-/// a large offline playlist sustain enough requests per second to exhaust the
-/// worker's rolling rate limit.
-static WORKER_RATE_GATE: std::sync::LazyLock<tokio::sync::Mutex<tokio::time::Instant>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(tokio::time::Instant::now()));
-
-async fn wait_for_worker_slot() {
-    const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
-    let mut next = WORKER_RATE_GATE
-        .lock()
-        .await;
-    let now = tokio::time::Instant::now();
-    if *next > now {
-        tokio::time::sleep_until(*next).await;
+impl WorkerGate {
+    async fn wait(&self) {
+        loop {
+            let mut next = self
+                .next
+                .lock()
+                .await;
+            let now = tokio::time::Instant::now();
+            if let Some(when) = *next
+                && when > now
+            {
+                drop(next);
+                tokio::time::sleep_until(when).await;
+                continue;
+            }
+            *next = Some(now + std::time::Duration::from_millis(750));
+            return;
+        }
     }
-    *next = tokio::time::Instant::now() + MIN_INTERVAL;
+    async fn defer(&self, delay: std::time::Duration) {
+        let until = tokio::time::Instant::now() + delay;
+        let mut next = self
+            .next
+            .lock()
+            .await;
+        *next = Some(next.map_or(until, |previous| previous.max(until)));
+    }
 }
 
-/// GET and decode a JSON document from the resolver worker with bounded
-/// concurrency and transient-failure retries.
-///
-/// 429 rate-limits and network blips are retried with exponential backoff and
-/// jitter (via the shared `retry!` helper) instead of bubbling straight up as a
-/// hard error — the previous behaviour turned a transient 429 into a permanent
-/// "no source", which the caller swallowed and served to the client as a 500 /
-/// Finamp `-1008`.
+fn retry_after(
+    value: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
+    if let Ok(seconds) = value
+        .trim()
+        .parse::<u64>()
+    {
+        return Some(std::time::Duration::from_secs(seconds.min(86400)));
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(std::time::Duration::from_secs(
+        (date.timestamp() - now.timestamp()).clamp(0, 86400) as u64,
+    ))
+}
+
 /// Whether a failed worker response is worth another attempt.
 ///
 /// Retrying a permanent answer is not merely wasteful, it is the difference
@@ -298,48 +352,73 @@ fn is_retryable(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
-const WORKER_ATTEMPTS: u32 = 5;
-const WORKER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+const WORKER_ATTEMPTS: u32 = 2;
 
 async fn worker_get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<T> {
-    let _permit = WORKER_CONCURRENCY
-        .acquire()
-        .await
-        .expect("worker concurrency semaphore is never closed");
-
-    let mut last_err = None;
-    for attempt in 0..WORKER_ATTEMPTS {
-        wait_for_worker_slot().await;
-        match client
-            .get(url)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    return resp
-                        .json::<T>()
-                        .await
-                        .map_err(Into::into);
+    let parsed = reqwest::Url::parse(url)?;
+    let origin = parsed
+        .origin()
+        .ascii_serialization();
+    let gate = WORKER_GATES
+        .entry(origin.clone())
+        .or_default()
+        .clone();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    tokio::time::timeout_at(deadline, async {
+        for attempt in 0..WORKER_ATTEMPTS {
+            let permit = WORKER_CONCURRENCY.acquire().await?;
+            gate.wait().await;
+            let response = client.get(url).send().await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    drop(permit);
+                    if attempt + 1 == WORKER_ATTEMPTS { return Err(error.without_url().into()); }
+                    gate.defer(std::time::Duration::from_millis(1500)).await;
+                    continue;
                 }
-                if !is_retryable(status) {
-                    // Permanent: a deleted worker, a revoked manifest token, a
-                    // track the provider does not carry. Say so immediately.
-                    return Err(anyhow!("worker responded {status}"));
-                }
-                last_err = Some(anyhow!("worker responded {status}"));
+            };
+            let status = response.status();
+            if status.is_success() { return response.json::<T>().await.map_err(|e| e.without_url().into()); }
+            let delay = response.headers().get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()).and_then(|v| retry_after(v, chrono::Utc::now()))
+                .unwrap_or(std::time::Duration::from_millis(1500));
+            drop(response);
+            drop(permit);
+            if is_retryable(status) {
+                gate.defer(delay).await;
+                tracing::warn!(%origin, status = status.as_u16(), retry_after_ms = delay.as_millis(), "music resolver cooldown");
             }
-            Err(e) => last_err = Some(e.into()),
+            if !is_retryable(status) || attempt + 1 == WORKER_ATTEMPTS {
+                return Err(anyhow!("music resolver responded {status}"));
+            }
         }
-        if attempt + 1 < WORKER_ATTEMPTS {
-            tokio::time::sleep(WORKER_RETRY_DELAY * (1 << attempt.min(10))).await;
+        unreachable!("attempt count is nonzero")
+    }).await.map_err(|_| anyhow!("music resolver deadline exceeded"))?
+}
+
+fn matches_recording(
+    media: &db::Media,
+    artist: Option<&str>,
+    track: &EclipseTrack,
+) -> bool {
+    let normalize = super::opendal::normalize_music_identity;
+    let title = normalize(&media.title);
+    !title.is_empty()
+        && normalize(&track.title) == title
+        && artist.is_some_and(|artist| {
+            !normalize(artist).is_empty()
+                && normalize(artist) == normalize(&track.artist)
+        })
+        && match (media.runtime, track.duration) {
+            (Some(expected), Some(actual)) if expected > 0 => {
+                (expected - actual).abs() <= 5
+            }
+            _ => true,
         }
-    }
-    Err(last_err.expect("at least one attempt is always made"))
 }
 
 async fn eclipse_streams(
@@ -371,21 +450,18 @@ async fn eclipse_streams(
         return Ok(vec![]);
     }
 
-    // Pick the first result whose title matches (case-insensitive), else fall back to first.
-    let title_lower = media
-        .title
-        .to_lowercase();
-    let track = resp
+    let artist = media
+        .artist_name()
+        .or(gp_title.as_deref());
+    let Some(track) = resp
         .tracks
         .iter()
-        .find(|t| {
-            t.title
-                .to_lowercase()
-                == title_lower
-        })
-        .unwrap_or(&resp.tracks[0]);
+        .find(|track| matches_recording(media, artist.as_deref(), track))
+    else {
+        return Ok(vec![]);
+    };
 
-    let stream_url = format!("{}/stream/{}", base_url, track.id);
+    let stream_url = format!("{}/stream/{}", base_url, urlencoding::encode(&track.id));
     let stream_resp: EclipseStreamResponse =
         worker_get_json(client, &stream_url).await?;
 
@@ -393,7 +469,25 @@ async fn eclipse_streams(
         descriptor: StreamDescriptor::http(normalize_stream_url(&stream_resp.url)),
         name: Some(format!("Eclipse · {}", stream_resp.quality)),
         description: Some(format!("{} · {}", track.artist, track.album)),
-        duration: Some(track.duration),
+        duration: track.duration,
+        valid_until: stream_resp
+            .expires_at
+            .and_then(|value| {
+                value
+                    .as_i64()
+                    .and_then(|n| {
+                        chrono::DateTime::from_timestamp(
+                            if n > 10_000_000_000 { n / 1000 } else { n },
+                            0,
+                        )
+                    })
+                    .or_else(|| {
+                        value
+                            .as_str()
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|d| d.with_timezone(&chrono::Utc))
+                    })
+            }),
         ..Default::default()
     }])
 }
@@ -402,6 +496,101 @@ async fn eclipse_streams(
 mod tests {
     use super::{is_retryable, normalize_stream_url};
     use reqwest::StatusCode;
+
+    #[test]
+    fn retry_after_supports_seconds_and_http_dates() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-27T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            super::retry_after("120", now)
+                .unwrap()
+                .as_secs(),
+            120
+        );
+        assert_eq!(
+            super::retry_after("Sun, 27 Sep 2026 00:02:00 GMT", now)
+                .unwrap()
+                .as_secs(),
+            120
+        );
+        assert_eq!(
+            super::retry_after("Sat, 26 Sep 2026 00:00:00 GMT", now)
+                .unwrap()
+                .as_secs(),
+            0
+        );
+        assert!(super::retry_after("invalid", now).is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_429_cooldown_is_observed_before_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!(
+            "http://{}/search",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let mut starts = Vec::new();
+            for response in [
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            ] {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                let mut buf = [0; 4096];
+                socket
+                    .read(&mut buf)
+                    .await
+                    .unwrap();
+                starts.push(std::time::Instant::now());
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+            starts[1].duration_since(starts[0])
+        });
+        let _: serde_json::Value =
+            super::worker_get_json(&reqwest::Client::new(), &url)
+                .await
+                .unwrap();
+        assert!(
+            server
+                .await
+                .unwrap()
+                >= std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn eclipse_optional_metadata_and_exact_recording_identity() {
+        let track: super::EclipseTrack =
+            serde_json::from_str(r#"{"id":"123","title":"Song","artist":"Artist"}"#)
+                .unwrap();
+        let mut media = crate::db::Media {
+            title: "Song".into(),
+            runtime: Some(200),
+            ..Default::default()
+        };
+        assert!(super::matches_recording(&media, Some("Artist"), &track));
+        assert!(!super::matches_recording(
+            &media,
+            Some("Cover Artist"),
+            &track
+        ));
+        media.title = "Other song".into();
+        assert!(!super::matches_recording(&media, Some("Artist"), &track));
+        let _: super::EclipseStreamResponse =
+            serde_json::from_str(r#"{"url":"https://example.org/audio"}"#).unwrap();
+    }
 
     #[test]
     fn permanent_worker_answers_are_not_retried() {

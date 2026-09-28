@@ -20,6 +20,7 @@ pub async fn stream_proxy(
     headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    session: std::result::Result<db::auth::AuthSession, axum_anyhow::ApiError>,
 ) -> Result<impl IntoResponse> {
     let media = db::Media::get_by_id(
         &state
@@ -30,6 +31,21 @@ pub async fn stream_proxy(
     .await?
     .context_not_found("not found")?;
 
+    if let Some(owner) = media
+        .stream_info
+        .as_ref()
+        .and_then(|info| info.access_user_id)
+    {
+        let session = session?;
+        if session
+            .user
+            .id
+            != owner
+        {
+            return Err(anyhow::anyhow!("music source belongs to another user"))
+                .context_not_found("not found");
+        }
+    }
     let descriptor = media
         .stream_info
         .map(|si| si.descriptor)

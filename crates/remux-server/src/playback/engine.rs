@@ -723,6 +723,7 @@ fn cumulative_segment_ticks(
 /// Parameters for starting a new HLS transcode job.
 #[derive(Debug, Clone)]
 pub struct TranscodeParams {
+    pub audio_sample_rate: Option<u32>,
     pub input_url: String,
     pub output_dir: PathBuf,
     pub video_codec: String, // "copy", "libx264", "libx265"
@@ -801,6 +802,7 @@ pub struct TranscodeParams {
 impl Default for TranscodeParams {
     fn default() -> Self {
         Self {
+            audio_sample_rate: None,
             input_url: String::new(),
             output_dir: PathBuf::new(),
             video_codec: "copy".to_string(),
@@ -1164,7 +1166,80 @@ fn append_http_input_options(args: &mut Vec<String>, input: &str) {
 }
 
 /// Build the ffmpeg CLI args for an HLS transcode.
+fn build_audio_hls_args(params: &TranscodeParams) -> Vec<String> {
+    let mut args = vec!["-nostdin".into(), "-v".into(), "error".into()];
+    append_http_input_options(&mut args, &params.input_url);
+    if let Some(ticks) = params
+        .start_time_ticks
+        .filter(|t| *t > 0)
+    {
+        args.extend(["-ss".into(), format!("{:.7}", ticks as f64 / 10_000_000.0)]);
+    }
+    args.extend([
+        "-i".into(),
+        params
+            .input_url
+            .clone(),
+        "-map".into(),
+        params
+            .audio_stream_index
+            .map(|i| format!("0:{i}"))
+            .unwrap_or_else(|| "0:a:0".into()),
+        "-vn".into(),
+        "-sn".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        params
+            .audio_bitrate
+            .unwrap_or(192000)
+            .clamp(16000, 512000)
+            .to_string(),
+        "-ac".into(),
+        params
+            .audio_channels
+            .unwrap_or(2)
+            .clamp(1, 2)
+            .to_string(),
+        "-ar".into(),
+        params
+            .audio_sample_rate
+            .unwrap_or(44100)
+            .to_string(),
+        "-f".into(),
+        "hls".into(),
+        "-hls_time".into(),
+        params
+            .segment_length
+            .clamp(1, 10)
+            .to_string(),
+        "-start_number".into(),
+        params
+            .hls_start_number
+            .to_string(),
+        "-hls_segment_filename".into(),
+        params
+            .output_dir
+            .join("segment_%05d.ts")
+            .to_string_lossy()
+            .into_owned(),
+        "-hls_playlist_type".into(),
+        "event".into(),
+        "-hls_list_size".into(),
+        "0".into(),
+        params
+            .output_dir
+            .join("main.m3u8")
+            .to_string_lossy()
+            .into_owned(),
+    ]);
+    args
+}
+
 pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
+    if params.video_codec == "none" {
+        return build_audio_hls_args(params);
+    }
     let accel = params.hardware_acceleration_type;
     let is_hw = !matches!(accel, HardwareAccelerationType::None);
     let hdr = is_hdr(
@@ -2254,6 +2329,7 @@ pub async fn start_transcode(
 /// Parameters for a progressive (non-HLS) transcode that streams to stdout.
 #[derive(Debug, Clone)]
 pub struct ProgressiveTranscodeParams {
+    pub audio_sample_rate: Option<u32>,
     pub input_url: String,
     pub container: String, // "mp4", "ts", "mkv", "webm"
     /// Emit only the selected/default audio stream. Used by Jellyfin's
@@ -2443,6 +2519,7 @@ pub(crate) fn build_progressive_args(
             Some(build_qsv_scale_filter(params.max_width, params.max_height))
         } else {
             let tp = TranscodeParams {
+                audio_sample_rate: None,
                 max_width: params.max_width,
                 max_height: params.max_height,
                 ..Default::default()
@@ -2693,6 +2770,9 @@ pub(crate) fn build_progressive_args(
         if let Some(bitrate) = params.audio_bitrate {
             args.extend(["-b:a".into(), bitrate.to_string()]);
         }
+        if let Some(rate) = params.audio_sample_rate {
+            args.extend(["-ar".into(), rate.to_string()]);
+        }
         if let Some(ch) = params.audio_channels {
             args.extend(["-ac".into(), ch.to_string()]);
         }
@@ -2812,6 +2892,7 @@ pub fn generate_variant_playlist(
     let runtime_ticks = session.runtime_ticks;
     let segment_length = session.segment_length;
     let play_session_id = &session.id;
+
     let start_time_secs = session.start_time_secs;
     let use_fmp4 = session.use_fmp4();
     // fMP4 segments require HLS version 7; standard TS segments need version 6.
@@ -2926,6 +3007,13 @@ fn hevc_hls_codec_string(profile: Option<&str>, level: Option<f64>) -> String {
 
 /// Generate a master HLS playlist that references the variant playlist.
 pub fn generate_master_playlist(session: &TranscodeSession) -> String {
+    if session.video_codec == "none" {
+        return format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=560000,CODECS=\"mp4a.40.2\"\nmain.m3u8?PlaySessionId={}\n",
+            session.id
+        );
+    }
+
     use remux_sdks::remux::VideoRangeType;
 
     let play_session_id = &session.id;
@@ -3418,6 +3506,7 @@ mod tests {
 
     fn default_hls(output_dir: PathBuf) -> TranscodeParams {
         TranscodeParams {
+            audio_sample_rate: None,
             input_url: "http://localhost/test.mkv".into(),
             output_dir,
             ..Default::default()
@@ -3426,6 +3515,7 @@ mod tests {
 
     fn default_progressive() -> ProgressiveTranscodeParams {
         ProgressiveTranscodeParams {
+            audio_sample_rate: None,
             input_url: "http://localhost/test.mkv".into(),
             container: "mp4".into(),
             audio_only: false,
@@ -3490,6 +3580,7 @@ mod tests {
     fn hls_hevc_copy_uses_fmp4() {
         let dir = PathBuf::from("/tmp/test_hevc");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "copy".into(),
             source_video_codec: Some("hevc".into()),
             ..default_hls(dir)
@@ -3518,6 +3609,7 @@ mod tests {
     fn hls_hevc_dovi_copy_strips_rpu() {
         let dir = PathBuf::from("/tmp/test_hevc_dovi");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "copy".into(),
             source_video_codec: Some("hevc".into()),
             source_video_range_type: Some(VideoRangeType::DoviWithHdr10),
@@ -3535,6 +3627,7 @@ mod tests {
     fn hls_aac_copy_adds_adtstoasc() {
         let dir = PathBuf::from("/tmp/test_aac_copy");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             audio_codec: "copy".into(),
             source_audio_codec: Some("aac".into()),
             ..default_hls(dir)
@@ -3550,6 +3643,7 @@ mod tests {
     fn hls_aac_transcode_no_adtstoasc() {
         let dir = PathBuf::from("/tmp/test_aac_transcode");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             audio_codec: "aac".into(),
             source_audio_codec: Some("aac".into()),
             ..default_hls(dir)
@@ -3566,6 +3660,7 @@ mod tests {
     fn hls_non_aac_copy_no_adtstoasc() {
         let dir = PathBuf::from("/tmp/test_ac3_copy");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             audio_codec: "copy".into(),
             source_audio_codec: Some("ac3".into()),
             ..default_hls(dir)
@@ -3583,6 +3678,7 @@ mod tests {
         // "hvc1" codec string should also trigger fMP4 path
         let dir = PathBuf::from("/tmp/test_hvc1");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "copy".into(),
             source_video_codec: Some("hvc1".into()),
             ..default_hls(dir)
@@ -3595,6 +3691,7 @@ mod tests {
     fn hls_libx264_transcode_flags() {
         let dir = PathBuf::from("/tmp/test_x264");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             ..default_hls(dir)
         });
@@ -3611,6 +3708,7 @@ mod tests {
     fn hls_libx264_custom_preset_and_bitrate() {
         let dir = PathBuf::from("/tmp/test_x264_br");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             encoding_preset: Some(EncodingPreset::Veryfast),
             video_bitrate: Some(4_000_000),
@@ -3629,6 +3727,7 @@ mod tests {
             .to_ticks(TickUnit::Seconds)
             .unwrap();
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             start_time_ticks: Some(ticks),
             ..default_hls(dir)
         });
@@ -3664,6 +3763,7 @@ mod tests {
         // opener is short.
         let dir = PathBuf::from("/tmp/test_firstseg_enc");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             first_segment_length_secs: Some(2),
             ..default_hls(dir)
@@ -3677,6 +3777,7 @@ mod tests {
         // so the whole stream runs at the short cadence.
         let dir = PathBuf::from("/tmp/test_firstseg_copy");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "copy".into(),
             first_segment_length_secs: Some(2),
             ..default_hls(dir)
@@ -3731,6 +3832,7 @@ mod tests {
     fn trusted_probe_data_reduces_ffmpeg_analysis_budget() {
         let dir = PathBuf::from("/tmp/test_trusted_probe");
         let trusted = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             trusted_probe_data: true,
             ..default_hls(dir.clone())
         });
@@ -3754,6 +3856,7 @@ mod tests {
             .to_ticks(TickUnit::Seconds)
             .unwrap();
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             start_time_ticks: Some(ticks),
             hls_start_number: 22,
             ..default_hls(dir)
@@ -3766,6 +3869,7 @@ mod tests {
     #[test]
     fn resumed_vod_playlist_advertises_start_offset_and_full_seek_map() {
         let session = TranscodeSession {
+            audio_sample_rate: None,
             id: "play-session".into(),
             item_id: Uuid::nil(),
             media_source_id: Uuid::nil(),
@@ -3820,6 +3924,7 @@ mod tests {
     fn hls_scale_filter_both_dimensions() {
         let dir = PathBuf::from("/tmp/test_scale");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             max_width: Some(1920),
             max_height: Some(1080),
@@ -3839,6 +3944,7 @@ mod tests {
     fn hls_scale_filter_width_only() {
         let dir = PathBuf::from("/tmp/test_scale_w");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             max_width: Some(1280),
             ..default_hls(dir)
@@ -3852,6 +3958,7 @@ mod tests {
     fn hls_audio_bitrate_and_channels() {
         let dir = PathBuf::from("/tmp/test_audio");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             audio_bitrate: Some(192_000),
             audio_channels: Some(2),
             ..default_hls(dir)
@@ -3865,6 +3972,7 @@ mod tests {
     fn hls_audio_copy_no_bitrate_flags() {
         let dir = PathBuf::from("/tmp/test_acopy");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             audio_codec: "copy".into(),
             ..default_hls(dir)
         });
@@ -3883,6 +3991,7 @@ mod tests {
     fn hls_subtitle_burn_forces_reencode_and_filter_complex() {
         let dir = PathBuf::from("/tmp/test_sub");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "copy".into(),
             burn_subtitle: true,
             subtitle_stream_index: Some(2),
@@ -3909,6 +4018,7 @@ mod tests {
     fn hls_subtitle_burn_with_scale_in_filter_complex() {
         let dir = PathBuf::from("/tmp/test_sub_scale");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             burn_subtitle: true,
             subtitle_stream_index: Some(3),
@@ -3930,6 +4040,7 @@ mod tests {
     fn hls_nvenc_hardware_accel() {
         let dir = PathBuf::from("/tmp/test_nvenc");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             hardware_acceleration_type: HardwareAccelerationType::Nvenc,
             source_frame_rate: Some(23.976_025),
@@ -3972,6 +4083,7 @@ mod tests {
     fn hls_nvenc_uses_safe_gop_when_remote_frame_rate_is_missing_or_invalid() {
         for frame_rate in [None, Some(0.0), Some(f32::NAN), Some(241.0)] {
             let args = build_hls_args(&TranscodeParams {
+                audio_sample_rate: None,
                 video_codec: "libx264".into(),
                 hardware_acceleration_type: HardwareAccelerationType::Nvenc,
                 source_frame_rate: frame_rate,
@@ -3988,6 +4100,7 @@ mod tests {
     fn hls_non_nvenc_paths_do_not_receive_nvenc_only_gop_flags() {
         for video_codec in ["copy", "libx264"] {
             let args = build_hls_args(&TranscodeParams {
+                audio_sample_rate: None,
                 video_codec: video_codec.into(),
                 source_frame_rate: Some(60.0),
                 ..default_hls(PathBuf::from("/tmp/test_non_nvenc_gop"))
@@ -4002,6 +4115,7 @@ mod tests {
     #[test]
     fn hls_nvenc_hdr_uses_gpu_native_tonemap() {
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             hardware_acceleration_type: HardwareAccelerationType::Nvenc,
             source_video_range_type: Some(VideoRangeType::Hdr10),
@@ -4018,6 +4132,7 @@ mod tests {
     fn hls_resumed_transcode_uses_accurate_seek() {
         let dir = PathBuf::from("/tmp/test_resumed_transcode_seek");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             start_time_ticks: Some(10_340_000_000),
             ..default_hls(dir)
@@ -4042,11 +4157,13 @@ mod tests {
     #[test]
     fn hls_transcode_forces_segment_keyframes_but_stream_copy_does_not() {
         let encoded = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             segment_length: 4,
             ..default_hls(PathBuf::from("/tmp/test_encoded_keyframes"))
         });
         let copied = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "copy".into(),
             segment_length: 4,
             ..default_hls(PathBuf::from("/tmp/test_copied_keyframes"))
@@ -4063,6 +4180,7 @@ mod tests {
     fn hls_stream_copy_retains_source_timestamps() {
         let dir = PathBuf::from("/tmp/test_stream_copy_timestamps");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "copy".into(),
             ..default_hls(dir)
         });
@@ -4077,6 +4195,7 @@ mod tests {
     #[test]
     fn hls_resumed_stream_copy_starts_a_fresh_output_timeline() {
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "copy".into(),
             start_time_ticks: Some(10_340_000_000),
             ..default_hls(PathBuf::from("/tmp/test_resumed_copy_timestamps"))
@@ -4098,6 +4217,7 @@ mod tests {
     fn hls_vaapi_hardware_accel() {
         let dir = PathBuf::from("/tmp/test_vaapi");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             hardware_acceleration_type: HardwareAccelerationType::Vaapi,
             vaapi_device: "/dev/dri/renderD128".into(),
@@ -4133,6 +4253,7 @@ mod tests {
     fn hls_codec_list_defaults_to_h264() {
         let dir = PathBuf::from("/tmp/test_codec_list");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "av1,hevc,vp9,h264".into(),
             ..default_hls(dir)
         });
@@ -4143,6 +4264,7 @@ mod tests {
     fn hls_vaapi_no_driver_omits_driver_option() {
         let dir = PathBuf::from("/tmp/test_vaapi_amd");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             hardware_acceleration_type: HardwareAccelerationType::Vaapi,
             vaapi_device: "/dev/dri/renderD128".into(),
@@ -4166,6 +4288,7 @@ mod tests {
     fn hls_qsv_hardware_accel() {
         let dir = PathBuf::from("/tmp/test_qsv");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             video_codec: "libx264".into(),
             hardware_acceleration_type: HardwareAccelerationType::Qsv,
             vaapi_device: "/dev/dri/renderD128".into(),
@@ -4393,6 +4516,7 @@ mod tests {
     #[test]
     fn hls_local_input_omits_http_only_options() {
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             input_url: "/media/movie.mkv".into(),
             ..default_hls(PathBuf::from("/tmp/hls-local-input"))
         });
@@ -4407,6 +4531,7 @@ mod tests {
     fn hls_loudnorm_added_when_transcoding_audio() {
         let dir = PathBuf::from("/tmp/test_session");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             audio_codec: "aac".into(),
             normalize_audio_loudness: true,
             ..default_hls(dir)
@@ -4418,6 +4543,7 @@ mod tests {
     fn hls_loudnorm_absent_when_disabled() {
         let dir = PathBuf::from("/tmp/test_session");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             audio_codec: "aac".into(),
             normalize_audio_loudness: false,
             ..default_hls(dir)
@@ -4429,6 +4555,7 @@ mod tests {
     fn hls_loudnorm_absent_when_audio_copy() {
         let dir = PathBuf::from("/tmp/test_session");
         let args = build_hls_args(&TranscodeParams {
+            audio_sample_rate: None,
             audio_codec: "copy".into(),
             normalize_audio_loudness: true,
             ..default_hls(dir)

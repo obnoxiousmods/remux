@@ -21,7 +21,7 @@ pub mod ytdlp;
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{FutureExt, Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::{
     pin::Pin,
@@ -148,6 +148,25 @@ where
 /// Resolves one addon's streams, bounded by `timeout`, tagging each result with
 /// its source. An addon that errors or times out contributes nothing rather
 /// than failing the whole resolution.
+#[derive(Debug, thiserror::Error)]
+#[error("provider has no matching recording")]
+pub(crate) struct RecordingUnavailable;
+
+struct ProbeLease {
+    health: Arc<dashmap::DashMap<Uuid, health::AddonHealth>>,
+    id: Uuid,
+}
+impl Drop for ProbeLease {
+    fn drop(&mut self) {
+        if let Some(mut health) = self
+            .health
+            .get_mut(&self.id)
+        {
+            health.probe_in_flight = false;
+        }
+    }
+}
+
 async fn resolve_one(
     runtime: &AddonRuntime,
     media: &db::Media,
@@ -159,15 +178,65 @@ async fn resolve_one(
         .row
         .name;
     let t = Instant::now();
+    let _probe_lease = {
+        let mut health = ctx
+            .addons
+            .health
+            .entry(
+                runtime
+                    .row
+                    .id,
+            )
+            .or_default();
+        match health.gate(t) {
+            health::Gate::Skip { .. } => {
+                return (
+                    vec![],
+                    (
+                        runtime
+                            .row
+                            .id,
+                        health::Outcome::Cancelled,
+                    ),
+                );
+            }
+            health::Gate::Probe => {
+                health.probe_in_flight = true;
+                Some(ProbeLease {
+                    health: ctx
+                        .addons
+                        .health
+                        .clone(),
+                    id: runtime
+                        .row
+                        .id,
+                })
+            }
+            health::Gate::Allow => None,
+        }
+    };
     let id_prefixes = runtime
         .resource_id_prefixes(&ResourceType::Stream)
         .map(|p| p.to_vec());
-    match wait_for_stream_addon(
-        runtime
-            .stream
-            .as_ref()
-            .expect("addons_for only yields addons with a stream capability")
-            .get_streams_for_user(media, ctx, identity, id_prefixes.as_deref()),
+    let (streams, (id, outcome)) = match wait_for_stream_addon(
+        async {
+            let streams = runtime.stream.as_ref().expect("stream addon")
+                .get_streams_for_user(media, ctx, identity, id_prefixes.as_deref()).await?;
+            if media.kind != db::MediaKind::Track { return Ok(streams); }
+            // A resolver hit is not a playable source. Reject stale local paths and
+            // incomplete or undecodable remote objects before declaring a winner.
+            let had_candidates = !streams.is_empty();
+            for mut info in streams.into_iter().take(4) {
+                info.source = Some(name.clone());
+                info.addon_id = Some(runtime.row.id);
+                match crate::services::music_cache::qualify(ctx, media, info, identity.map(|i| i.user_id)).await {
+                    Ok(info) => return Ok(vec![info]),
+                    Err(error) => warn!(addon = %name, item_id = %media.id, %error, "music candidate failed qualification"),
+                }
+            }
+            if had_candidates { return Err(anyhow!("all music candidates failed qualification")); }
+            Ok(vec![])
+        },
         timeout,
     )
     .await
@@ -230,7 +299,14 @@ async fn resolve_one(
                 ),
             )
         }
-    }
+    };
+    // Finish the probe while still holding its lease. Report only once.
+    ctx.addons
+        .health
+        .entry(id)
+        .or_default()
+        .record(outcome, Instant::now());
+    (streams, (id, health::Outcome::Cancelled))
 }
 
 pub use remux_sdks::{
@@ -768,7 +844,8 @@ fn apply_meta(media: &mut db::Media, mut patch: db::Media, replace: bool) {
 
 // ---------------------------------------------------------------------------
 impl From<crate::stream::StreamInfo> for db::Media {
-    fn from(si: crate::stream::StreamInfo) -> Self {
+    fn from(mut si: crate::stream::StreamInfo) -> Self {
+        si.infer_valid_until();
         let title = si
             .name
             .clone()
@@ -1435,15 +1512,31 @@ impl AddonService {
         self.inner
             .load()
             .iter()
-            .find(|r| r.row.id == addon_id && r.row.enabled)
-            .and_then(|r| r.caps.media_tracker.clone())
+            .find(|r| {
+                r.row
+                    .id
+                    == addon_id
+                    && r.row
+                        .enabled
+            })
+            .and_then(|r| {
+                r.caps
+                    .media_tracker
+                    .clone()
+            })
     }
 
     pub fn has_media_tracker(&self) -> bool {
         self.inner
             .load()
             .iter()
-            .any(|r| r.row.enabled && r.caps.media_tracker.is_some())
+            .any(|r| {
+                r.row
+                    .enabled
+                    && r.caps
+                        .media_tracker
+                        .is_some()
+            })
     }
     async fn addons_for<T>(
         &self,
@@ -2777,34 +2870,55 @@ impl AddonService {
             // when the whole current one comes back empty. This is what keeps a
             // locally-available track instant instead of making it wait out the
             // slowest remote resolver in the same tier.
-            let tiers = priority_tiers(
-                addons
-                    .into_iter()
-                    .map(|r| {
-                        (
-                            r.row
-                                .priority,
-                            r,
-                        )
-                    })
-                    .collect(),
-            );
+            let (local, remote): (Vec<_>, Vec<_>) = addons
+                .into_iter()
+                .partition(|r| {
+                    r.row
+                        .preset
+                        .kind
+                        == "opendal-local"
+                });
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_secs(
+                    ctx.config
+                        .music_fallback_stream_addon_timeout_secs,
+                );
             let mut resolved = Vec::new();
-            for (index, tier) in tiers
-                .iter()
-                .enumerate()
-            {
-                let timeout =
-                    stream_addon_timeout(&media.kind, &ctx.config, index == 0);
-                let (streams, reports) = first_non_empty(
-                    tier.iter()
-                        .map(|r| resolve_one(r, media, ctx, identity.as_ref(), timeout))
-                        .collect(),
-                )
-                .await;
-                self.record_health(reports);
-                resolved = streams;
-                if !resolved.is_empty() {
+            for tier in [local, remote] {
+                if tier.is_empty() {
+                    continue;
+                }
+                let identity = identity.as_ref();
+                let jobs: Vec<futures::future::BoxFuture<'_, _>> = tier
+                    .iter()
+                    .enumerate()
+                    .map(|(index, r)| {
+                        async move {
+                            if index == 1 {
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                            }
+                            let remaining = deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            resolve_one(r, media, ctx, identity, remaining).await
+                        }
+                        .boxed()
+                    })
+                    .collect();
+                let mut pending = futures::stream::iter(jobs).buffer_unordered(2);
+                while let Some((streams, report)) = pending
+                    .next()
+                    .await
+                {
+                    self.record_health(vec![report]);
+                    if !streams.is_empty() {
+                        resolved = streams;
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                if !resolved.is_empty() || tokio::time::Instant::now() >= deadline {
                     break;
                 }
             }
@@ -3169,11 +3283,46 @@ impl AddonService {
             user_id.map_or_else(|| "anonymous".to_string(), |id| id.to_string())
         );
 
+        let mut has_usable_track_source = false;
+        if media.kind == db::MediaKind::Track {
+            for source in media
+                .streams(&ctx.db)
+                .await?
+            {
+                if let Some(info) = source
+                    .stream_info
+                    .as_ref()
+                {
+                    if info
+                        .access_user_id
+                        .is_some_and(|owner| Some(owner) != user_id)
+                    {
+                        continue;
+                    }
+                    if let crate::stream::StreamDescriptor::Local(path) =
+                        &info.descriptor
+                    {
+                        if tokio::fs::File::open(path)
+                            .await
+                            .is_ok()
+                        {
+                            has_usable_track_source = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            media.sources = None;
+        }
+        let force_track_refresh =
+            media.kind == db::MediaKind::Track && !has_usable_track_source;
         // Fast path: TTL not expired — skip the lock entirely.
         let is_fresh = |refreshed: Option<chrono::NaiveDateTime>| {
-            refreshed.is_some_and(|r| {
-                (chrono::Utc::now().naive_utc() - r).num_seconds() < STREAMS_TTL_SECS
-            })
+            !force_track_refresh
+                && refreshed.is_some_and(|r| {
+                    (chrono::Utc::now().naive_utc() - r).num_seconds()
+                        < STREAMS_TTL_SECS
+                })
         };
         if is_fresh(media.streams_refreshed_at) {
             return Ok(());
@@ -3202,7 +3351,17 @@ impl AddonService {
         .ok()
         .flatten()
         .flatten();
-        if is_fresh(refreshed_at) {
+        let refreshed_track_usable = if media.kind == db::MediaKind::Track {
+            media.sources = None;
+            media.streams(&ctx.db).await?.iter().any(|source| source.stream_info.as_ref().is_some_and(|info|
+                info.access_user_id.is_none_or(|owner| Some(owner) == user_id)
+                && matches!(&info.descriptor, crate::stream::StreamDescriptor::Local(path) if std::fs::File::open(path).is_ok())
+            ))
+        } else {
+            false
+        };
+        media.sources = None;
+        if is_fresh(refreshed_at) || refreshed_track_usable {
             media.streams_refreshed_at = refreshed_at;
             return Ok(());
         }
@@ -3339,12 +3498,6 @@ impl AddonService {
         }
 
         let now = chrono::Utc::now().naive_utc();
-        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(media.id)
-            .execute(&ctx.db)
-            .await?;
-        media.streams_refreshed_at = Some(now);
         let mut sources: Vec<db::Media> = deduped
             .into_iter()
             .enumerate()
@@ -3418,6 +3571,14 @@ impl AddonService {
 
         let inherited_chapters = inherit_missing_item_chapters(&mut sources);
         db::Media::upsert(&ctx.db, &sources).await?;
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(media.id)
+            .execute(&ctx.db)
+            .await?;
+        media.streams_refreshed_at = Some(now);
+        media.sources = None;
+
         if probe_version_count > 0 {
             info!(
                 probe_versions = probe_version_count,
@@ -3651,6 +3812,38 @@ pub fn make_media_id(addon_id: Uuid, local_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelled_half_open_probe_releases_lease() {
+        let health = std::sync::Arc::new(dashmap::DashMap::new());
+        let id = uuid::Uuid::new_v4();
+        let mut state = super::health::AddonHealth::default();
+        state.probe_in_flight = true;
+        health.insert(id, state);
+        let lease = super::ProbeLease {
+            health: health.clone(),
+            id,
+        };
+        assert!(matches!(
+            health
+                .get(&id)
+                .unwrap()
+                .gate(std::time::Instant::now()),
+            super::health::Gate::Skip { .. }
+        ));
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        let _ = task.await;
+        assert!(
+            !health
+                .get(&id)
+                .unwrap()
+                .probe_in_flight
+        );
+    }
+
     use super::*;
 
     #[test]

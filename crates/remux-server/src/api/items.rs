@@ -3605,6 +3605,7 @@ mod tests {
             body["Items"][0]["Id"],
             track
                 .id
+                .simple()
                 .to_string()
         );
         assert_eq!(body["Items"][0]["Type"], "Audio");

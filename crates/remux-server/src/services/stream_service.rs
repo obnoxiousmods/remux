@@ -97,10 +97,20 @@ impl StreamService {
         ctx: &AppContext,
         media: &mut db::Media,
         device_key: Option<&str>,
+        user_id: Option<Uuid>,
     ) -> anyhow::Result<Option<db::Media>> {
         let mut sources = media
             .streams(&ctx.db)
             .await?;
+        sources.retain(|source| {
+            source
+                .stream_info
+                .as_ref()
+                .is_some_and(|info| {
+                    info.access_user_id
+                        .is_none_or(|owner| Some(owner) == user_id)
+                })
+        });
         if let Some(key) = device_key {
             if let Some(saved_id) = ctx
                 .store
@@ -118,32 +128,19 @@ impl StreamService {
                 continue;
             };
             if let StreamDescriptor::Local(path) = &info.descriptor
-                && tokio::fs::metadata(path)
+                && let Ok(file) = tokio::fs::File::open(path).await
+                && file
+                    .metadata()
                     .await
-                    .is_ok_and(|metadata| metadata.is_file())
+                    .is_ok_and(|m| m.is_file())
             {
+                crate::services::music_cache::touch(ctx, path);
                 return Ok(Some(source.clone()));
             }
         }
 
-        let required = std::time::Duration::from_secs(
-            media
-                .runtime
-                .and_then(|seconds| u64::try_from(seconds).ok())
-                .unwrap_or(10 * 60)
-                .saturating_add(60),
-        );
-        Ok(sources
-            .into_iter()
-            .find(|source| {
-                source
-                    .stream_info
-                    .as_ref()
-                    .is_some_and(|info| {
-                        matches!(&info.descriptor, StreamDescriptor::Http { .. })
-                            && info.is_valid_for(required)
-                    })
-            }))
+        // Remote locators must pass complete-object qualification before reuse.
+        Ok(None)
     }
 
     pub fn new(cfg: StreamServiceConfig) -> Self {
@@ -194,12 +191,20 @@ impl StreamService {
         )
         .await;
 
-        self.ctx
-            .addons
-            .refresh_streams(&mut root, &self.ctx, self.user_id)
-            .await
-            .inspect_err(|e| tracing::error!("refresh_streams failed: {e:#}"));
-
+        let reusable = if root.kind == db::MediaKind::Track {
+            Self::reusable_track_source(&self.ctx, &mut root, None, self.user_id)
+                .await?
+        } else {
+            None
+        };
+        root.sources = None;
+        if reusable.is_none() {
+            self.ctx
+                .addons
+                .refresh_streams(&mut root, &self.ctx, self.user_id)
+                .await
+                .inspect_err(|e| tracing::error!("refresh_streams failed: {e:#}"));
+        }
         let db_streams = root
             .streams(
                 &self
@@ -207,6 +212,7 @@ impl StreamService {
                     .db,
             )
             .await?;
+        let is_track = root.kind == db::MediaKind::Track;
         let raw = if db_streams.is_empty() {
             // Root item can be the stream itself (e.g. locally-imported files)
             // but only when it carries a URL. Addon content uses the root as a
@@ -222,6 +228,15 @@ impl StreamService {
             }
         } else {
             db_streams
+        };
+
+        let raw = if is_track {
+            raw.into_iter().filter(|source| source.stream_info.as_ref().is_some_and(|info|
+                info.access_user_id.is_none_or(|owner| Some(owner) == self.user_id)
+                && matches!(&info.descriptor, StreamDescriptor::Local(path) if std::fs::File::open(path).is_ok())
+            )).collect()
+        } else {
+            raw
         };
 
         let streams = db::StreamGroup::filter_sources(
@@ -289,6 +304,25 @@ impl StreamService {
         let media = db::Media::get_by_id(&ctx.db, &lookup_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("stream not found: {}", lookup_id))?;
+        if media.kind == db::MediaKind::Stream
+            && let Some(parent_id) = media.parent_id
+            && let Some(parent) = db::Media::get_by_id(&ctx.db, &parent_id).await?
+            && parent.kind == db::MediaKind::Track
+        {
+            // Explicit stale source IDs need the same recovery and user scope as item IDs.
+            if let Some(info) = &media.stream_info
+                && info
+                    .access_user_id
+                    .is_none_or(|owner| Some(owner) == user_id)
+                && matches!(&info.descriptor, StreamDescriptor::Local(path) if std::fs::File::open(path).is_ok())
+            {
+                return Ok(media);
+            }
+            return Self::dispatch_lookup(
+                ctx, parent_id, None, device_key, user_id, parent,
+            )
+            .await;
+        }
         Self::dispatch_lookup(ctx, item_id, requested_id, device_key, user_id, media)
             .await
     }
@@ -327,9 +361,10 @@ impl StreamService {
                 // of reading an empty or expired cached source indefinitely.
                 if requested_id.is_none() || requested_id == Some(item_id) {
                     if media.kind == db::MediaKind::Track {
-                        if let Some(source) =
-                            Self::reusable_track_source(ctx, &mut media, device_key)
-                                .await?
+                        if let Some(source) = Self::reusable_track_source(
+                            ctx, &mut media, device_key, user_id,
+                        )
+                        .await?
                         {
                             debug!(
                                 item_id = %item_id,
@@ -354,9 +389,15 @@ impl StreamService {
                             );
                         });
                 }
-                let sources = media
+                let mut sources = media
                     .streams(&ctx.db)
                     .await?;
+                if media.kind == db::MediaKind::Track {
+                    sources.retain(|source| source.stream_info.as_ref().is_some_and(|info|
+                        info.access_user_id.is_none_or(|owner| Some(owner) == user_id)
+                        && matches!(&info.descriptor, StreamDescriptor::Local(path) if std::fs::File::open(path).is_ok())
+                    ));
+                }
                 if let Some(sid) = requested_id.filter(|&sid| sid != item_id) {
                     sources
                         .into_iter()

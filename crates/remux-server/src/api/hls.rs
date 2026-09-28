@@ -67,8 +67,17 @@ async fn wait_for_variant_playlist(
     timeout: std::time::Duration,
 ) -> String {
     let (output_tx, state_tx) = {
-        let session = session.read().await;
-        (session.output_tx.clone(), session.state_tx.clone())
+        let session = session
+            .read()
+            .await;
+        (
+            session
+                .output_tx
+                .clone(),
+            session
+                .state_tx
+                .clone(),
+        )
     };
     wait_for_variant_playlist_signals(
         output_tx.subscribe(),
@@ -372,7 +381,9 @@ async fn create_hls_session(
         .video_codec
         .as_deref()
         .unwrap_or("copy");
-    let video_codec = if video_codec_raw == "copy" || !video_transcode_enabled_hls {
+    let video_codec = if video_codec_raw == "none" {
+        "none".to_string()
+    } else if video_codec_raw == "copy" || !video_transcode_enabled_hls {
         "copy".to_string()
     } else {
         "h264".to_string()
@@ -559,18 +570,23 @@ async fn create_hls_session(
                     .next()
             })
             .context_not_found("no playable source found")?;
-        } else if resolved_media.kind == db::MediaKind::Track {
-            let sources = resolved_media
-                .streams(
-                    &state
-                        .ctx
-                        .db,
-                )
-                .await?;
-            resolved_media = sources
-                .into_iter()
-                .next()
-                .context_not_found("no stream found for track")?;
+        } else if resolved_media.kind == db::MediaKind::Track || video_codec == "none" {
+            resolved_media = crate::services::StreamService::lookup(
+                &state.ctx,
+                id,
+                q.media_source_id,
+                Some(
+                    &auth
+                        .device
+                        .id,
+                ),
+                Some(
+                    auth.user
+                        .id,
+                ),
+            )
+            .await
+            .map_err(super::playback::stream_lookup_error)?;
         }
 
         let input_url = resolved_media
@@ -814,6 +830,11 @@ async fn create_hls_session(
             session_hw_accel,
         );
 
+        session
+            .write()
+            .await
+            .audio_sample_rate = q.audio_sample_rate;
+
         // Record the exact seek this ffmpeg process will perform before the
         // session becomes visible to other requests — the prewarm claim check
         // and the start acknowledgement read this value.
@@ -834,6 +855,7 @@ async fn create_hls_session(
         let session_clone = session.clone();
         let encoding_opts = encoding_opts_hls.clone();
         let params = crate::playback::engine::TranscodeParams {
+            audio_sample_rate: q.audio_sample_rate,
             input_url,
             output_dir: session
                 .read()
@@ -873,7 +895,15 @@ async fn create_hls_session(
             // Force stereo downmix when transcoding audio — multi-channel AAC
             // (e.g. 6.1 from DTS-HD) causes MEDIA_ERR_SRC_NOT_SUPPORTED on most
             // browsers and iOS Safari.
-            audio_channels: if audio_codec == "copy" { None } else { Some(2) },
+            audio_channels: if audio_codec == "copy" {
+                None
+            } else {
+                Some(
+                    q.max_audio_channels
+                        .unwrap_or(2)
+                        .clamp(1, 2),
+                )
+            },
             audio_stream_index: q
                 .audio_stream_index
                 .map(|v| v as i32)
@@ -1004,6 +1034,70 @@ async fn create_hls_session(
     Ok((session, play_session_id))
 }
 
+fn audio_hls_query(mut q: api::HlsVideoQuery) -> api::HlsVideoQuery {
+    q.video_codec = Some("none".into());
+    q.audio_codec = Some("aac".into());
+    q.audio_sample_rate = Some(
+        [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000]
+            .into_iter()
+            .filter(|rate| {
+                *rate
+                    <= q.audio_sample_rate
+                        .unwrap_or(44100)
+            })
+            .last()
+            .unwrap_or(8000),
+    );
+    q.segment_length = Some(
+        q.segment_length
+            .unwrap_or(6)
+            .clamp(1, 10),
+    );
+    q
+}
+
+#[get("/audio/{id}/master.m3u8")]
+pub async fn master_hls_audio(
+    State(state): State<AppState>,
+    auth: auth::AuthSession,
+    Path(id): Path<Uuid>,
+    Query(q): Query<api::HlsVideoQuery>,
+) -> Result<impl IntoResponse> {
+    master_hls_video(State(state), auth, Path(id), Query(audio_hls_query(q))).await
+}
+
+#[get("/audio/{id}/main.m3u8", "/audio/{id}/main/stream.m3u8")]
+pub async fn variant_hls_audio(
+    State(state): State<AppState>,
+    auth: auth::AuthSession,
+    Path(id): Path<Uuid>,
+    Query(q): Query<api::HlsVideoQuery>,
+) -> Result<impl IntoResponse> {
+    let mut q = audio_hls_query(q);
+    let (_, session_id) = create_hls_session(&state, &auth, id, &q).await?;
+    if q.play_session_id
+        .is_none()
+    {
+        // Playlist reloads must address the same transcode. Otherwise a client
+        // entering through main.m3u8 starts a new EVENT playlist on every poll.
+        let token = urlencoding::encode(
+            auth.device
+                .access_token
+                .expose(),
+        );
+        let location = format!(
+            "/audio/{id}/main.m3u8?PlaySessionId={session_id}&api_key={token}&StartTimeTicks={}",
+            q.start_time_ticks
+                .unwrap_or(0)
+        );
+        return Ok(axum::response::Redirect::temporary(&location).into_response());
+    }
+    q.play_session_id = Some(session_id);
+    Ok(variant_hls_video_inner(state, q)
+        .await?
+        .into_response())
+}
+
 #[get("/videos/{id}/master.m3u8")]
 pub async fn master_hls_video(
     State(state): State<AppState>,
@@ -1032,13 +1126,32 @@ pub async fn master_hls_video(
     let session_read = session
         .read()
         .await;
-    let master_playlist = add_playback_start_acknowledgement(
+    let mut master_playlist = add_playback_start_acknowledgement(
         add_playback_generation_to_master(
             crate::playback::engine::generate_master_playlist(&session_read),
             q.start_time_ticks,
         ),
         acknowledged_ticks,
     );
+    if session_read.video_codec == "none" {
+        let token = urlencoding::encode(
+            auth.device
+                .access_token
+                .expose(),
+        );
+        master_playlist = master_playlist
+            .lines()
+            .map(|line| {
+                if !line.starts_with('#') && line.contains("main.m3u8?") {
+                    format!("{line}&api_key={token}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+    }
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/vnd.apple.mpegurl")
@@ -1355,7 +1468,8 @@ async fn variant_hls_video_inner(
                 }
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+            + "\n";
 
         return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -1619,7 +1733,7 @@ mod local_tests {
 
 /// Serves individual HLS segment files.
 /// The full filename is retained so fMP4 remains fMP4 during disk recovery.
-#[get("/videos/{id}/main/{segment_file}")]
+#[get("/videos/{id}/main/{segment_file}", "/audio/{id}/main/{segment_file}")]
 pub async fn hls_segment(
     State(state): State<AppState>,
     Path((id, segment_file)): Path<(Uuid, String)>,
@@ -1630,7 +1744,7 @@ pub async fn hls_segment(
 
 /// Segment route at the same level as main.m3u8 — browsers resolve bare
 /// segment filenames relative to the variant playlist URL.
-#[get("/videos/{id}/{segment_file}")]
+#[get("/videos/{id}/{segment_file}", "/audio/{id}/{segment_file}")]
 pub async fn hls_segment_flat(
     State(state): State<AppState>,
     Path((id, segment_file)): Path<(Uuid, String)>,
@@ -1640,7 +1754,10 @@ pub async fn hls_segment_flat(
 }
 
 /// Jellyfin-compatible HLS segment route: /Videos/{id}/hls1/{playlistId}/{segmentFile}
-#[get("/videos/{id}/hls1/{playlist_id}/{segment_file}")]
+#[get(
+    "/videos/{id}/hls1/{playlist_id}/{segment_file}",
+    "/audio/{id}/hls1/{playlist_id}/{segment_file}"
+)]
 pub async fn hls1_segment(
     State(state): State<AppState>,
     Path((id, _playlist_id, segment_file)): Path<(Uuid, String, String)>,
@@ -1928,6 +2045,10 @@ async fn hls_segment_inner(
                     .await
                     .unwrap_or_default();
                     let params = crate::playback::engine::TranscodeParams {
+                        audio_sample_rate: session
+                            .read()
+                            .await
+                            .audio_sample_rate,
                         input_url,
                         output_dir: output_dir.clone(),
                         video_codec,
@@ -2102,12 +2223,19 @@ async fn hls_segment_inner(
         .ping(&play_session_id);
 
     let file = tokio::fs::File::open(&segment_path).await?;
+    let length = file
+        .metadata()
+        .await?
+        .len();
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
+    // Completed fragments have a known length. Preserve this byte contract
+    // for clients and body-delivery telemetry.
     // fMP4 segments (.m4s) use video/mp4; MPEG-TS segments use video/mp2t.
     Ok(Response::builder()
         .status(StatusCode::OK)
+        .header(http::header::CONTENT_LENGTH, length)
         .header(
             "Content-Type",
             segment
@@ -2140,5 +2268,341 @@ mod tests {
         // fMP4 now also uses synthetic VOD playlist — full seek bar from the start.
         assert!(!super::should_serve_ffmpeg_variant_playlist(false, true, 0));
         assert!(super::should_serve_ffmpeg_variant_playlist(true, false, 0));
+    }
+}
+
+#[cfg(test)]
+mod music_integration_tests {
+    use crate::{
+        Config, db,
+        stream::{StreamDescriptor, StreamInfo},
+    };
+    use uuid::Uuid;
+
+    /// Exercises real registered routes, SQLite, authorization, byte ranges,
+    /// ffmpeg HLS output, every segment, and complete audio decoding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ten_track_jellyfin_audio_queue_direct_ranges_and_hls() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: dir
+                .path()
+                .to_owned(),
+            database_url: Some(format!(
+                "sqlite://{}?mode=rwc",
+                dir.path()
+                    .join("isolated.sqlite")
+                    .display()
+            )),
+            disable_dht: true,
+            telemetry_enabled: true,
+            telemetry_sample_rate: 0.0,
+            telemetry_slow_request_ms: u64::MAX,
+            torrent_http_port: Some(0),
+            torrent_peer_port: Some(0),
+            torrent_data_dir: None,
+            log_dir: None,
+            ..Default::default()
+        }
+        .resolve();
+        let setup = db::connect(
+            config
+                .database_url
+                .as_deref()
+                .unwrap(),
+            10000,
+            1,
+        )
+        .await
+        .unwrap();
+        db::migrate(&setup)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM task_triggers")
+            .execute(&setup)
+            .await
+            .unwrap();
+        setup
+            .close()
+            .await;
+        let (app, ctx) = crate::init_app_with_ctx(config)
+            .await
+            .unwrap();
+        let actual: String = sqlx::query_scalar(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        )
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            std::path::Path::new(&actual),
+            dir.path()
+                .join("isolated.sqlite")
+        );
+        let mut user = db::User {
+            id: Uuid::new_v4(),
+            username: "music-test".into(),
+            is_admin: true,
+            ..Default::default()
+        };
+        user.save(&ctx.db)
+            .await
+            .unwrap();
+        let token = Uuid::new_v4().to_string();
+        db::auth::Device {
+            id: "music-test".into(),
+            user_id: user.id,
+            access_token: token
+                .clone()
+                .into(),
+            name: "test".into(),
+            app_name: "Finamp".into(),
+            ..Default::default()
+        }
+        .save(&ctx.db)
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        for index in 0..10 {
+            let extension = ["wav", "flac", "mp3"][index % 3];
+            let path = dir
+                .path()
+                .join(format!("track-{index}.{extension}"));
+            let generated = std::process::Command::new("ffmpeg")
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=12",
+                ])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(generated.success());
+            let (probe, _) = crate::playback::probe::probe_media(
+                path.to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let id = Uuid::new_v4();
+            let item = db::Media {
+                id,
+                title: format!("Track {index}"),
+                kind: db::MediaKind::Track,
+                runtime: Some(12),
+                external_ids: db::ExternalIds {
+                    custom_stremio_id: Some(format!("test:music:{id}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let source = db::Media {
+                id: Uuid::new_v4(),
+                parent_id: Some(id),
+                title: "local".into(),
+                kind: db::MediaKind::Stream,
+                runtime: Some(12),
+                probe_data: Some(probe.clone()),
+                stream_info: Some(StreamInfo {
+                    descriptor: StreamDescriptor::Local(path.clone()),
+                    probe_data: Some(probe),
+                    access_user_id: Some(user.id),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let source_id = source.id;
+            db::Media::upsert(&ctx.db, &[item, source])
+                .await
+                .unwrap();
+            if index == 0 {
+                assert_eq!(
+                    client
+                        .get(format!("{base}/audio/{id}/stream"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    401
+                );
+                assert_eq!(
+                    client
+                        .get(format!("{base}/stream/{source_id}"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    401
+                );
+            }
+            let file_url = format!("{base}/items/{id}/file?api_key={token}");
+            let full = client
+                .get(&file_url)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(full.status(), 200, "track {index} file");
+            let full = full
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(full.as_ref(), std::fs::read(&path).unwrap());
+            for range in [
+                "bytes=0-1".to_string(),
+                "bytes=-64".to_string(),
+                format!("bytes={}-", full.len() / 2),
+            ] {
+                let response = client
+                    .get(&file_url)
+                    .header("Range", &range)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 206, "{range}");
+                assert!(
+                    response
+                        .headers()
+                        .contains_key("content-range")
+                );
+                let bytes = response
+                    .bytes()
+                    .await
+                    .unwrap();
+                let expected = if range == "bytes=0-1" {
+                    &full[..2]
+                } else if range == "bytes=-64" {
+                    &full[full.len() - 64..]
+                } else {
+                    &full[full.len() / 2..]
+                };
+                assert_eq!(bytes.as_ref(), expected);
+            }
+            if index == 0 {
+                let response = client.get(format!("{base}/audio/{id}/universal?api_key={token}&Container=mp3&TranscodingContainer=mp3&AudioCodec=mp3&MaxAudioChannels=1&MaxAudioSampleRate=22050"))
+                    .send().await.unwrap();
+                assert_eq!(response.status(), 200);
+                let progressive = dir
+                    .path()
+                    .join("progressive.mp3");
+                std::fs::write(
+                    &progressive,
+                    response
+                        .bytes()
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                let (probe, _) = crate::playback::probe::probe_media(
+                    progressive
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                let audio = probe
+                    .audio_stream()
+                    .unwrap();
+                assert_eq!(audio.channels, Some(1));
+                assert_eq!(audio.sample_rate, Some(22050));
+                assert!(
+                    (probe
+                        .run_time_ticks
+                        .unwrap()
+                        - 120_000_000)
+                        .abs()
+                        < 5_000_000
+                );
+            }
+            let manifest_url = if index % 2 == 0 {
+                let master = client.get(if index == 2 {
+                    format!("{base}/audio/{id}/universal?api_key={token}&TranscodingProtocol=hls&TranscodingContainer=ts&AudioCodec=aac")
+                } else { format!("{base}/audio/{id}/master.m3u8?api_key={token}&AudioBitRate=128000&AudioSampleRate=44100") })
+                    .send().await.unwrap();
+                assert_eq!(master.status(), 200);
+                let master = master
+                    .text()
+                    .await
+                    .unwrap();
+                assert!(master.contains("CODECS=\"mp4a.40.2\""), "{master}");
+                assert!(!master.contains("avc1"));
+                format!(
+                    "{base}/audio/{id}/{}",
+                    master
+                        .lines()
+                        .find(|line| !line.starts_with('#') && !line.is_empty())
+                        .unwrap()
+                )
+            } else {
+                format!("{base}/audio/{id}/main.m3u8?api_key={token}")
+            };
+            let decoded = dir
+                .path()
+                .join(format!("decoded-{index}.wav"));
+            let output = tokio::process::Command::new("ffmpeg")
+                .kill_on_drop(true)
+                .args(["-nostdin", "-v", "info", "-xerror", "-i"])
+                .arg(&manifest_url)
+                .args(["-map", "0:a:0"])
+                .arg(&decoded)
+                .output();
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(30), output)
+                    .await
+                    .unwrap_or_else(|_| panic!("track {index}: HLS decoding timed out"))
+                    .unwrap();
+            assert!(
+                output
+                    .status
+                    .success(),
+                "track {index}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let (decoded, _) = crate::playback::probe::probe_media(
+                decoded
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                (decoded
+                    .run_time_ticks
+                    .unwrap()
+                    - 120_000_000)
+                    .abs()
+                    < 5_000_000
+            );
+        }
+        // Healthy request details are sampled out, but rollups must still
+        // count all ten complete downloads and thirty byte-range requests.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let count: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(request_count), 0) FROM telemetry_hourly_rollups WHERE route_template = '/items/{id}/file' AND sample_reason = 'complete'")
+                    .fetch_one(&ctx.db).await.unwrap();
+                if count == 40 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }).await.expect("all file requests must reach the unsampled rollup");
+        let details: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_request_events WHERE route_template = '/items/{id}/file'")
+            .fetch_one(&ctx.db).await.unwrap();
+        assert_eq!(details, 0);
+        server.abort();
+        ctx.shutdown()
+            .await;
     }
 }

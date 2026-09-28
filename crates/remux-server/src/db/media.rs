@@ -1569,15 +1569,24 @@ impl Media {
             .candidate_ids(&MediaKind::Series, None, None, None)
             .into_iter()
             .next()
-            .unwrap_or_else(|| self.id.to_string())
+            .unwrap_or_else(|| {
+                self.id
+                    .to_string()
+            })
     }
 
     pub fn season_id(series_key: &str, season_idx: i64) -> Uuid {
-        crate::common::stable_media_uuid(&MediaKind::Season, &format!("{series_key}:{season_idx}"))
+        crate::common::stable_media_uuid(
+            &MediaKind::Season,
+            &format!("{series_key}:{season_idx}"),
+        )
     }
 
     pub fn episode_id(series_key: &str, season_idx: i64, ep_idx: i64) -> Uuid {
-        crate::common::stable_media_uuid(&MediaKind::Episode, &format!("{series_key}:{season_idx}:{ep_idx}"))
+        crate::common::stable_media_uuid(
+            &MediaKind::Episode,
+            &format!("{series_key}:{season_idx}:{ep_idx}"),
+        )
     }
 
     pub async fn clear_parent_id_scoped(
@@ -1586,11 +1595,13 @@ impl Media {
         required_parent_id: &Uuid,
     ) -> Result<(), sqlx::Error> {
         for id in media_ids {
-            sqlx::query("UPDATE media SET parent_id = NULL WHERE id = ? AND parent_id = ?")
-                .bind(id)
-                .bind(required_parent_id)
-                .execute(db)
-                .await?;
+            sqlx::query(
+                "UPDATE media SET parent_id = NULL WHERE id = ? AND parent_id = ?",
+            )
+            .bind(id)
+            .bind(required_parent_id)
+            .execute(db)
+            .await?;
         }
         Ok(())
     }
@@ -1600,13 +1611,14 @@ impl Media {
         id: &Uuid,
         patch: &ExternalIds,
     ) -> Result<Option<ExternalIds>, sqlx::Error> {
-        let current: Option<sqlx::types::Json<ExternalIds>> = sqlx::query_scalar(
-            "SELECT external_ids FROM media WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(db)
-        .await?;
-        let Some(current) = current else { return Ok(None); };
+        let current: Option<sqlx::types::Json<ExternalIds>> =
+            sqlx::query_scalar("SELECT external_ids FROM media WHERE id = ?")
+                .bind(id)
+                .fetch_optional(db)
+                .await?;
+        let Some(current) = current else {
+            return Ok(None);
+        };
         let mut merged = current.0;
         merged.merge(patch, false);
         sqlx::query("UPDATE media SET external_ids = ?, updated_at = ? WHERE id = ?")
@@ -7341,6 +7353,7 @@ impl From<sdks::stremio::Stream> for Media {
         };
 
         let stream_info = Some(StreamInfo {
+            access_user_id: None,
             descriptor,
             valid_until: None,
             filename: source
@@ -8683,9 +8696,7 @@ mod tests {
     #[test]
     fn custom_stremio_type_extracts_non_standard_type() {
         assert_eq!(
-            custom_stremio_type(&sdks::stremio::MediaType::Other(
-                "anime".to_string()
-            )),
+            custom_stremio_type(&sdks::stremio::MediaType::Other("anime".to_string())),
             Some("anime".to_string())
         );
         assert_eq!(custom_stremio_type(&sdks::stremio::MediaType::Series), None);

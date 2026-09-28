@@ -199,6 +199,9 @@ impl StreamDescriptor {
 /// fields they have; the rest are `None` / empty.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StreamInfo {
+    /// Access scope for a verified music cache object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_user_id: Option<Uuid>,
     pub descriptor: StreamDescriptor,
     /// Latest time this descriptor is expected to remain usable.
     ///
@@ -322,14 +325,18 @@ impl StreamInfo {
             | StreamDescriptor::Rtsp { .. }
             | StreamDescriptor::Torrent { .. }
             | StreamDescriptor::Opendal { .. } => true,
-            StreamDescriptor::Http { .. } => self
-                .valid_until
-                .is_some_and(|expiry| {
-                    expiry
-                        .signed_duration_since(chrono::Utc::now())
-                        .to_std()
-                        .is_ok_and(|remaining| remaining >= duration)
-                }),
+            StreamDescriptor::Http { .. } => {
+                let mut effective = self.clone();
+                effective.infer_valid_until();
+                effective
+                    .valid_until
+                    .is_some_and(|expiry| {
+                        expiry
+                            .signed_duration_since(chrono::Utc::now())
+                            .to_std()
+                            .is_ok_and(|remaining| remaining >= duration)
+                    })
+            }
         }
     }
 }
@@ -463,7 +470,9 @@ const SEGMENTED_LAYOUT_TTL: Duration = Duration::from_secs(5 * 60);
 const SEGMENTED_LAYOUT_LIMIT: usize = 256;
 const MAX_SEGMENT_COUNT: usize = 2048;
 const MAX_INIT_SEGMENT_BYTES: u64 = 128 * 1024;
-const SEGMENT_DISCOVERY_BATCH_SIZE: usize = 16;
+const SEGMENT_DISCOVERY_BATCH_SIZE: usize = 4;
+static SEGMENT_LAYOUT_LOCKS: crate::keyed_lock::KeyedLock<String> =
+    crate::keyed_lock::KeyedLock::new();
 
 fn tidal_segment_zero_url(raw: &str) -> Option<url::Url> {
     let parsed = url::Url::parse(raw).ok()?;
@@ -812,10 +821,22 @@ impl HttpSource {
         client: &reqwest::Client,
         base: &url::Url,
     ) -> Result<Arc<[u64]>> {
+        let ordered_headers: std::collections::BTreeMap<_, _> = self
+            .request_headers
+            .iter()
+            .collect();
+        let cache_key = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("{}:{ordered_headers:?}", self.url).as_bytes(),
+        )
+        .to_string();
+        let _guard = SEGMENT_LAYOUT_LOCKS
+            .lock(cache_key.clone())
+            .await;
         if let Some(cached) = SEGMENTED_MP4_LAYOUTS
             .read()
             .await
-            .get(&self.url)
+            .get(&cache_key)
             .filter(|layout| {
                 layout
                     .discovered_at
@@ -879,8 +900,7 @@ impl HttpSource {
                 }
                 if matches!(
                     response.status(),
-                    reqwest::StatusCode::BAD_REQUEST
-                        | reqwest::StatusCode::NOT_FOUND
+                    reqwest::StatusCode::NOT_FOUND
                         | reqwest::StatusCode::RANGE_NOT_SATISFIABLE
                 ) {
                     break 'discovery;
@@ -925,8 +945,7 @@ impl HttpSource {
             cache.clear();
         }
         cache.insert(
-            self.url
-                .clone(),
+            cache_key,
             SegmentedMp4Layout {
                 discovered_at: Instant::now(),
                 lengths: lengths.clone(),
@@ -991,6 +1010,13 @@ impl HttpSource {
                         response.status()
                     )));
                     break;
+                }
+                if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                    let expected = format!("bytes {local_start}-{local_end}/{}", lengths[index]);
+                    if response.headers().get(http::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()) != Some(expected.as_str()) {
+                        yield Err::<bytes::Bytes, io::Error>(io::Error::other("fragmented audio Content-Range mismatch"));
+                        break;
+                    }
                 }
                 // Some CDNs ignore Range and answer 200 with the full segment.
                 // Preserve the virtual resource's exact byte contract by
@@ -1070,6 +1096,13 @@ impl HttpSource {
 #[async_trait]
 impl StreamSource for HttpSource {
     async fn serve(&self, _state: &AppState, headers: &HeaderMap) -> Result<Response> {
+        self.serve_object(headers)
+            .await
+    }
+}
+
+impl HttpSource {
+    pub(crate) async fn serve_object(&self, headers: &HeaderMap) -> Result<Response> {
         let client = STREAM_PROXY_CLIENT.clone();
         if let Some(base) = tidal_segment_zero_url(&self.url) {
             return self
@@ -1397,6 +1430,40 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_signed_locator_is_expired_without_persisted_valid_until() {
+        let info = super::StreamInfo {
+            descriptor: super::StreamDescriptor::http(
+                "https://example.org/audio?expire=1600000000",
+            ),
+            ..Default::default()
+        };
+        assert!(
+            info.valid_until
+                .is_none()
+        );
+        assert!(!info.is_valid_for(std::time::Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn persistence_infers_expiry_before_serialization() {
+        let source: crate::db::Media = super::StreamInfo {
+            descriptor: super::StreamDescriptor::http(
+                "https://example.org/audio?expire=1900000000",
+            ),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            source
+                .stream_info
+                .unwrap()
+                .valid_until
+                .unwrap()
+                .timestamp(),
+            1900000000
+        );
+    }
 
     #[test]
     fn an_uppercase_extension_still_gets_its_real_mime_type() {

@@ -63,8 +63,8 @@ pub mod db;
 #[cfg(feature = "desktop")]
 pub mod embedded_static;
 pub mod intro;
-mod jellyfin_client;
 mod iptv;
+mod jellyfin_client;
 pub mod localization;
 pub mod playback;
 pub mod playback_session;
@@ -476,6 +476,10 @@ fn default_torrent_http_port() -> u16 {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Config {
+    #[serde(default = "default_music_cache_bytes")]
+    pub music_cache_bytes: u64,
+    #[serde(default = "default_music_cache_entry_bytes")]
+    pub music_cache_entry_bytes: u64,
     #[serde(default = "default_data_dir")]
     pub data_dir: std::path::PathBuf,
     /// `None` means derive from `data_dir` — call `resolve()` after loading.
@@ -516,6 +520,10 @@ pub struct Config {
     /// Path to the bgutil-pot binary used by yt-dlp for YouTube POT token generation.
     #[serde(default = "default_bgutil_script_path")]
     pub bgutil_script_path: std::path::PathBuf,
+    #[serde(default = "default_ytdlp_executable")]
+    pub ytdlp_executable: std::path::PathBuf,
+    #[serde(default, skip_serializing)]
+    pub ytdlp_extra_args: Vec<String>,
     /// Base URL for the TMDB API. Overridable for testing.
     #[serde(default = "default_tmdb_base_url")]
     pub tmdb_base_url: String,
@@ -549,10 +557,9 @@ pub struct Config {
     /// provider cost seconds per song. Defaults to 3.
     #[serde(default = "default_music_stream_addon_timeout_secs")]
     pub music_stream_addon_timeout_secs: u64,
-    /// Per-addon budget (seconds) for a music item once the primary providers
-    /// have all come back empty. Only spent when the alternative is silence,
-    /// and the last-resort providers are genuinely slow — a yt-dlp search plus
-    /// format resolution takes several seconds. Defaults to 20.
+    /// Total resolution and complete-object qualification budget (seconds)
+    /// for a track, including local lookup and bounded remote fallback races.
+    /// Also used by legacy album/artist fallback resolution. Defaults to 20.
     #[serde(default = "default_music_fallback_stream_addon_timeout_secs")]
     pub music_fallback_stream_addon_timeout_secs: u64,
     /// Directory for server log files (daily-rolled `remux.log`), surfaced by
@@ -603,7 +610,9 @@ pub struct Config {
     pub jellyfin_version: String,
 }
 
-fn default_jellyfin_version() -> String { "10.11.8".to_string() }
+fn default_jellyfin_version() -> String {
+    "10.11.8".to_string()
+}
 
 fn default_remuxdb_url() -> Option<String> {
     Some("https://remuxdb.1632022.xyz".to_string())
@@ -723,9 +732,22 @@ impl Config {
     }
 }
 
+fn default_ytdlp_executable() -> std::path::PathBuf {
+    "yt-dlp".into()
+}
+
+fn default_music_cache_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024
+}
+fn default_music_cache_entry_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
+            music_cache_bytes: default_music_cache_bytes(),
+            music_cache_entry_bytes: default_music_cache_entry_bytes(),
             data_dir: default_data_dir(),
             database_url: None,
             legacy_jellyfin_db_path: None,
@@ -738,6 +760,8 @@ impl Default for Config {
             disable_dht: false,
             torrent_peer_port: default_torrent_peer_port(),
             bgutil_script_path: default_bgutil_script_path(),
+            ytdlp_executable: default_ytdlp_executable(),
+            ytdlp_extra_args: Vec::new(),
             tmdb_base_url: default_tmdb_base_url(),
             trakt_base_url: default_trakt_base_url(),
             group_local_music_limit: None,

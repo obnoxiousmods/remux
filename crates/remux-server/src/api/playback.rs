@@ -60,7 +60,7 @@ use axum_anyhow::ApiResult as Result;
 /// server fault — stock Jellyfin answers 404 when a file is gone, and 404 is
 /// what music clients render as "unavailable" instead of inventing a transcode
 /// or permission error. Everything else keeps its 500.
-fn stream_lookup_error(err: anyhow::Error) -> axum_anyhow::ApiError {
+pub(crate) fn stream_lookup_error(err: anyhow::Error) -> axum_anyhow::ApiError {
     if NoPlayableSources::is_cause_of(&err) {
         err.context_not_found("no playable source is currently available for this item")
     } else {
@@ -834,16 +834,29 @@ pub async fn items_file(
 pub async fn audio_stream(
     headers: headers::HeaderMap,
     State(state): State<AppState>,
+    session: auth::AuthSession,
     Path(id): Path<Uuid>,
     Query(q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
-    videos_stream_inner(headers, state, None, id, q).await
+    videos_stream_inner(
+        headers,
+        state,
+        Some(
+            session
+                .user
+                .id,
+        ),
+        id,
+        q,
+    )
+    .await
 }
 
 #[get("/audio/{id}/stream.{container}")]
 pub async fn audio_stream_by_container(
     headers: headers::HeaderMap,
     State(state): State<AppState>,
+    session: auth::AuthSession,
     Path((id, container)): Path<(Uuid, String)>,
     Query(mut q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
@@ -852,7 +865,18 @@ pub async fn audio_stream_by_container(
     {
         q.container = Some(container);
     }
-    videos_stream_inner(headers, state, None, id, q).await
+    videos_stream_inner(
+        headers,
+        state,
+        Some(
+            session
+                .user
+                .id,
+        ),
+        id,
+        q,
+    )
+    .await
 }
 
 #[get("/videos/{id}/stream")]
@@ -1073,6 +1097,7 @@ async fn videos_stream_inner(
         == Some("Encode");
 
     let params = crate::playback::engine::ProgressiveTranscodeParams {
+        audio_sample_rate: None,
         input_url: url,
         container: container.clone(),
         audio_only: false,
@@ -1240,6 +1265,7 @@ struct UniversalAudioQuery {
 /// What the source actually is, for the direct-play decision.
 #[derive(Debug, Default, Clone, Copy)]
 struct SourceAudio<'a> {
+    channels: Option<i64>,
     container: Option<&'a str>,
     codec: Option<&'a str>,
     bitrate: Option<i64>,
@@ -1250,6 +1276,7 @@ struct SourceAudio<'a> {
 /// What the client says it can accept.
 #[derive(Debug, Default, Clone, Copy)]
 struct ClientAudioLimits<'a> {
+    max_channels: Option<i64>,
     /// Raw `Container` value; empty or absent means the client declared nothing.
     containers: Option<&'a str>,
     max_bitrate: Option<i64>,
@@ -1281,7 +1308,11 @@ fn probe_is_audio_only(probe: &api::MediaSourceInfo) -> bool {
                 .codec
                 .as_deref()
                 .is_some_and(|codec| {
-                    COVER_ART_CODECS.contains(&codec.to_ascii_lowercase().as_str())
+                    COVER_ART_CODECS.contains(
+                        &codec
+                            .to_ascii_lowercase()
+                            .as_str(),
+                    )
                 })
         })
 }
@@ -1291,8 +1322,7 @@ fn probe_is_audio_only(probe: &api::MediaSourceInfo) -> bool {
 /// Returns `None` rather than guessing, so a genuinely unknown container keeps
 /// whatever the byte path reported instead of being mislabelled.
 fn audio_content_type_for(container: Option<&str>) -> Option<http::HeaderValue> {
-    let container = container?
-        .to_ascii_lowercase();
+    let container = container?.to_ascii_lowercase();
     let mime = match container.as_str() {
         "flac" => "audio/flac",
         "mp3" | "mpeg" | "mpga" => "audio/mpeg",
@@ -1374,7 +1404,8 @@ fn universal_direct_play(source: &SourceAudio, limits: &ClientAudioLimits) -> bo
         (Some(cap), Some(actual)) => actual <= cap,
         _ => true,
     };
-    within(limits.max_bitrate, source.bitrate)
+    within(limits.max_channels, source.channels)
+        && within(limits.max_bitrate, source.bitrate)
         && within(limits.max_sample_rate, source.sample_rate)
         && within(limits.max_bit_depth, source.bit_depth)
 }
@@ -1442,12 +1473,6 @@ pub async fn audio_universal(
                 .as_simple()
                 .to_string()
         });
-    let (container, audio_codec, content_type) = audio_download_format(
-        q.transcoding_container
-            .as_deref(),
-        q.audio_codec
-            .as_deref(),
-    );
 
     let media = StreamService::lookup(
         &state.ctx,
@@ -1477,6 +1502,7 @@ pub async fn audio_universal(
         .as_ref();
     let audio_stream = probe.and_then(|p| p.audio_stream());
     let source = SourceAudio {
+        channels: audio_stream.and_then(|st| st.channels),
         container: probe.and_then(|p| {
             p.container
                 .as_deref()
@@ -1490,6 +1516,9 @@ pub async fn audio_universal(
         bit_depth: audio_stream.and_then(|st| st.bit_depth),
     };
     let limits = ClientAudioLimits {
+        max_channels: q
+            .max_audio_channels
+            .map(i64::from),
         containers: q
             .container
             .as_deref(),
@@ -1532,6 +1561,46 @@ pub async fn audio_universal(
         return Ok(response);
     }
 
+    if q.transcoding_protocol
+        .as_deref()
+        .is_some_and(|p| p.eq_ignore_ascii_case("hls"))
+    {
+        let hls = api::HlsVideoQuery {
+            play_session_id: q.play_session_id,
+            media_source_id: Some(media.id),
+            audio_codec: Some("aac".into()),
+            audio_bit_rate: q
+                .audio_bit_rate
+                .or(q
+                    .max_streaming_bitrate
+                    .and_then(|n| i32::try_from(n).ok())),
+            audio_sample_rate: q
+                .max_audio_sample_rate
+                .and_then(|n| u32::try_from(n).ok()),
+            max_audio_channels: q
+                .transcoding_audio_channels
+                .or(q.max_audio_channels)
+                .and_then(|n| u32::try_from(n).ok()),
+            start_time_ticks: q.start_time_ticks,
+            ..Default::default()
+        };
+        return Ok(super::hls::master_hls_audio(
+            State(state),
+            session,
+            Path(id),
+            Query(hls),
+        )
+        .await?
+        .into_response());
+    }
+
+    let (container, audio_codec, content_type) = audio_download_format(
+        q.transcoding_container
+            .as_deref(),
+        q.audio_codec
+            .as_deref(),
+    );
+
     let descriptor = media
         .stream_info
         .as_ref()
@@ -1562,6 +1631,10 @@ pub async fn audio_universal(
                 .clone()
         });
     let params = crate::playback::engine::ProgressiveTranscodeParams {
+        audio_sample_rate: q
+            .max_audio_sample_rate
+            .and_then(|n| u32::try_from(n).ok())
+            .map(|n| n.clamp(8000, 192000)),
         input_url,
         container: container.to_string(),
         audio_only: true,
@@ -1663,6 +1736,7 @@ mod tests {
 
     fn flac_source() -> SourceAudio<'static> {
         SourceAudio {
+            channels: Some(2),
             container: Some("flac"),
             codec: Some("flac"),
             bitrate: Some(1_085_498),
@@ -1756,10 +1830,7 @@ mod tests {
         // files is application/octet-stream — a music client is entitled to
         // audio/* from the audio endpoint.
         use super::audio_content_type_for;
-        assert_eq!(
-            audio_content_type_for(Some("flac")).unwrap(),
-            "audio/flac"
-        );
+        assert_eq!(audio_content_type_for(Some("flac")).unwrap(), "audio/flac");
         assert_eq!(audio_content_type_for(Some("MP3")).unwrap(), "audio/mpeg");
         // ffprobe reports mp4 audio under its demuxer's full name.
         assert_eq!(
@@ -1856,6 +1927,7 @@ mod tests {
     #[test]
     fn an_unknown_source_value_does_not_force_a_needless_transcode() {
         let source = SourceAudio {
+            channels: None,
             container: Some("flac"),
             codec: Some("flac"),
             bitrate: None,
@@ -1869,6 +1941,7 @@ mod tests {
                 max_bitrate: Some(320_000),
                 max_sample_rate: Some(48_000),
                 max_bit_depth: Some(16),
+                max_channels: Some(2),
             }
         ));
     }
@@ -1882,8 +1955,18 @@ mod tests {
              &EnableRedirection=true",
         )
         .expect("PascalCase query should deserialize");
-        assert_eq!(pascal.container.as_deref(), Some("flac,mp3"));
-        assert_eq!(pascal.transcoding_container.as_deref(), Some("mp4"));
+        assert_eq!(
+            pascal
+                .container
+                .as_deref(),
+            Some("flac,mp3")
+        );
+        assert_eq!(
+            pascal
+                .transcoding_container
+                .as_deref(),
+            Some("mp4")
+        );
         assert_eq!(pascal.max_streaming_bitrate, Some(320_000));
         assert_eq!(pascal.max_audio_sample_rate, Some(48_000));
         assert_eq!(pascal.max_audio_bit_depth, Some(16));
@@ -1893,10 +1976,14 @@ mod tests {
             "transcodingContainer=mp4&audioCodec=aac&maxStreamingBitrate=192000",
         )
         .expect("camelCase query should deserialize");
-        assert_eq!(camel.transcoding_container.as_deref(), Some("mp4"));
+        assert_eq!(
+            camel
+                .transcoding_container
+                .as_deref(),
+            Some("mp4")
+        );
         assert_eq!(camel.max_streaming_bitrate, Some(192_000));
     }
-
 
     #[test]
     fn an_unresolvable_source_is_a_404_not_a_500() {
@@ -2474,7 +2561,7 @@ mod tests {
         // so Android TV and other clients can resolve the stream from the path parameter.
         resp.assert_json_contains(&json!({
             "MediaSources": [{
-                "Id": media.id.to_string(),
+                "Id": media.id.simple().to_string(),
                 "SupportsTranscoding": true,
                 "SupportsDirectPlay": true,
             }]
@@ -2509,7 +2596,7 @@ mod tests {
         resp.assert_status_ok();
         resp.assert_json_contains(&json!({
             "MediaSources": [{
-                "Id": media.id.to_string(),
+                "Id": media.id.simple().to_string(),
                 "Container": "mp4",
                 "RunTimeTicks": 100000000,
                 "SupportsDirectPlay": true,
@@ -2557,7 +2644,7 @@ mod tests {
         // No MediaSourceId in request → source Id must equal the item id.
         resp.assert_json_contains(&json!({
             "MediaSources": [{
-                "Id": media.id.to_string(),
+                "Id": media.id.simple().to_string(),
                 "SupportsDirectPlay": true,
                 "SupportsTranscoding": true,
             }]
@@ -2807,13 +2894,13 @@ mod tests {
                 HeaderValue::from_str(&auth).unwrap(),
             )
             // Android TV sends MediaSourceId == the item id for auto-play
-            .json(&json!({ "MediaSourceId": media.id.to_string() }))
+            .json(&json!({ "MediaSourceId": media.id.simple().to_string() }))
             .await;
 
         resp.assert_status_ok();
         resp.assert_json_contains(&json!({
             "MediaSources": [{
-                "Id": media.id.to_string(),
+                "Id": media.id.simple().to_string(),
             }]
         }));
     }
@@ -2846,6 +2933,7 @@ mod tests {
                 .unwrap(),
             source
                 .id
+                .simple()
                 .to_string(),
             "source Id should equal item id when no MediaSourceId given"
         );
@@ -2857,7 +2945,7 @@ mod tests {
                 http::header::AUTHORIZATION,
                 HeaderValue::from_str(&auth).unwrap(),
             )
-            .json(&json!({ "MediaSourceId": source.id.to_string() }))
+            .json(&json!({ "MediaSourceId": source.id.simple().to_string() }))
             .await;
         resp_with_sid.assert_status_ok();
         let body2: serde_json::Value = resp_with_sid.json();
@@ -2867,6 +2955,7 @@ mod tests {
                 .unwrap(),
             source
                 .id
+                .simple()
                 .to_string(),
             "source Id must equal item id when MediaSourceId == item id (Android TV)"
         );
@@ -2942,13 +3031,17 @@ mod tests {
             .await
             .expect("set streams_refreshed_at");
 
+        let fixture_a = tempfile::NamedTempFile::new().unwrap();
+        let fixture_b = tempfile::NamedTempFile::new().unwrap();
         let mut source_a = db::Media {
             title: "1080p".to_string(),
             kind: db::MediaKind::Stream,
             parent_id: Some(movie.id),
             stream_info: Some(crate::stream::StreamInfo {
                 descriptor: crate::stream::StreamDescriptor::Local(
-                    "test-fixture-1080p.mp4".into(),
+                    fixture_a
+                        .path()
+                        .to_owned(),
                 ),
                 ..Default::default()
             }),
@@ -2968,7 +3061,9 @@ mod tests {
             parent_id: Some(movie.id),
             stream_info: Some(crate::stream::StreamInfo {
                 descriptor: crate::stream::StreamDescriptor::Local(
-                    "test-fixture-720p.mp4".into(),
+                    fixture_b
+                        .path()
+                        .to_owned(),
                 ),
                 ..Default::default()
             }),
@@ -2989,7 +3084,7 @@ mod tests {
                 http::header::AUTHORIZATION,
                 HeaderValue::from_str(&auth).unwrap(),
             )
-            .json(&json!({ "MediaSourceId": source_a.id.to_string() }))
+            .json(&json!({ "MediaSourceId": source_a.id.simple().to_string() }))
             .await;
         resp.assert_status_ok();
         let body: serde_json::Value = resp.json();
@@ -3007,6 +3102,7 @@ mod tests {
                 .unwrap(),
             source_a
                 .id
+                .simple()
                 .to_string(),
             "Id must equal the requested MediaSourceId, not source_b's id"
         );
@@ -3016,6 +3112,7 @@ mod tests {
                 .unwrap(),
             source_a
                 .id
+                .simple()
                 .to_string(),
             "ETag must equal the requested MediaSourceId"
         );
@@ -3037,6 +3134,7 @@ mod tests {
                 .unwrap(),
             movie
                 .id
+                .simple()
                 .to_string(),
             "without MediaSourceId, first source Id must equal the item id, not a stream's id"
         );
@@ -3046,6 +3144,7 @@ mod tests {
                 .unwrap(),
             movie
                 .id
+                .simple()
                 .to_string(),
             "without MediaSourceId, ETag must equal the item id"
         );
@@ -3389,7 +3488,7 @@ mod tests {
                 HeaderValue::from_str(&auth).unwrap(),
             )
             .json(&json!({
-                "ItemId": media.id.to_string(),
+                "ItemId": media.id.simple().to_string(),
                 "PlaySessionId": psid,
                 "PositionTicks": 0
             }))
@@ -3402,7 +3501,7 @@ mod tests {
                 HeaderValue::from_str(&auth).unwrap(),
             )
             .json(&json!({
-                "ItemId": media.id.to_string(),
+                "ItemId": media.id.simple().to_string(),
                 "PlaySessionId": psid,
                 "PositionTicks": 100_000_000i64,
                 "AudioStreamIndex": 2
@@ -3466,7 +3565,7 @@ mod tests {
                 HeaderValue::from_str(&auth).unwrap(),
             )
             .json(&json!({
-                "ItemId": media.id.to_string(),
+                "ItemId": media.id.simple().to_string(),
                 "PlaySessionId": psid,
                 "PositionTicks": 0
             }))
@@ -3479,7 +3578,7 @@ mod tests {
                 HeaderValue::from_str(&auth).unwrap(),
             )
             .json(&json!({
-                "ItemId": media.id.to_string(),
+                "ItemId": media.id.simple().to_string(),
                 "PlaySessionId": psid,
                 "PositionTicks": 100_000_000i64,
                 "AudioStreamIndex": 2
@@ -3677,6 +3776,7 @@ mod tests {
                 .unwrap(),
             movie
                 .id
+                .simple()
                 .to_string()
         );
         // Source[1] (Blu-ray group) must carry the StreamGroup UUID, not a stream UUID
@@ -3686,6 +3786,7 @@ mod tests {
                 .unwrap(),
             bluray_group
                 .id
+                .simple()
                 .to_string(),
             "blu-ray group source Id must be the StreamGroup UUID"
         );
@@ -3697,7 +3798,7 @@ mod tests {
                 http::header::AUTHORIZATION,
                 HeaderValue::from_str(&auth).unwrap(),
             )
-            .json(&json!({ "MediaSourceId": bluray_group.id.to_string() }))
+            .json(&json!({ "MediaSourceId": bluray_group.id.simple().to_string() }))
             .await;
         resp2.assert_status_ok();
         let body2: serde_json::Value = resp2.json();
@@ -3717,6 +3818,7 @@ mod tests {
                 .unwrap(),
             bluray_group
                 .id
+                .simple()
                 .to_string(),
             "source Id must be the Blu-ray group UUID"
         );

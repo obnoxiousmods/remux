@@ -93,6 +93,7 @@ impl HlsSegmentFile {
 }
 
 pub struct TranscodeSession {
+    pub audio_sample_rate: Option<u32>,
     pub id: String,
     pub item_id: Uuid,
     pub media_source_id: Uuid,
@@ -213,6 +214,7 @@ impl TranscodeSession {
         let (state_tx, _) = watch::channel(TranscodeState::Starting);
         let (output_tx, _) = watch::channel(0);
         Arc::new(tokio::sync::RwLock::new(Self {
+            audio_sample_rate: None,
             id: play_session_id,
             item_id,
             media_source_id,

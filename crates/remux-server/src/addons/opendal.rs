@@ -759,6 +759,15 @@ impl StreamAddon for OpendalAddon {
                 });
                 candidates
                     .into_iter()
+                    .filter(|f| {
+                        media.kind != db::MediaKind::Track
+                            || self.backend != "local"
+                            || f.path
+                                .starts_with("https://")
+                            || f.path
+                                .starts_with("http://")
+                            || std::fs::File::open(&f.path).is_ok()
+                    })
                     .take(1)
                     .collect()
             }
@@ -797,6 +806,15 @@ impl StreamAddon for OpendalAddon {
         let streams = files
             .into_iter()
             .filter(|f| {
+                media.kind != db::MediaKind::Track
+                    || self.backend != "local"
+                    || f.path
+                        .starts_with("https://")
+                    || f.path
+                        .starts_with("http://")
+                    || std::fs::File::open(&f.path).is_ok()
+            })
+            .filter(|f| {
                 if media.kind == db::MediaKind::Episode {
                     let ep_match = media
                         .idx
@@ -812,7 +830,15 @@ impl StreamAddon for OpendalAddon {
                 }
             })
             .map(|f| {
-                let descriptor = if self.backend == "local" {
+                let descriptor = if self.media_kind == "track"
+                    && (f
+                        .path
+                        .starts_with("https://")
+                        || f.path
+                            .starts_with("http://"))
+                {
+                    crate::stream::StreamDescriptor::http(&f.path)
+                } else if self.backend == "local" {
                     crate::stream::StreamDescriptor::Local(std::path::PathBuf::from(
                         &f.path,
                     ))
@@ -1166,7 +1192,9 @@ async fn scan_addon(
     tmdb: &Option<sdks::RestClient<sdks::BearerAuth>>,
     addon: &Addon,
 ) -> Result<()> {
-    let cfg = &addon.preset.config;
+    let cfg = &addon
+        .preset
+        .config;
     let media_kind = cfg["media_kind"]
         .as_str()
         .unwrap_or("movie")
@@ -3754,7 +3782,28 @@ mod tests {
         .await
         .unwrap();
 
-        for (id, path) in [(local_b_id, "/b.flac"), (local_a_id, "/a.flac")] {
+        let a_path = dir
+            .path()
+            .join("a.flac");
+        let b_path = dir
+            .path()
+            .join("b.flac");
+        std::fs::write(&a_path, b"fixture").unwrap();
+        std::fs::write(&b_path, b"fixture").unwrap();
+        for (id, path) in [
+            (
+                local_b_id,
+                b_path
+                    .to_str()
+                    .unwrap(),
+            ),
+            (
+                local_a_id,
+                a_path
+                    .to_str()
+                    .unwrap(),
+            ),
+        ] {
             sqlx::query(
                 "INSERT INTO opendal_files \
                  (id, addon_id, media_kind, path, name, title, track_number, scanned_at) \
@@ -3791,8 +3840,16 @@ mod tests {
         assert_eq!(streams.len(), 1);
         assert!(matches!(
             &streams[0].descriptor,
-            StreamDescriptor::Local(path) if path == std::path::Path::new("/a.flac")
+            StreamDescriptor::Local(path) if path == &a_path
         ));
+        std::fs::remove_file(&a_path).unwrap();
+        let streams = addon
+            .get_streams(&remote, ctx, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&streams[0].descriptor, StreamDescriptor::Local(path) if path == &b_path)
+        );
     }
 
     // -----------------------------------------------------------------------
