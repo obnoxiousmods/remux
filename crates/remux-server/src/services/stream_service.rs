@@ -10,6 +10,113 @@ use remux_sdks::{
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+/// Warm a bounded lookahead through the same user-scoped resolver as playback.
+/// Runs after playback starts; never delays the response to the client.
+pub(crate) fn prefetch_music(
+    ctx: AppContext,
+    user: db::User,
+    data: &api::PlaybackInfo,
+) {
+    let Some(queue) = data
+        .now_playing_queue
+        .as_ref()
+    else {
+        return;
+    };
+    let ids = upcoming_music_ids(
+        queue,
+        data.item_id,
+        data.playlist_item_id
+            .as_deref(),
+        ctx.config
+            .music_prefetch_tracks
+            .min(8),
+    );
+    if ids.is_empty() {
+        return;
+    }
+    static PREFETCH: std::sync::LazyLock<tokio::sync::Semaphore> =
+        std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+    let Ok(permit) = PREFETCH.try_acquire() else {
+        return;
+    };
+    let dedup = format!("music-prefetch:{}:{}:{ids:?}", user.id, data.item_id);
+    if !ctx
+        .store
+        .insert(dedup, true, std::time::Duration::from_secs(60))
+    {
+        return;
+    }
+    let current = data.item_id;
+    tokio::spawn(async move {
+        let _permit = permit;
+        let Ok(Some(current)) = db::Media::get_by_id(&ctx.db, &current).await else {
+            return;
+        };
+        if current.kind != db::MediaKind::Track {
+            return;
+        }
+        for id in ids {
+            let Ok(Some(media)) = db::Media::get_by_id(&ctx.db, &id).await else {
+                continue;
+            };
+            if media.kind != db::MediaKind::Track {
+                continue;
+            }
+            let mut service = StreamService::new(StreamServiceConfig {
+                ctx: ctx.clone(),
+                item_id: id,
+                requested_id: None,
+                show_ungrouped: true,
+                stream_filter: user
+                    .policy
+                    .as_ref()
+                    .and_then(|p| {
+                        p.stream_filter
+                            .clone()
+                    }),
+                user_id: Some(user.id),
+            });
+            if let Err(error) = service
+                .load(media)
+                .await
+            {
+                debug!(item_id = %id, %error, "music queue prefetch unavailable");
+            }
+        }
+    });
+}
+
+fn upcoming_music_ids(
+    queue: &[api::QueueItem],
+    current: Uuid,
+    playlist_item: Option<&str>,
+    count: usize,
+) -> Vec<Uuid> {
+    let position = playlist_item
+        .filter(|s| !s.is_empty())
+        .and_then(|id| {
+            queue
+                .iter()
+                .position(|q| q.id == current && q.playlist_item_id == id)
+        })
+        .or_else(|| {
+            queue
+                .iter()
+                .position(|q| q.id == current)
+        });
+    let Some(position) = position else {
+        return vec![];
+    };
+    queue
+        .iter()
+        .skip(position + 1)
+        .take(count)
+        .map(|q| q.id)
+        .filter(|id| !id.is_nil())
+        .collect()
+}
+
 /// Every candidate source for an item failed to resolve: no provider had it, or
 /// the ones that did are down.
 ///
@@ -1043,4 +1150,37 @@ fn media_info_from_probe(
         external_ids,
         tracks,
     })
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+    #[test]
+    fn lookahead_is_bounded_and_disambiguates_repeated_tracks() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let queue = vec![
+            api::QueueItem {
+                id: a,
+                playlist_item_id: "first".into(),
+            },
+            api::QueueItem {
+                id: b,
+                ..Default::default()
+            },
+            api::QueueItem {
+                id: a,
+                playlist_item_id: "repeat".into(),
+            },
+            api::QueueItem {
+                id: c,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(upcoming_music_ids(&queue, a, Some("repeat"), 2), vec![c]);
+        assert_eq!(upcoming_music_ids(&queue, a, None, 1), vec![b]);
+        assert!(upcoming_music_ids(&queue, a, None, 0).is_empty());
+        assert!(upcoming_music_ids(&queue, Uuid::new_v4(), None, 2).is_empty());
+    }
 }

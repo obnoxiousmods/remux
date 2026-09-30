@@ -478,6 +478,9 @@ fn default_torrent_http_port() -> u16 {
 pub struct Config {
     #[serde(default = "default_music_cache_bytes")]
     pub music_cache_bytes: u64,
+    /// Number of upcoming queue tracks to acquire after playback starts (0 disables).
+    #[serde(default = "default_music_prefetch_tracks")]
+    pub music_prefetch_tracks: usize,
     #[serde(default = "default_music_cache_entry_bytes")]
     pub music_cache_entry_bytes: u64,
     #[serde(default = "default_data_dir")]
@@ -736,6 +739,10 @@ fn default_ytdlp_executable() -> std::path::PathBuf {
     "yt-dlp".into()
 }
 
+fn default_music_prefetch_tracks() -> usize {
+    2
+}
+
 fn default_music_cache_bytes() -> u64 {
     10 * 1024 * 1024 * 1024
 }
@@ -747,6 +754,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             music_cache_bytes: default_music_cache_bytes(),
+            music_prefetch_tracks: default_music_prefetch_tracks(),
             music_cache_entry_bytes: default_music_cache_entry_bytes(),
             data_dir: default_data_dir(),
             database_url: None,

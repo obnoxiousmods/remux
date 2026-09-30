@@ -155,6 +155,15 @@ pub async fn report_playback_start(
                 e.context_internal("failed to start session")
             }
         })?;
+    crate::services::stream_service::prefetch_music(
+        state
+            .ctx
+            .clone(),
+        session
+            .user
+            .clone(),
+        &data,
+    );
     record_playback(
         &state,
         &session,
@@ -209,6 +218,15 @@ pub async fn report_playback_progress(
             .ws_tx
             .send(crate::ws::WsEvent::SessionsChanged);
     }
+    crate::services::stream_service::prefetch_music(
+        state
+            .ctx
+            .clone(),
+        session
+            .user
+            .clone(),
+        &data,
+    );
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

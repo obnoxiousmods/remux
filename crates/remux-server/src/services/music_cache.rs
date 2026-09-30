@@ -264,12 +264,37 @@ async fn qualify_inner(
         "truncated music body"
     );
     drop(file);
+    let probe = verify_complete_audio(temporary.path(), media).await?;
+    let raw = serde_json::to_vec(&probe)?;
+    anyhow::ensure!(raw.len() <= 16384, "music metadata exceeds reservation");
+    let mut metadata = tempfile::NamedTempFile::new_in(&root)?;
+    std::io::Write::write_all(&mut metadata, &raw)?;
+    metadata
+        .persist(&metadata_path)
+        .map_err(|e| e.error)?;
+    temporary
+        .persist(&path)
+        .map_err(|e| e.error)?;
+    info.size = Some(written as i64);
+    info.probe_data = Some(probe);
+    info.valid_until = None;
+    info.descriptor = StreamDescriptor::Local(path);
+    info.access_user_id = user_id;
+    tracing::info!(item_id = %media.id, source = ?info.source, bytes = written, "music object complete and decode verified");
+    Ok(info)
+}
+
+/// Decode the entire object before publishing it for playback.
+pub(crate) async fn verify_complete_audio(
+    path: &Path,
+    media: &db::Media,
+) -> Result<crate::api::MediaSourceInfo> {
     let decode = tokio::process::Command::new(
         std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into()),
     )
     .kill_on_drop(true)
     .args(["-nostdin", "-v", "error", "-xerror", "-i"])
-    .arg(temporary.path())
+    .arg(path)
     .args(["-map", "0:a:0", "-f", "null", "-"])
     .output()
     .await
@@ -280,8 +305,7 @@ async fn qualify_inner(
             .success(),
         "music object failed complete audio decode"
     );
-    let probe_path = temporary
-        .path()
+    let probe_path = path
         .to_string_lossy()
         .to_string();
     let (probe, _) = tokio::task::spawn_blocking(move || {
@@ -306,23 +330,7 @@ async fn qualify_inner(
             "music duration does not match recording"
         );
     }
-    let raw = serde_json::to_vec(&probe)?;
-    anyhow::ensure!(raw.len() <= 16384, "music metadata exceeds reservation");
-    let mut metadata = tempfile::NamedTempFile::new_in(&root)?;
-    std::io::Write::write_all(&mut metadata, &raw)?;
-    metadata
-        .persist(&metadata_path)
-        .map_err(|e| e.error)?;
-    temporary
-        .persist(&path)
-        .map_err(|e| e.error)?;
-    info.size = Some(written as i64);
-    info.probe_data = Some(probe);
-    info.valid_until = None;
-    info.descriptor = StreamDescriptor::Local(path);
-    info.access_user_id = user_id;
-    tracing::info!(item_id = %media.id, source = ?info.source, bytes = written, "music object complete and decode verified");
-    Ok(info)
+    Ok(probe)
 }
 
 #[cfg(test)]
