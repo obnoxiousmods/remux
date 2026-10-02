@@ -3737,6 +3737,20 @@ impl Media {
                 qb.push(" AND grandparent_id = ")
                     .push_bind(grandparent_id);
             }
+            if let Some(grandparent_ids) = &filter.grandparent_ids {
+                if !grandparent_ids.is_empty() {
+                    qb.push(" AND grandparent_id IN (");
+                    let mut sep = qb.separated(", ");
+                    for id in grandparent_ids {
+                        sep.push_bind(id);
+                    }
+                    qb.push(")");
+                }
+            }
+            if let Some(released_after) = &filter.released_after {
+                qb.push(" AND released_at >= ")
+                    .push_bind(released_after);
+            }
             if let Some(promoted) = &filter.promoted {
                 qb.push(" AND promoted = ")
                     .push_bind(promoted);
