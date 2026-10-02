@@ -35,6 +35,9 @@ fi
 mkdir -p "$root/target/slskd-tmp"
 export TMPDIR="$root/target/slskd-tmp" DOTNET_CLI_TELEMETRY_OPTOUT=1
 dotnet test "$source_dir/tests/slskd.Tests.Unit" -c Release --filter FullyQualifiedName~ApiConcurrencyTests
+mkdir -p "$output_dir"
+[[ ! -L "$output_dir" ]] || { echo 'slskd publish output must not be a symlink' >&2; exit 1; }
+find "$output_dir" -mindepth 1 -delete
 dotnet publish "$source_dir/src/slskd/slskd.csproj" -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:DebugType=none -o "$output_dir"
 mkdir -p "$output_dir/wwwroot"
 cp -a "$web_dir/build/." "$output_dir/wwwroot/"

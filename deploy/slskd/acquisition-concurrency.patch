@@ -171,6 +171,46 @@ index 03fc4af..303cba4 100644
 @@ -56,0 +57,2 @@
 +    <!-- Pin the fixed native SQLite package until Microsoft.Data.Sqlite raises its transitive floor. -->
 +    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" />
+diff --git a/src/web/package-lock.json b/src/web/package-lock.json
+index 6e09618..a494983 100644
+--- a/src/web/package-lock.json
++++ b/src/web/package-lock.json
+@@ -5614 +5613,0 @@
+-      "dev": true,
+@@ -6082,3 +6081,3 @@
+-      "version": "1.15.0",
+-      "resolved": "https://registry.npmjs.org/axios/-/axios-1.15.0.tgz",
+-      "integrity": "sha512-wWyJDlAatxk30ZJer+GeCWS209sA42X+N5jU2jy6oHTp7ufw8uzUTVFBX9+wTfAlhiJXGS0Bq7X6efruWjuK9Q==",
++      "version": "1.20.0",
++      "resolved": "https://registry.npmjs.org/axios/-/axios-1.20.0.tgz",
++      "integrity": "sha512-r8aOh8j9cGKpgQAqpzrUHnSIc6a59Y3Xf/cv8sy1DrHCkZHzQGEuoq1tARk6qSyDdtQGSDgpb9kFlruzPvrgwg==",
+@@ -6087,2 +6086,3 @@
+-        "follow-redirects": "^1.15.11",
+-        "form-data": "^4.0.5",
++        "follow-redirects": "^1.16.0",
++        "form-data": "^4.0.6",
++        "https-proxy-agent": "^5.0.1",
+@@ -7964 +7963,0 @@
+-      "dev": true,
+@@ -12183 +12181,0 @@
+-      "dev": true,
+@@ -15224,2 +15222 @@
+-      "integrity": "sha512-sGkPx+VjMtmA6MX27oA4FBFELFCZZ4S4XqeGOXCv68tT+jb3vk/RyaKWP0PTKyWtmLSM0b+adUTEvbs1PEaH2w==",
+-      "dev": true
++      "integrity": "sha512-sGkPx+VjMtmA6MX27oA4FBFELFCZZ4S4XqeGOXCv68tT+jb3vk/RyaKWP0PTKyWtmLSM0b+adUTEvbs1PEaH2w=="
+diff --git a/src/web/src/lib/api.js b/src/web/src/lib/api.js
+index 9506a0d..6f400c4 100644
+--- a/src/web/src/lib/api.js
++++ b/src/web/src/lib/api.js
+@@ -3 +3 @@ import { clearToken, getToken, isPassthroughEnabled } from './token';
+-import axios from 'axios';
++import { create } from 'axios';
+@@ -5,3 +5,2 @@ import axios from 'axios';
+-axios.defaults.baseURL = apiBaseUrl;
+-
+-const api = axios.create({
++const api = create({
++  baseURL: apiBaseUrl,
 diff --git a/tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs b/tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs
 new file mode 100644
 index 0000000..e984ed0
