@@ -39,8 +39,9 @@ cannot benefit from lookahead.
 
 The fork starts at upstream `e42a525d700d6dc343f316447803138b8ea2fbe3`.
 `deploy/slskd/acquisition-concurrency.patch` preserves the complete changes and tests;
-`deploy/slskd/build.sh` rebuilds them using .NET 10, with build files on disk rather
-than `/tmp`. Its opt-in settings are:
+`deploy/slskd/build.sh` runs the React UI tests/build and the focused .NET tests, then
+publishes the executable with its matching `wwwroot` assets. It requires Node/npm and
+the .NET 10 SDK, and keeps build files on disk rather than `/tmp`. Its opt-in settings are:
 
 ```text
 SLSKD_API_DOWNLOAD_CONCURRENCY=16

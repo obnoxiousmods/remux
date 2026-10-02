@@ -1,24 +1,9 @@
-From 39487cf01791843efdc0de71b0a1b8ed9e042685 Mon Sep 17 00:00:00 2001
-From: Joey <joey@localhost>
-Date: Tue, 29 Sep 2026 18:41:09 -0700
-Subject: [PATCH 1/2] feat: make acquisition API concurrency configurable and
- cancellable
-
----
- src/slskd/Common/ApiConcurrency.cs            | 120 ++++++++++++++++++
- .../API/Controllers/SearchesController.cs     |   4 +-
- .../API/Controllers/TransfersController.cs    |   6 +-
- .../Common/ApiConcurrencyTests.cs             |  25 ++++
- 4 files changed, 150 insertions(+), 5 deletions(-)
- create mode 100644 src/slskd/Common/ApiConcurrency.cs
- create mode 100644 tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs
-
 diff --git a/src/slskd/Common/ApiConcurrency.cs b/src/slskd/Common/ApiConcurrency.cs
 new file mode 100644
-index 0000000..83a0d17
+index 0000000..61cfe06
 --- /dev/null
 +++ b/src/slskd/Common/ApiConcurrency.cs
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,124 @@
 +﻿// <copyright file="ApiConcurrency.cs" company="JP Dillingham">
 +//           ▄▄▄▄     ▄▄▄▄     ▄▄▄▄
 +//     ▄▄▄▄▄▄█  █▄▄▄▄▄█  █▄▄▄▄▄█  █
@@ -122,9 +107,13 @@ index 0000000..83a0d17
 +        /// <param name="cancellationToken">Cancellation for a disconnected API caller.</param>
 +        /// <returns>A value indicating whether a slot was acquired.</returns>
 +        public static Task<bool> TryAcquireAsync(SemaphoreSlim limiter, CancellationToken cancellationToken = default)
-+            => AcquireTimeout == TimeSpan.Zero
++        {
++            cancellationToken.ThrowIfCancellationRequested();
++
++            return AcquireTimeout == TimeSpan.Zero
 +                ? Task.FromResult(limiter.Wait(0))
 +                : limiter.WaitAsync(AcquireTimeout, cancellationToken);
++        }
 +
 +        private static int ReadEnvironmentInt(string name, int defaultValue, int min, int max)
 +        {
@@ -140,7 +129,7 @@ index 0000000..83a0d17
 +    }
 +}
 diff --git a/src/slskd/Search/API/Controllers/SearchesController.cs b/src/slskd/Search/API/Controllers/SearchesController.cs
-index 9921441..54d0b24 100644
+index 9921441..e1e15de 100644
 --- a/src/slskd/Search/API/Controllers/SearchesController.cs
 +++ b/src/slskd/Search/API/Controllers/SearchesController.cs
 @@ -67 +67 @@ namespace slskd.Search.API
@@ -149,8 +138,11 @@ index 9921441..54d0b24 100644
 @@ -94 +94 @@ namespace slskd.Search.API
 -            if (!SearchRequestLimiter.Wait(0))
 +            if (!await ApiConcurrency.TryAcquireAsync(SearchRequestLimiter, HttpContext.RequestAborted))
+@@ -96 +96 @@ namespace slskd.Search.API
+-                return StatusCode(429, "Only one concurrent operation is permitted. Wait until the previous request completes");
++                return StatusCode(429, $"The concurrent search limit is {ApiConcurrency.SearchRequests}. Wait for an available slot.");
 diff --git a/src/slskd/Transfers/API/Controllers/TransfersController.cs b/src/slskd/Transfers/API/Controllers/TransfersController.cs
-index 83eb04e..8846d1e 100644
+index 83eb04e..782d141 100644
 --- a/src/slskd/Transfers/API/Controllers/TransfersController.cs
 +++ b/src/slskd/Transfers/API/Controllers/TransfersController.cs
 @@ -76 +76 @@ namespace slskd.Transfers.API
@@ -159,15 +151,32 @@ index 83eb04e..8846d1e 100644
 @@ -262 +262 @@ namespace slskd.Transfers.API
 -            if (!DownloadRequestLimiter.Wait(0))
 +            if (!await ApiConcurrency.TryAcquireAsync(DownloadRequestLimiter, HttpContext.RequestAborted))
+@@ -264 +264 @@ namespace slskd.Transfers.API
+-                return StatusCode(429, "Only one concurrent operation is permitted. Wait until the previous request completes");
++                return StatusCode(429, $"The concurrent download limit is {ApiConcurrency.DownloadRequests}. Wait for an available slot.");
 @@ -352 +352 @@ namespace slskd.Transfers.API
 -            if (!DownloadRequestLimiter.Wait(0))
 +            if (!await ApiConcurrency.TryAcquireAsync(DownloadRequestLimiter, HttpContext.RequestAborted))
+@@ -354 +354 @@ namespace slskd.Transfers.API
+-                return StatusCode(429, "Only one concurrent operation is permitted. Wait until the previous request completes");
++                return StatusCode(429, $"The concurrent download limit is {ApiConcurrency.DownloadRequests}. Wait for an available slot.");
+@@ -722 +722 @@ namespace slskd.Transfers.API
+-}
+\ No newline at end of file
++}
+diff --git a/src/slskd/slskd.csproj b/src/slskd/slskd.csproj
+index 03fc4af..303cba4 100644
+--- a/src/slskd/slskd.csproj
++++ b/src/slskd/slskd.csproj
+@@ -56,0 +57,2 @@
++    <!-- Pin the fixed native SQLite package until Microsoft.Data.Sqlite raises its transitive floor. -->
++    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" />
 diff --git a/tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs b/tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs
 new file mode 100644
-index 0000000..77015bd
+index 0000000..e984ed0
 --- /dev/null
 +++ b/tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,38 @@
 +using System;
 +using System.Threading;
 +using System.Threading.Tasks;
@@ -177,6 +186,19 @@ index 0000000..77015bd
 +
 +public class ApiConcurrencyTests
 +{
++    [Fact]
++    public async Task CancelledRequestDoesNotAcquireALimiterSlot()
++    {
++        using var semaphore = ApiConcurrency.CreateLimiter(1);
++        using var cancellation = new CancellationTokenSource();
++        cancellation.Cancel();
++
++        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
++            await ApiConcurrency.TryAcquireAsync(semaphore, cancellation.Token));
++
++        Assert.True(await ApiConcurrency.TryAcquireAsync(semaphore));
++    }
++
 +    [Theory]
 +    [InlineData(1)]
 +    [InlineData(2)]
@@ -193,67 +215,3 @@ index 0000000..77015bd
 +        Assert.True(await ApiConcurrency.TryAcquireAsync(semaphore));
 +    }
 +}
-
-From d4c43e9b13c79ddae9c484afce830142f4e0d04b Mon Sep 17 00:00:00 2001
-From: Joey <joey@localhost>
-Date: Tue, 29 Sep 2026 19:08:03 -0700
-Subject: [PATCH 2/2] fix: honor cancellation and report API concurrency limits
-
----
- src/slskd/Common/ApiConcurrency.cs                  |  6 +++++-
- .../Search/API/Controllers/SearchesController.cs    |  2 +-
- .../API/Controllers/TransfersController.cs          |  6 +++---
- .../slskd.Tests.Unit/Common/ApiConcurrencyTests.cs  | 13 +++++++++++++
- 4 files changed, 22 insertions(+), 5 deletions(-)
-
-diff --git a/src/slskd/Common/ApiConcurrency.cs b/src/slskd/Common/ApiConcurrency.cs
-index 83a0d17..61cfe06 100644
---- a/src/slskd/Common/ApiConcurrency.cs
-+++ b/src/slskd/Common/ApiConcurrency.cs
-@@ -104 +104,4 @@ namespace slskd
--            => AcquireTimeout == TimeSpan.Zero
-+        {
-+            cancellationToken.ThrowIfCancellationRequested();
-+
-+            return AcquireTimeout == TimeSpan.Zero
-@@ -106,0 +110 @@ namespace slskd
-+        }
-diff --git a/src/slskd/Search/API/Controllers/SearchesController.cs b/src/slskd/Search/API/Controllers/SearchesController.cs
-index 54d0b24..e1e15de 100644
---- a/src/slskd/Search/API/Controllers/SearchesController.cs
-+++ b/src/slskd/Search/API/Controllers/SearchesController.cs
-@@ -96 +96 @@ namespace slskd.Search.API
--                return StatusCode(429, "Only one concurrent operation is permitted. Wait until the previous request completes");
-+                return StatusCode(429, $"The concurrent search limit is {ApiConcurrency.SearchRequests}. Wait for an available slot.");
-diff --git a/src/slskd/Transfers/API/Controllers/TransfersController.cs b/src/slskd/Transfers/API/Controllers/TransfersController.cs
-index 8846d1e..782d141 100644
---- a/src/slskd/Transfers/API/Controllers/TransfersController.cs
-+++ b/src/slskd/Transfers/API/Controllers/TransfersController.cs
-@@ -264 +264 @@ namespace slskd.Transfers.API
--                return StatusCode(429, "Only one concurrent operation is permitted. Wait until the previous request completes");
-+                return StatusCode(429, $"The concurrent download limit is {ApiConcurrency.DownloadRequests}. Wait for an available slot.");
-@@ -354 +354 @@ namespace slskd.Transfers.API
--                return StatusCode(429, "Only one concurrent operation is permitted. Wait until the previous request completes");
-+                return StatusCode(429, $"The concurrent download limit is {ApiConcurrency.DownloadRequests}. Wait for an available slot.");
-@@ -722 +722 @@ namespace slskd.Transfers.API
--}
-\ No newline at end of file
-+}
-diff --git a/tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs b/tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs
-index 77015bd..e984ed0 100644
---- a/tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs
-+++ b/tests/slskd.Tests.Unit/Common/ApiConcurrencyTests.cs
-@@ -9,0 +10,13 @@ public class ApiConcurrencyTests
-+    [Fact]
-+    public async Task CancelledRequestDoesNotAcquireALimiterSlot()
-+    {
-+        using var semaphore = ApiConcurrency.CreateLimiter(1);
-+        using var cancellation = new CancellationTokenSource();
-+        cancellation.Cancel();
-+
-+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
-+            await ApiConcurrency.TryAcquireAsync(semaphore, cancellation.Token));
-+
-+        Assert.True(await ApiConcurrency.TryAcquireAsync(semaphore));
-+    }
-+
