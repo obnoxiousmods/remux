@@ -6,21 +6,24 @@ source_dir="$root/target/slskd-source"
 output_dir="$root/target/slskd-publish"
 web_dir="$source_dir/src/web"
 revision=e42a525d700d6dc343f316447803138b8ea2fbe3
+slskd_git() {
+  git -c "safe.directory=$source_dir" -C "$source_dir" "$@"
+}
 mkdir -p "$root/target"
 exec 9>"$root/target/slskd-build.lock"
 flock 9
 if [[ ! -d "$source_dir/.git" ]]; then
-  git init "$source_dir"
-  git -C "$source_dir" remote add origin https://github.com/slskd/slskd.git
-  git -C "$source_dir" fetch --depth 1 origin "$revision"
-  git -C "$source_dir" checkout --detach FETCH_HEAD
+  slskd_git init
+  slskd_git remote add origin https://github.com/slskd/slskd.git
+  slskd_git fetch --depth 1 origin "$revision"
+  slskd_git checkout --detach FETCH_HEAD
 fi
-[[ "$(git -C "$source_dir" rev-parse HEAD)" == "$revision" ]] || { echo 'Unexpected slskd source revision' >&2; exit 1; }
-if git -C "$source_dir" apply --unidiff-zero --reverse --check "$root/deploy/slskd/acquisition-concurrency.patch" >/dev/null 2>&1; then
+[[ "$(slskd_git rev-parse HEAD)" == "$revision" ]] || { echo 'Unexpected slskd source revision' >&2; exit 1; }
+if slskd_git apply --unidiff-zero --reverse --check "$root/deploy/slskd/acquisition-concurrency.patch" >/dev/null 2>&1; then
   echo 'slskd acquisition patch already applied'
 else
-  git -C "$source_dir" apply --unidiff-zero --check "$root/deploy/slskd/acquisition-concurrency.patch"
-  git -C "$source_dir" apply --unidiff-zero "$root/deploy/slskd/acquisition-concurrency.patch"
+  slskd_git apply --unidiff-zero --check "$root/deploy/slskd/acquisition-concurrency.patch"
+  slskd_git apply --unidiff-zero "$root/deploy/slskd/acquisition-concurrency.patch"
 fi
 
 # slskd serves its React UI from a separate wwwroot directory. dotnet publish
